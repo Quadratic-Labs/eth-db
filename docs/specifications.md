@@ -51,7 +51,7 @@ Entry := (key : Bytes[32], value : Bytes[32])   # 64 bytes with alignment paddin
 
 Naively, every batch write would require recomputing commitments from leaf to root, touching every ancestor of every modified key. To avoid this, the store caches selected intermediate commitment nodes on disk.
 
-Caching introduces read, write, and space amplification; however, since addressing relies only on key prefixes, reads and writes at different trie depths are independent and can proceed in parallel.
+Caching trades read for write and space amplification; however, since addressing relies only on key prefixes, reads and writes at different trie depths are independent and can proceed in parallel.
 
 ### 3.2 Cache Policy
 
