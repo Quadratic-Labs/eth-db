@@ -8,14 +8,14 @@
 
 ## 1. Overview
 
-PrefixDB is an authenticated key-value storage engine for Ethereum world state that synthesises the layered write-buffering of VerkleTrieDB (v1) with the compact routing index of QuotientDB (v2). Its distinguishing property is that compaction is *prefix-local*: instead of sorting and merging globally, the engine partitions the key space by 6-bit prefix strides at each level, confining compaction work to the pages that share a common prefix. This bounds write amplification to a small neighbourhood of the modified subtree and eliminates compaction-driven interference across unrelated key ranges.
+PrefixDB is an authenticated key-value storage engine for Ethereum world state that synthesises the layered write-buffering of VerkleTrieDB (v1) with the compact routing index of QuotientDB (v2). Its distinguishing property is that compaction is *prefix-local*: instead of sorting and merging globally, the engine partitions the key space by 7-bit prefix strides at each level, confining compaction work to the pages that share a common prefix. This bounds write amplification to a small neighbourhood of the modified subtree and eliminates compaction-driven interference across unrelated key ranges.
 
 Key properties:
 
 - Pages of 64 KV-pairs (4 KiB) are the atomic unit of disk I/O — writes are buffered in-memory and flushed as full pages.
-- A two-layer routing index — a small B+-tree over `(depth, prefix)` keys (top two levels permanently pinned, ≈ 22 MiB total) pointing to per-node data pages that hold SST slot IDs, key ranges, and inline commitments — enables parallel lookup across all prefix levels with no serial pointer chasing.
-- A prefix-partitioned multi-level store: level Lk holds pages whose entries share a common `6k`-bit key prefix.
-- Commitment nodes are co-located 64 siblings per page and rewritten at most once per block per affected node.
+- A two-layer routing index — a small B+-tree over `(depth, prefix)` keys (top two levels permanently pinned, ≈ 12 MiB total) pointing to per-node data pages that hold SST slot IDs, key ranges, and commitment page IDs — enables parallel lookup across all prefix levels with no serial pointer chasing.
+- A prefix-partitioned multi-level store: level Lk holds pages whose entries share a common `7k`-bit key prefix.
+- Commitment nodes are co-located 128 siblings per page and rewritten at most once per block per affected node.
 
 ---
 
@@ -69,17 +69,17 @@ Caching trades read for write and space amplification; however, since addressing
 
 ### 3.2 Cache Policy
 
-Rather than caching every intermediate node, the store caches commitment nodes only at depths that are multiples of a fixed stride `D`. This bounds the recomputation cost to at most `D` levels when a cached node is invalidated. With `D = 6`, each commitment page holds exactly 64 sibling commitments, filling one 4 KiB page.
+Rather than caching every intermediate node, the store caches commitment nodes only at depths that are multiples of a fixed stride `D`. This bounds the recomputation cost to at most `D` levels when a cached node is invalidated. With `D = 7`, a strided node has exactly 2^7 = 128 children; their 128 commitment values of 32 bytes each total 128 × 32 = **4,096 bytes = one exactly full 4 KiB page** of commitment data, fitting cleanly into a single I/O.
 
 Upper tree levels (near the root) are updated very frequently but are cheaply recomputable from lower cached commitments, so they are kept **in memory only** and are not persisted to disk.
 
 ### 3.3 Commitment Storage
 
-At strided depths, each node's 32-byte commitment is stored **inline** in its node data page (§4.3.2), eliminating the separate commitment page heap and its associated pointer overhead.
+At strided depths, each routing node `(k, P)` owns a dedicated 4 KiB **commitment page** that stores the 32-byte commitment values of all 128 children `(k+1, P||b)` for `b ∈ {0…127}`. With 128 × 32 = 4,096 bytes this fills one page exactly, with no wasted space.
 
-When recomputing the commitment at a strided node `(k, P)`, up to 64 children `(k+1, P||b)` for `b ∈ {0…63}` must be consulted. All 64 routing keys share the same depth and differ only in the last 6 bits of `prefix_data`, so they occupy a contiguous range of the B+-tree leaf layer. A single B+-tree range scan identifies which children have node data pages; those pages are loaded in a parallel batch and their inline commitments extracted. Children absent from the B+-tree contribute the fixed empty-subtree constant. The resulting 64-entry vector is hashed to produce the updated commitment for `(k, P)`, which is written back into `(k, P)`'s node data page under CoW.
+The node data page for `(k, P)` (§4.3.2) holds a `commitment_slot_id` pointing to this commitment page. Recomputing `(k, P)`'s commitment after a child changes is a single read-modify-write cycle: load the commitment page (one I/O, all 128 children's values), update the changed child's slot, hash all 128 entries to produce the new commitment for `(k, P)`, and write the page back. Children absent from the routing index contribute the fixed empty-subtree constant.
 
-Because commitments are recomputed at most once per block, each node data page is rewritten at most once per block for commitment purposes, preserving the tight write-amplification bound of the prior design.
+Because commitments are recomputed at most once per block per affected node, each commitment page is rewritten at most once per block, tightly bounding commitment write amplification.
 
 ---
 
@@ -91,21 +91,21 @@ For parallel I/O, the key space is partitioned into `2^S` shards using the first
 
 ### 4.2 Layered Storage
 
-Storage is organised into levels L0 through LN. Level Lk holds pages whose entries share a common key prefix of `6k` bits.
+Storage is organised into levels L0 through LN. Level Lk holds pages whose entries share a common key prefix of `7k` bits.
 
 **L0 (in-memory buffer):**
 - New writes are appended to a sorted in-memory buffer and simultaneously journalled to a per-shard WAL for crash recovery.
-- When the buffer accumulates ≥ 64 entries sharing a common 6-bit prefix, compaction to L1 can be triggered for that prefix group.
+- When the buffer accumulates ≥ 64 entries sharing a common 7-bit prefix, compaction to L1 can be triggered for that prefix group.
 - Superseded values for duplicate keys are discarded at compaction time.
 
 **L1:**
-- Holds pages of 64 internally sorted entries, grouped by their first 6 bits of key prefix.
-- Each routing-index node references at most N payload pages (N ≤ 145; see §4.3).
-- When a prefix group reaches its page capacity, compaction to L2 is triggered: all pages for the group are merged, entries sharing a common 12-bit prefix are sorted and flushed as L2 pages, and the remainder is reorganised into fresh L1 pages.
+- Holds pages of 64 internally sorted entries, grouped by their first 7 bits of key prefix.
+- Each routing-index node references at most N payload pages (N ≤ 146; see §4.3).
+- When a prefix group reaches its page capacity, compaction to L2 is triggered: all pages for the group are merged, entries sharing a common 14-bit prefix are sorted and flushed as L2 pages, and the remainder is reorganised into fresh L1 pages.
 
 **Lk (general):**
-- Pages at level Lk hold entries sharing a common `6k`-bit prefix.
-- On compaction, entries sharing a `6(k+1)`-bit prefix are promoted to L(k+1); the rest are reorganised into new Lk pages.
+- Pages at level Lk hold entries sharing a common `7k`-bit prefix.
+- On compaction, entries sharing a `7(k+1)`-bit prefix are promoted to L(k+1); the rest are reorganised into new Lk pages.
 - Stale values for overwritten keys are discarded at each compaction.
 
 **Compaction trigger:** A routing-index node initiates compaction when its SST page count reaches a configurable threshold (e.g., 64 pages per node).
@@ -114,7 +114,7 @@ Storage is organised into levels L0 through LN. Level Lk holds pages whose entri
 
 ### 4.3 Routing Index
 
-The routing index comprises two complementary on-disk structures: a **Routing B+-Tree** that maps `(depth, prefix)` keys to the heap address of a node's data page, and the **Node Data Pages** themselves, which store SST slot IDs and combinadic membership filters. Together they replace the old Patricia-trie: the B+-tree's top two levels are small enough to pin in RAM permanently, so the serial pointer-chasing dependency of trie traversal is eliminated — all node data pages for a lookup can be read in a single parallel batch.
+The routing index comprises two complementary on-disk structures: a **Routing B+-Tree** that maps `(depth, prefix)` keys to the heap address of a node's data page, and the **Node Data Pages** themselves, which store SST slot IDs, key ranges, and commitment page IDs. Together they replace the old Patricia-trie: the B+-tree's top two levels are small enough to pin in RAM permanently, so the serial pointer-chasing dependency of trie traversal is eliminated — all node data pages for a lookup can be read in a single parallel batch.
 
 #### 4.3.1 Routing B+-Tree
 
@@ -122,14 +122,14 @@ Every non-empty trie node — every `(depth, prefix)` pair that currently holds 
 
 **Routing key:** `(depth : u8,  prefix_data : u32)`
 
-- `depth` is the level number k; a node at level Lk holds entries sharing a common `6k`-bit key prefix.
-- `prefix_data` is the first `6 × depth` bits of the full key, left-aligned into 32 bits and zero-padded on the right.
+- `depth` is the level number k; a node at level Lk holds entries sharing a common `7k`-bit key prefix.
+- `prefix_data` is the first `7 × depth` bits of the full key, left-aligned into 32 bits and zero-padded on the right.
 - Sort order: lexicographic on `(depth, prefix_data)`, which groups all level-k entries into a contiguous band and places shallower nodes before deeper ones.
 
 **Prefix extraction:**
 
 ```
-prefix_data(K, d) = (K as u256) >> (256 − 6d),  as big-endian u32
+prefix_data(K, d) = (K as u256) >> (256 − 7d),  as big-endian u32
 ```
 
 **Leaf node layout (4 KiB):**
@@ -158,16 +158,16 @@ Capacity: floor((4096 − 12) / 9) = **453 entries per node**.
 
 **Tree height at scale:**
 
-| Scale | SST pages / shard | B+-tree leaves / shard | L2 internal / shard | Height |
-|-------|-------------------|------------------------|----------------------|--------|
-| 2^32  | ≈ 2^18            | ≈ 579                  | ≈ 2                  | 3      |
-| 2^36  | ≈ 2^22            | ≈ 9,259                | ≈ 21                 | 3      |
+| Scale | Routing entries / shard | B+-tree leaves / shard | L2 internal / shard | Height |
+|-------|-------------------------|------------------------|----------------------|--------|
+| 2^32  | ≈ 2^14 = 16 K           | ≈ 37                   | ≈ 1                  | 2      |
+| 2^36  | ≈ 2^21 = 2 M            | ≈ 4,622                | ≈ 11                 | 3      |
 
-Height stays at **3** across the full target range.
+The tree grows from height 2 to height 3 as key space expands from 2^32 to 2^36.
 
 **In-memory management:**
 
-- **Permanently pinned:** the root page and all L2 internal pages — roughly 22 pages per shard × 256 shards × 4 KiB ≈ **22 MiB** total. After startup these pages never leave RAM.
+- **Permanently pinned:** the root page and all L2 internal pages — roughly 12 pages per shard × 256 shards × 4 KiB ≈ **12 MiB** total at 2^36 scale. After startup these pages never leave RAM.
 - **LRU-cached:** B+-tree leaf pages. Because the pinned levels fully determine which leaf page contains any routing key, locating a node data page after warm-up requires exactly **one uncached leaf read per depth level**, and those reads are independent of one another.
 
 **CoW updates:** on any structural change a new copy of the affected node plus its ancestors up to the root is written to the heap; old copies are released for GC. At height 3 this costs at most **3 B+-tree node writes** per routing entry change.
@@ -178,7 +178,7 @@ Each B+-tree leaf entry `(depth, prefix_data, node_data_page_id)` points to a 4 
 
 | Field | Size | Description |
 |-------|------|-------------|
-| `commitment` | 32 B | Inline 32-byte commitment for this node's key-prefix subtree |
+| `commitment_slot_id` | 4 B | Heap page ID of this node's commitment page (§3.3) |
 | `N` (SST count) | 1 B | Number of SST pages currently at this node |
 | `sorted_page_count` | 1 B | Number of globally sorted SST pages |
 | `_pad` | 2 B | |
@@ -186,7 +186,7 @@ Each B+-tree leaf entry `(depth, prefix_data, node_data_page_id)` points to a 4 
 | `min_keys` | 12 × N B | First 12 bytes of the minimum key in each SST |
 | `max_keys` | 12 × N B | First 12 bytes of the maximum key in each SST |
 
-**Total size:** `36 + 28 × N` bytes → maximum **N = 145** SST pages per node.
+**Total size:** `8 + 28 × N` bytes → maximum **N = 146** SST pages per node.
 
 The node data page is rewritten under CoW whenever SSTs are added, removed, or reordered at the node. The B+-tree entry pointing to it is updated in the same CoW operation, keeping the two always consistent.
 
@@ -202,13 +202,13 @@ All persistent pages — B+-tree nodes, node data pages, KV payload, and commitm
 - **Container:** 1,024 segments = 4 GiB. Stored as a single file, addressed by `(container_id, segment_offset)`.
 - **Liveness bitmap:** One bit per page per segment (128 bytes), kept in memory and persisted to a sidecar file for GC use.
 
-The two logical stores (routing index — which subsumes commitments inline — and KV payload) may be assigned separate containers with independent GC parameters and cache budgets.
+The three logical stores (routing index, KV payload, and commitment pages) may be assigned separate containers with independent GC parameters and cache budgets.
 
 ### 4.5 Cache
 
 - L0 is always fully resident in memory.
 - Higher levels are paged in on demand; each heap can be assigned its own LRU cache size and eviction policy.
-- B+-tree pages receive the highest eviction priority. The top two levels (root + L2 internal nodes, ≈ 22 MiB) are permanently pinned; leaf pages and node data pages compete for the remaining LRU budget.
+- B+-tree pages receive the highest eviction priority. The top two levels (root + L2 internal nodes, ≈ 12 MiB at 2^36 scale) are permanently pinned; leaf pages and node data pages compete for the remaining LRU budget.
 
 ---
 
@@ -219,7 +219,7 @@ The two logical stores (routing index — which subsumes commitments inline — 
 **Input:** key `K`
 
 1. Check the L0 in-memory buffer; if `K` is present, return its value.
-2. Compute one routing key per depth level along `K`'s path: for each d ∈ {1, 2, 3, 4, 5}, `rk[d] = (d, prefix_data(K, d))` (§4.3.1). (Deeper levels exist only if the key space has been partitioned that far by compaction.)
+2. Compute one routing key per depth level along `K`'s path: for each d ∈ {1, 2, 3, 4}, `rk[d] = (d, prefix_data(K, d))` (§4.3.1). (Deeper levels exist only if the key space has been partitioned that far by compaction.)
 3. For each `rk[d]`: use the pinned root and L2 internal pages of the B+-tree to locate the leaf page that contains `rk[d]`. Because both internal levels are in RAM, no uncached reads are needed for this step.
 4. **Issue all required B+-tree leaf page reads as a single parallel batch.** Each matching leaf entry yields a `node_data_page_id` for that depth level.
 5. **Issue all node data page reads as a single parallel batch** — one read per depth level that has an entry.
@@ -236,7 +236,7 @@ The critical I/O path after warm-up is three parallel rounds: B+-tree leaf pages
 **Input:** key `K`, value `V`
 
 1. Append `(K, V)` to the in-memory L0 buffer and write a WAL record.
-2. If any 6-bit prefix group in the buffer reaches ≥ 64 entries, trigger compaction for that group (see §6).
+2. If any 7-bit prefix group in the buffer reaches ≥ 64 entries, trigger compaction for that group (see §6).
 3. For every SST page created or relocated by compaction: update the corresponding node data page and B+-tree entry under CoW (at most 3 B+-tree node writes per changed routing key).
 
 ### 5.3 Batch Write
@@ -247,7 +247,7 @@ A batch write is a sequence of single writes at the store level. At the applicat
 
 The following steps are executed at the end of each block:
 
-1. Compute commitment updates for all affected strided nodes: for each such node `(k, P)`, batch-read the children's node data pages via a B+-tree range scan, extract their inline commitments, hash to produce the updated 32-byte commitment, and rewrite `(k, P)`'s node data page (CoW).
+1. Compute commitment updates for all affected strided nodes: for each such node `(k, P)`, load its commitment page via `commitment_slot_id` (one I/O, all 128 children's values), update the changed children's slots, hash all 128 entries to produce the updated 32-byte commitment, and write the commitment page back. Then rewrite `(k, P)`'s node data page with the updated `commitment_slot_id` (CoW).
 2. Apply pending compaction within the available per-block compaction budget.
 3. Write all new and modified B+-tree nodes and node data pages to the heap (CoW); `fsync`.
 4. Truncate the WAL to the current checkpoint.
@@ -280,10 +280,10 @@ Compaction operates on a single prefix node at a time (micro-compaction), keepin
 
 **Procedure:**
 
-1. Read all SST pages referenced by the node data page for `(k, P)` (at most 145 pages, ≤ 580 KiB).
+1. Read all SST pages referenced by the node data page for `(k, P)` (at most 146 pages, ≤ 584 KiB).
 2. Merge all 64-byte entries across pages, retaining only the most-recent value for each key; discard superseded entries.
 3. Sort the surviving entries by key.
-4. Identify all groups of entries sharing a common `6(k+1)`-bit prefix.
+4. Identify all groups of entries sharing a common `7(k+1)`-bit prefix.
 5. For each such group of ≥ 64 entries: write the 64 least-recently-written entries as a new L(k+1) SST page; create or update the node data page for `(k+1, Q)` (where Q is the extended prefix); insert or update the B+-tree entry `(k+1, Q) → new_node_data_page_id` (CoW, ≤ 3 node writes).
 6. Reorganise remaining entries into fresh Lk SST pages (up to 64 entries per page).
 7. Rewrite the node data page for `(k, P)` with the new SST slot IDs and updated SST range fields (min_key, max_key); update the B+-tree entry `(k, P)` (CoW); release all old SST pages and the old node data page for GC.
@@ -292,14 +292,14 @@ Compaction operates on a single prefix node at a time (micro-compaction), keepin
 
 ### 6.2 Downward Merge
 
-**Trigger:** the total live entries across all SST pages at node `(k+1, Q)` fall below the merge threshold (default 16 entries), and the parent node `(k, P)` — where P is Q with its last 6 bits removed — has remaining SST capacity.
+**Trigger:** the total live entries across all SST pages at node `(k+1, Q)` fall below the merge threshold (default 16 entries), and the parent node `(k, P)` — where P is Q with its last 7 bits removed — has remaining SST capacity.
 
 **Procedure:**
 
 1. Read all SST pages referenced by the node data pages for `(k+1, Q)` and `(k, P)`.
 2. Merge all entries; for any key present at both levels the L(k+1) entry is authoritative (it reflects a more recent write or compaction).
 3. Discard superseded entries; sort survivors by key.
-4. Write merged result as fresh Lk SST pages (at most 145 per node).
+4. Write merged result as fresh Lk SST pages (at most 146 per node).
 5. Rewrite the node data page for `(k, P)` with the new SST slot IDs and updated SST range fields (min_key, max_key); update the B+-tree entry `(k, P)` (CoW).
 6. **Delete** the B+-tree entry for `(k+1, Q)` (CoW); release the node data page for `(k+1, Q)` and all its old SST pages for GC.
 
@@ -342,7 +342,7 @@ Each node data page (§4.3.2) stores a `min_key` and `max_key` (first 12 bytes o
 
 ### 8.1 Scale Targets
 
-Ethereum mainnet currently has approximately `2^32` storage slots. With a target load-test scale of `2^36` slots and 64 bytes per entry, with a commitment fanout of `f = 2^6`:
+Ethereum mainnet currently has approximately `2^32` storage slots. With a target load-test scale of `2^36` slots and 64 bytes per entry, with a commitment fanout of `f = 2^7`:
 
 ```
 Total data ≈ 2^36 × (64/63) × 64 B  ≈  4.4 TB
@@ -352,12 +352,12 @@ Total data ≈ 2^36 × (64/63) × 64 B  ≈  4.4 TB
 
 | Parameter | Symbol | Typical value | Description |
 |-----------|--------|---------------|-------------|
-| Commitment stride | `D` | 6 | Trie depth interval between persisted commitment nodes; `D = 6` fits 64 child commitments in one 4 KiB page and matches the routing stride. |
+| Commitment stride | `D` | 7 | Trie depth interval between persisted commitment nodes; `D = 7` gives 128 children whose 128 × 32 = 4,096-byte commitment values fill one 4 KiB page exactly. |
 | Shard bits | `S` | 8 | Number of key prefix bits used for filesystem-level sharding; yields `2^S` independent shard directories. |
-| SSTs per node | `N` | 145 | Maximum SST pages per node data page; `36 + 28 × N ≤ 4096` → N = 145. |
+| SSTs per node | `N` | 146 | Maximum SST pages per node data page; `8 + 28 × N ≤ 4096` → N = 146. |
 | B+-tree entries per node | — | 453 | `(depth : u8, prefix_data : u32, page_id : u32)` = 9 B; floor((4096 − 12) / 9) = 453. |
-| B+-tree height | — | 3 | log₄₅₃(2²²) ≈ 2.5 → 3 levels; stable from 2^32 to 2^36 keys. |
-| B+-tree pinned RAM | — | ≈ 22 MiB | Root + L2 internal pages across all shards; permanently resident after startup. |
+| B+-tree height | — | 2–3 | Height 2 at 2^32 scale (≈ 2^14 routing entries/shard); height 3 at 2^36 scale (≈ 2^21 routing entries/shard). |
+| B+-tree pinned RAM | — | ≈ 12 MiB | Root + L2 internal pages across all 256 shards at 2^36 scale; permanently resident after startup. |
 | Upward compaction trigger | — | 64 pages | SST count at a node that initiates upward split compaction. |
 | Downward merge threshold | — | 16 entries | Total live entries below which a node is merged back into its parent. |
 | Opportunistic merge threshold | `T_opp` | 4 pages | Minimum SST pages loaded for the same prefix node in a single read to queue an opportunistic merge (§6.3). |
