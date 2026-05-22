@@ -14,12 +14,11 @@ pub const ZERO_HASH = merkle.ZERO_HASH;
 pub const STRIDE: u32 = 6;
 pub const PAGE_ENTRIES: u32 = 64;
 pub const CHILD_COUNT: u32 = 64;
-pub const MAX_SST_PER_NODE: u32 = 95;
+pub const S_MAX: u32 = 123; // sorted zone capacity per node
+pub const A_MAX: u32 = 8; // append zone capacity per node
 pub const MAX_DEPTH: u32 = 5;
-pub const PREFIX12_UNIVERSE: u32 = 4097;
-pub const COMPACTION_TRIGGER: u32 = 64;
 pub const MERGE_THRESHOLD: u32 = 16;
-pub const T_OPP: u32 = 4;
+pub const T_OPP: u32 = 2;
 
 // ─── Core key/value types (§2.1) ──────────────────────────────────────────────
 
@@ -30,12 +29,6 @@ pub const KvEntry = struct {
     key: Key,
     value: Value,
 };
-
-// ─── Decoded fingerprint (§7.1) ───────────────────────────────────────────────
-
-pub const DecodedFingerprint = [PAGE_ENTRIES]u16;
-pub const FINGERPRINT_NULL: u16 = 4096;
-pub const NULL_FINGERPRINT: DecodedFingerprint = [_]u16{FINGERPRINT_NULL} ** PAGE_ENTRIES;
 
 // ─── Page addressing (§4.3) ───────────────────────────────────────────────────
 
@@ -51,11 +44,22 @@ pub const SstPage = struct {
 };
 
 // ─── Node page (§4.2.2) ───────────────────────────────────────────────────────
+//
+// On-disk: exactly 4096 bytes (one physical page).
+//   4 B    header (sorted_count u8, append_count u8, _pad[2])
+//   2048 B child_commitments[64]
+//   492 B  sorted_slot_ids[123]   (u32 each)
+//   492 B  sorted_min4[123]       (u32 boundary prefix per sorted page, §7.1)
+//   32 B   append_slot_ids[8]     (u32 each)
+//   1024 B append_prefix16[8][64] (u16 per key, per append page, §7.1)
+//   4 B    _reserved
 
 pub const NodePage = struct {
-    sst_count: u8,
-    sorted_page_count: u8,
+    sorted_count: u8,
+    append_count: u8,
     child_commitments: [CHILD_COUNT]Hash,
-    payload_slot_ids: [MAX_SST_PER_NODE]PayloadSlotId,
-    key_fingerprints: [MAX_SST_PER_NODE]DecodedFingerprint,
+    sorted_slot_ids: [S_MAX]PayloadSlotId,
+    sorted_min4: [S_MAX]u32,
+    append_slot_ids: [A_MAX]PayloadSlotId,
+    append_prefix16: [A_MAX][PAGE_ENTRIES]u16,
 };

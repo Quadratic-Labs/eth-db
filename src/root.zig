@@ -2,15 +2,14 @@
 //!
 //! Core data types and constants live in types.zig; this module holds the
 //! engine structs (RoutingTable, L0Buffer, Pool, Heap, PrefixDB) and the
-//! prefix-helper functions.  page_store.zig and combinadic.zig each import
-//! types.zig directly, keeping the dependency graph acyclic.
+//! prefix-helper functions.  page_store.zig imports types.zig directly,
+//! keeping the dependency graph acyclic.
 
 const std = @import("std");
 
 // ─── Re-export sub-modules ─────────────────────────────────────────────────────
 pub const merkle = @import("merkle.zig");
 pub const page_store = @import("page_store.zig");
-pub const combinadic = @import("combinadic.zig");
 
 // ─── Re-export shared types from types.zig ─────────────────────────────────────
 const t = @import("types.zig");
@@ -19,18 +18,14 @@ pub const ZERO_HASH = t.ZERO_HASH;
 pub const STRIDE = t.STRIDE;
 pub const PAGE_ENTRIES = t.PAGE_ENTRIES;
 pub const CHILD_COUNT = t.CHILD_COUNT;
-pub const MAX_SST_PER_NODE = t.MAX_SST_PER_NODE;
+pub const S_MAX = t.S_MAX;
+pub const A_MAX = t.A_MAX;
 pub const MAX_DEPTH = t.MAX_DEPTH;
-pub const PREFIX12_UNIVERSE = t.PREFIX12_UNIVERSE;
-pub const COMPACTION_TRIGGER = t.COMPACTION_TRIGGER;
 pub const MERGE_THRESHOLD = t.MERGE_THRESHOLD;
 pub const T_OPP = t.T_OPP;
 pub const Key = t.Key;
 pub const Value = t.Value;
 pub const KvEntry = t.KvEntry;
-pub const DecodedFingerprint = t.DecodedFingerprint;
-pub const FINGERPRINT_NULL = t.FINGERPRINT_NULL;
-pub const NULL_FINGERPRINT = t.NULL_FINGERPRINT;
 pub const NodePageId = t.NodePageId;
 pub const PayloadSlotId = t.PayloadSlotId;
 pub const PrefixData = t.PrefixData;
@@ -257,8 +252,10 @@ pub const PrefixDB = struct {
     }
 };
 
-// ─── Prefix helpers (§4.2.1) ──────────────────────────────────────────────────
+// ─── Prefix helpers (§4.2.1, §7.1) ───────────────────────────────────────────
 
+/// prefixData(K, d) = top 6d bits of K, zero-padded into a u32.
+/// Used as the routing table key at depth d.
 pub fn prefixData(key: *const Key, depth: u32) PrefixData {
     const top4: u32 = (@as(u32, key[0]) << 24) | (@as(u32, key[1]) << 16) |
         (@as(u32, key[2]) << 8) | @as(u32, key[3]);
@@ -266,14 +263,30 @@ pub fn prefixData(key: *const Key, depth: u32) PrefixData {
     return top4 >> shift;
 }
 
-pub fn relativePrefix12(key: *const Key, depth: u32) u16 {
-    const bit_offset: u32 = STRIDE * depth;
-    const byte0: usize = @intCast(bit_offset / 8);
-    const bit_in_byte: u5 = @intCast(bit_offset % 8);
+/// prefix32(K, k): the 32 bits of K immediately following the node's 6k-bit
+/// prefix, packed into a u32.  Used as the binary-search key in sorted_min4.
+pub fn prefix32(key: *const Key, depth: u32) u32 {
+    const bit_offset = STRIDE * depth;
+    const byte0: usize = bit_offset / 8;
+    const shift: u6 = @intCast(8 - (bit_offset % 8));
+    const raw: u64 = (@as(u64, key[byte0]) << 32) |
+        (@as(u64, key[byte0 + 1]) << 24) |
+        (@as(u64, key[byte0 + 2]) << 16) |
+        (@as(u64, key[byte0 + 3]) << 8) |
+        @as(u64, key[byte0 + 4]);
+    return @truncate(raw >> shift);
+}
+
+/// prefix16(K, k): the 16 bits of K immediately following the node's 6k-bit
+/// prefix, packed into a u16.  Used to build and query append_prefix16 filters.
+pub fn prefix16(key: *const Key, depth: u32) u16 {
+    const bit_offset = STRIDE * depth;
+    const byte0: usize = bit_offset / 8;
+    const shift: u5 = @intCast(8 - (bit_offset % 8));
     const raw: u32 = (@as(u32, key[byte0]) << 16) |
         (@as(u32, key[byte0 + 1]) << 8) |
         @as(u32, key[byte0 + 2]);
-    return @intCast((raw >> (12 - bit_in_byte)) & 0xFFF);
+    return @truncate(raw >> shift);
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -281,7 +294,6 @@ pub fn relativePrefix12(key: *const Key, depth: u32) u16 {
 // Pull sub-module tests into the test binary.
 test {
     _ = @import("page_store.zig");
-    _ = @import("combinadic.zig");
 }
 
 test "prefixData depth 1 extracts top 6 bits" {
@@ -294,9 +306,63 @@ test "prefixData depth 5 extracts top 30 bits" {
     try std.testing.expectEqual(@as(PrefixData, 0x3FFF_FFFF), prefixData(&key, 5));
 }
 
-test "relativePrefix12 depth 1" {
-    const key = [_]u8{ 0b10110110, 0b00000000, 0 } ++ [_]u8{0} ** 29;
-    try std.testing.expectEqual(@as(u16, 0b100000000000), relativePrefix12(&key, 1));
+test "prefix32 depth 1 — bits [6,38) of key" {
+    // key[0]=0b11111100, key[1..4]=0xFF, key[4]=0b00000000
+    // bits 6..37: 00_11111111_11111111_11111111_00 = 0x00FF_FFFC shifted...
+    // Expected: prefix32 should extract 32 bits starting at bit 6.
+    // key bytes: FC FF FF FF 00 ...
+    //   bit 6 = 0, bit 7 = 0
+    //   bits 8-31 = all 1s (from 3 × 0xFF bytes)
+    //   bits 32-37 = 000000 (from 0x00)
+    // prefix32 = 0b00_11111111_11111111_11111111_000000 packed as u32:
+    //          = 0b0011_1111_1111_1111_1111_1111_0000_00 ... wait that's 30 bits
+    // Let me just compute: bits [6,38) of FC FF FF FF 00:
+    //   byte0=FC=11111100, byte1=FF, byte2=FF, byte3=FF, byte4=00
+    //   raw64 = (0xFC<<32)|(0xFF<<24)|(0xFF<<16)|(0xFF<<8)|0x00 = 0xFC_FF_FF_FF_00
+    //   shift = 8 - (6%8) = 2
+    //   raw64 >> 2 = 0x3F_3F_FF_FF_C0 (roughly)
+    //   & 0xFFFF_FFFF = 0x3F_FF_FF_C0
+    // Let me compute properly:
+    //   0xFC_FF_FF_FF_00 = 1111_1100 1111_1111 1111_1111 1111_1111 0000_0000
+    //   >> 2            = 0011_1111 0011_1111 1111_1111 1111_1111 1100_0000
+    //   lower 32 bits   = 0011_1111 1111_1111 1111_1111 1100_0000
+    //                   = 0x3FFF_FFC0
+    const key = [_]u8{ 0xFC, 0xFF, 0xFF, 0xFF, 0x00 } ++ [_]u8{0} ** 27;
+    try std.testing.expectEqual(@as(u32, 0x3FFF_FFC0), prefix32(&key, 1));
+}
+
+test "prefix32 depth 4 — bit_in_byte = 0" {
+    // depth=4 → bit_offset=24, byte0=3, bit_in_byte=0, shift=8
+    // raw64 = (key[3]<<32)|(key[4]<<24)|(key[5]<<16)|(key[6]<<8)|key[7]
+    // shift=8 → raw64>>8 & 0xFFFF_FFFF = key[3]<<24|key[4]<<16|key[5]<<8|key[6]
+    const key = [_]u8{0} ** 3 ++ [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE } ++ [_]u8{0} ** 24;
+    try std.testing.expectEqual(@as(u32, 0xAABB_CCDD), prefix32(&key, 4));
+}
+
+test "prefix16 depth 1 — bits [6,22) of key" {
+    // depth=1 → bit_offset=6, byte0=0, bit_in_byte=6, shift=2
+    // raw = (key[0]<<16)|(key[1]<<8)|key[2]
+    // key = FC 00 F0 → raw = 0xFC_00_F0
+    // >> 2 = 0x3F_00_3C; & 0xFFFF = 0x003C
+    const key = [_]u8{ 0xFC, 0x00, 0xF0 } ++ [_]u8{0} ** 29;
+    try std.testing.expectEqual(@as(u16, 0x003C), prefix16(&key, 1));
+}
+
+test "prefix16 depth 4 — bit_in_byte = 0" {
+    // depth=4 → bit_offset=24, byte0=3, bit_in_byte=0, shift=8
+    // raw = (key[3]<<16)|(key[4]<<8)|key[5]; >>8 = key[3]<<8|key[4]
+    const key = [_]u8{0} ** 3 ++ [_]u8{ 0xAB, 0xCD, 0xFF } ++ [_]u8{0} ** 26;
+    try std.testing.expectEqual(@as(u16, 0xABCD), prefix16(&key, 4));
+}
+
+test "prefix16 sub-prefix promotion check — top 6 bits" {
+    // §6.1 step 6: if (prefix16_sorted[0] >> 10) == (prefix16_sorted[63] >> 10)
+    // then all 64 entries share the same 6-bit sub-prefix.
+    const uniform_low: u16 = 0b0000_0100_0000_0000; // top 6 = 0b000001
+    const uniform_high: u16 = 0b0000_0111_1111_1111; // top 6 = 0b000001
+    const different: u16 = 0b0000_1000_0000_0000; // top 6 = 0b000010
+    try std.testing.expectEqual(uniform_low >> 10, uniform_high >> 10);
+    try std.testing.expect((uniform_low >> 10) != (different >> 10));
 }
 
 test "RoutingTable put and get" {
@@ -338,10 +404,12 @@ test "Heap write and retrieve node page" {
     var heap = try Heap.init(std.testing.allocator, 8, 32);
     defer heap.deinit();
     var page = std.mem.zeroes(NodePage);
-    page.sst_count = 2;
+    page.sorted_count = 2;
+    page.append_count = 1;
     const id = try heap.writeNodePage(page);
     const p = heap.nodePagePtr(id).?;
-    try std.testing.expectEqual(@as(u8, 2), p.sst_count);
+    try std.testing.expectEqual(@as(u8, 2), p.sorted_count);
+    try std.testing.expectEqual(@as(u8, 1), p.append_count);
     heap.freeNodePage(id);
     try std.testing.expectEqual(@as(?*NodePage, null), heap.nodePagePtr(id));
 }

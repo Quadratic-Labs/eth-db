@@ -1,4 +1,4 @@
-//! On-disk page I/O for KV payload (SST) pages (§4.3).
+//! On-disk page I/O for KV payload (SST) pages and node pages (§4.3).
 //!
 //! Addressing — a 32-bit page ID splits as:
 //!   bits 31..20  →  container_id  (one file per container, up to 4096 files)
@@ -6,12 +6,19 @@
 //!
 //! On-disk SST page: exactly 4096 bytes = 64 × KvEntry.
 //! The in-memory `count` field is NOT written — it is recovered from the
-//! node-page fingerprint (§4.2.2).  Callers that receive a page via `read`
-//! get `count = PAGE_ENTRIES`; they must apply the fingerprint to narrow it.
+//! node-page sorted_min4 / append_prefix16 arrays (§4.2.2).
+//!
+//! On-disk node page: exactly 4096 bytes (one physical page).
+//!   bytes    0 –    3  : header (sorted_count u8, append_count u8, _pad[2])
+//!   bytes    4 – 2051  : child_commitments[64]      (64 × 32 = 2048 B)
+//!   bytes 2052 – 2543  : sorted_slot_ids[123]        (123 × 4 = 492 B, LE u32)
+//!   bytes 2544 – 3035  : sorted_min4[123]            (123 × 4 = 492 B, LE u32)
+//!   bytes 3036 – 3067  : append_slot_ids[8]          (8 × 4 = 32 B, LE u32)
+//!   bytes 3068 – 4091  : append_prefix16[8][64]      (8 × 64 × 2 = 1024 B, LE u16)
+//!   bytes 4092 – 4095  : _reserved (zero)
 
 const std = @import("std");
 const root = @import("types.zig");
-const combinadic = @import("combinadic.zig");
 
 pub const PAGE_SIZE: u32 = 4096;
 
@@ -52,7 +59,7 @@ pub const SstPageStore = struct {
 
     /// Read the SST page at heap slot `id`.
     /// Returns the page with `count = PAGE_ENTRIES`; callers must narrow this
-    /// from the associated node-page fingerprint.
+    /// from the associated node-page filter data.
     pub fn read(self: *SstPageStore, id: root.PayloadSlotId) !root.SstPage {
         const f = try self.openContainer(containerId(id), .read);
         defer f.close();
@@ -79,76 +86,89 @@ pub const SstPageStore = struct {
 };
 
 // ─── Node page store ──────────────────────────────────────────────────────────
-//
-// On-disk NodePage layout (fixed 8192 bytes = 2 physical pages):
-//
-//   bytes    0 –    3  : header  (sst_count u8, sorted_page_count u8, _pad[2])
-//   bytes    4 – 2051  : child_commitments[64]  (64 × 32 = 2048 B)
-//   bytes 2052 – 2431  : payload_slot_ids[95]   (95 × 4  =  380 B, little-endian)
-//   bytes 2432 – 8131  : key_fingerprints[95]   (95 × 60 = 5700 B, combinadic)
-//   bytes 8132 – 8191  : trailing padding (60 B, zero)
-//
-// The fingerprint slots beyond sst_count are encoded as NULL_FINGERPRINT, so
-// the entire 8192-byte block is always written / read without branching on count.
 
-const NODE_PAGE_SIZE: u32 = 8192;
+const NODE_PAGE_SIZE: u32 = 4096;
 const NODE_COMMITMENTS_OFF: u32 = 4;
-const NODE_SLOT_IDS_OFF: u32 = 2052;
-const NODE_FINGERPRINTS_OFF: u32 = 2432;
+const NODE_SORTED_IDS_OFF: u32 = 2052; // 4 + 2048
+const NODE_SORTED_MIN4_OFF: u32 = 2544; // 2052 + 492
+const NODE_APPEND_IDS_OFF: u32 = 3036; // 2544 + 492
+const NODE_APPEND_PREFIX16_OFF: u32 = 3068; // 3036 + 32
+// _reserved: 4092–4095
 
-fn nodeFileOffset(local_block: u32) u64 {
-    return @as(u64, local_block) * NODE_PAGE_SIZE;
+comptime {
+    // Verify the on-disk layout totals exactly one physical page.
+    const tail = NODE_APPEND_PREFIX16_OFF + root.A_MAX * root.PAGE_ENTRIES * 2 + 4;
+    if (tail != NODE_PAGE_SIZE) @compileError("NodePage layout does not fit in 4096 bytes");
 }
 
 fn serialiseNodePage(page: *const root.NodePage, buf: *[NODE_PAGE_SIZE]u8) void {
-    buf[0] = page.sst_count;
-    buf[1] = page.sorted_page_count;
+    buf[0] = page.sorted_count;
+    buf[1] = page.append_count;
     buf[2] = 0;
     buf[3] = 0;
 
     // child_commitments: 64 × 32 bytes, endian-neutral (byte arrays)
     @memcpy(buf[NODE_COMMITMENTS_OFF..][0..2048], std.mem.asBytes(&page.child_commitments));
 
-    // payload_slot_ids: 95 × u32, little-endian
-    for (page.payload_slot_ids, 0..) |id, i| {
-        std.mem.writeInt(u32, buf[NODE_SLOT_IDS_OFF + i * 4 ..][0..4], id, .little);
+    // sorted_slot_ids: 123 × u32, little-endian
+    for (page.sorted_slot_ids, 0..) |id, i| {
+        std.mem.writeInt(u32, buf[NODE_SORTED_IDS_OFF + i * 4 ..][0..4], id, .little);
     }
 
-    // key_fingerprints: 95 × 60 bytes, combinadic-encoded
-    for (page.key_fingerprints, 0..) |fp, i| {
-        const enc = combinadic.encode(&fp);
-        @memcpy(buf[NODE_FINGERPRINTS_OFF + i * 60 ..][0..60], &enc);
+    // sorted_min4: 123 × u32, little-endian
+    for (page.sorted_min4, 0..) |m, i| {
+        std.mem.writeInt(u32, buf[NODE_SORTED_MIN4_OFF + i * 4 ..][0..4], m, .little);
     }
 
-    // trailing padding
-    @memset(buf[8132..8192], 0);
+    // append_slot_ids: 8 × u32, little-endian
+    for (page.append_slot_ids, 0..) |id, i| {
+        std.mem.writeInt(u32, buf[NODE_APPEND_IDS_OFF + i * 4 ..][0..4], id, .little);
+    }
+
+    // append_prefix16: 8 × 64 × u16, little-endian; each row is 128 bytes
+    for (page.append_prefix16, 0..) |row, pi| {
+        for (row, 0..) |v, ki| {
+            std.mem.writeInt(u16, buf[NODE_APPEND_PREFIX16_OFF + pi * 128 + ki * 2 ..][0..2], v, .little);
+        }
+    }
+
+    // trailing reserved bytes
+    @memset(buf[4092..4096], 0);
 }
 
 fn deserialiseNodePage(buf: *const [NODE_PAGE_SIZE]u8) root.NodePage {
     var page: root.NodePage = undefined;
-    page.sst_count = buf[0];
-    page.sorted_page_count = buf[1];
+    page.sorted_count = buf[0];
+    page.append_count = buf[1];
 
     @memcpy(std.mem.asBytes(&page.child_commitments), buf[NODE_COMMITMENTS_OFF..][0..2048]);
 
-    for (0..root.MAX_SST_PER_NODE) |i| {
-        page.payload_slot_ids[i] = std.mem.readInt(u32, buf[NODE_SLOT_IDS_OFF + i * 4 ..][0..4], .little);
+    for (0..root.S_MAX) |i| {
+        page.sorted_slot_ids[i] = std.mem.readInt(u32, buf[NODE_SORTED_IDS_OFF + i * 4 ..][0..4], .little);
     }
 
-    for (0..root.MAX_SST_PER_NODE) |i| {
-        const enc: *const [60]u8 = buf[NODE_FINGERPRINTS_OFF + i * 60 ..][0..60];
-        page.key_fingerprints[i] = combinadic.decode(enc);
+    for (0..root.S_MAX) |i| {
+        page.sorted_min4[i] = std.mem.readInt(u32, buf[NODE_SORTED_MIN4_OFF + i * 4 ..][0..4], .little);
     }
+
+    for (0..root.A_MAX) |i| {
+        page.append_slot_ids[i] = std.mem.readInt(u32, buf[NODE_APPEND_IDS_OFF + i * 4 ..][0..4], .little);
+    }
+
+    for (0..root.A_MAX) |pi| {
+        for (0..root.PAGE_ENTRIES) |ki| {
+            page.append_prefix16[pi][ki] = std.mem.readInt(u16, buf[NODE_APPEND_PREFIX16_OFF + pi * 128 + ki * 2 ..][0..2], .little);
+        }
+    }
+
     return page;
 }
 
 /// Persistent store for node pages (§4.2.2 / §4.3).
 ///
 /// Container files are named `node_XXXXXXXX.dat` inside `dir`.
-/// Each NodePageId maps to an 8 KiB block: bits 31..20 select the container
+/// Each NodePageId maps to a 4 KiB block: bits 31..20 select the container
 /// file, bits 19..0 give the block index within the file.
-/// The on-disk encoding uses combinadic fingerprints (§7.1), not the decoded
-/// in-memory form.
 pub const NodePageStore = struct {
     dir: std.fs.Dir,
 
@@ -162,7 +182,7 @@ pub const NodePageStore = struct {
         serialiseNodePage(page, &buf);
         const f = try self.openContainer(containerId(id), .write);
         defer f.close();
-        try f.seekTo(nodeFileOffset(localPage(id)));
+        try f.seekTo(fileOffset(localPage(id)));
         try f.writeAll(&buf);
     }
 
@@ -171,7 +191,7 @@ pub const NodePageStore = struct {
         var buf: [NODE_PAGE_SIZE]u8 = undefined;
         const f = try self.openContainer(containerId(id), .read);
         defer f.close();
-        try f.seekTo(nodeFileOffset(localPage(id)));
+        try f.seekTo(fileOffset(localPage(id)));
         const n = try f.readAll(&buf);
         if (n != NODE_PAGE_SIZE) return error.UnexpectedEof;
         return deserialiseNodePage(&buf);
@@ -206,7 +226,7 @@ test "SstPageStore write and read round-trip" {
 
     try std.testing.expectEqual(page.entries[0], got.entries[0]);
     try std.testing.expectEqual(page.entries[1], got.entries[1]);
-    // count is PAGE_ENTRIES on read — caller narrows via fingerprint
+    // count is PAGE_ENTRIES on read — caller narrows via node-page filter
     try std.testing.expectEqual(@as(u8, root.PAGE_ENTRIES), got.count);
 }
 
@@ -220,8 +240,8 @@ test "SstPageStore multiple pages in one container" {
     var pb = std.mem.zeroes(root.SstPage);
     pb.entries[0].key = [_]u8{0xBB} ** 32;
 
-    try store.write(0, &pa); // container 0, local 0
-    try store.write(1, &pb); // container 0, local 1
+    try store.write(0, &pa);
+    try store.write(1, &pb);
 
     const ga = try store.read(0);
     const gb = try store.read(1);
@@ -239,8 +259,8 @@ test "SstPageStore pages across containers" {
     var p1 = std.mem.zeroes(root.SstPage);
     p1.entries[0].key = [_]u8{0x22} ** 32;
 
-    const id0: root.PayloadSlotId = (0 << 20) | 0; // container 0, local 0
-    const id1: root.PayloadSlotId = (1 << 20) | 0; // container 1, local 0
+    const id0: root.PayloadSlotId = (0 << 20) | 0;
+    const id1: root.PayloadSlotId = (1 << 20) | 0;
 
     try store.write(id0, &p0);
     try store.write(id1, &p1);
@@ -256,7 +276,6 @@ test "SstPageStore non-zero offset within container" {
     defer tmp.cleanup();
     var store = SstPageStore.init(tmp.dir);
 
-    // Write to page 7 (local_page = 7, skipping pages 0-6)
     const id: root.PayloadSlotId = 7;
     var page = std.mem.zeroes(root.SstPage);
     page.entries[3].key = [_]u8{0xFF} ** 32;
@@ -292,68 +311,78 @@ test "NodePageStore write and read round-trip — sparse page" {
     var store = NodePageStore.init(tmp.dir);
 
     var page = std.mem.zeroes(root.NodePage);
-    page.sst_count = 2;
-    page.sorted_page_count = 1;
-    // Set some non-trivial child commitments
+    page.sorted_count = 2;
+    page.append_count = 1;
     page.child_commitments[0] = [_]u8{0xAB} ** 32;
     page.child_commitments[63] = [_]u8{0xCD} ** 32;
-    // Two payload slot IDs
-    page.payload_slot_ids[0] = 42;
-    page.payload_slot_ids[1] = 99;
-    // Two fingerprints: a simple one and the null fingerprint
-    page.key_fingerprints[0] = root.NULL_FINGERPRINT;
-    page.key_fingerprints[0][0] = 0;
-    page.key_fingerprints[0][1] = 7;
-    // key_fingerprints[1] stays zero-initialised (all zeros ≠ null, but valid sorted)
+    page.sorted_slot_ids[0] = 42;
+    page.sorted_slot_ids[1] = 99;
+    page.sorted_min4[0] = 0x0000_1234;
+    page.sorted_min4[1] = 0x0000_5678;
+    page.append_slot_ids[0] = 7;
+    // append_prefix16[0] — 64 u16 values for the one append page
+    for (&page.append_prefix16[0], 0..) |*v, i| v.* = @intCast(i * 100);
 
     try store.write(0, &page);
     const got = try store.read(0);
 
-    try std.testing.expectEqual(page.sst_count, got.sst_count);
-    try std.testing.expectEqual(page.sorted_page_count, got.sorted_page_count);
+    try std.testing.expectEqual(page.sorted_count, got.sorted_count);
+    try std.testing.expectEqual(page.append_count, got.append_count);
     try std.testing.expectEqual(page.child_commitments[0], got.child_commitments[0]);
     try std.testing.expectEqual(page.child_commitments[63], got.child_commitments[63]);
-    try std.testing.expectEqual(page.payload_slot_ids[0], got.payload_slot_ids[0]);
-    try std.testing.expectEqual(page.payload_slot_ids[1], got.payload_slot_ids[1]);
-    try std.testing.expectEqual(page.key_fingerprints[0], got.key_fingerprints[0]);
+    try std.testing.expectEqual(page.sorted_slot_ids[0], got.sorted_slot_ids[0]);
+    try std.testing.expectEqual(page.sorted_slot_ids[1], got.sorted_slot_ids[1]);
+    try std.testing.expectEqual(page.sorted_min4[0], got.sorted_min4[0]);
+    try std.testing.expectEqual(page.sorted_min4[1], got.sorted_min4[1]);
+    try std.testing.expectEqual(page.append_slot_ids[0], got.append_slot_ids[0]);
+    try std.testing.expectEqualSlices(u16, &page.append_prefix16[0], &got.append_prefix16[0]);
 }
 
-test "NodePageStore round-trip — full child_commitments" {
+test "NodePageStore round-trip — full sorted zone" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = NodePageStore.init(tmp.dir);
 
     var page = std.mem.zeroes(root.NodePage);
-    page.sst_count = 0;
-    for (&page.child_commitments, 0..) |*h, i| {
-        @memset(h, @intCast(i + 1));
-    }
+    page.sorted_count = root.S_MAX;
+    page.append_count = 0;
+    for (&page.sorted_slot_ids, 0..) |*id, i| id.* = @intCast(i);
+    for (&page.sorted_min4, 0..) |*m, i| m.* = @intCast(i * 0x100);
+    for (&page.child_commitments, 0..) |*h, i| @memset(h, @intCast(i + 1));
 
-    try store.write(1, &page);
-    const got = try store.read(1);
+    try store.write(0, &page);
+    const got = try store.read(0);
 
+    try std.testing.expectEqual(@as(u8, root.S_MAX), got.sorted_count);
+    try std.testing.expectEqual(@as(u32, 122), got.sorted_slot_ids[122]);
+    try std.testing.expectEqual(@as(u32, 122 * 0x100), got.sorted_min4[122]);
     for (page.child_commitments, got.child_commitments) |a, b| {
         try std.testing.expectEqual(a, b);
     }
 }
 
-test "NodePageStore round-trip — NULL_FINGERPRINT for all 95 slots" {
+test "NodePageStore round-trip — full append zone" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = NodePageStore.init(tmp.dir);
 
     var page = std.mem.zeroes(root.NodePage);
-    page.sst_count = root.MAX_SST_PER_NODE;
-    for (&page.key_fingerprints) |*fp| fp.* = root.NULL_FINGERPRINT;
-    for (&page.payload_slot_ids, 0..) |*id, i| id.* = @intCast(i);
+    page.sorted_count = 0;
+    page.append_count = root.A_MAX;
+    for (&page.append_slot_ids, 0..) |*id, i| id.* = @intCast(1000 + i);
+    // Fill all 8 × 64 prefix16 entries with recognisable values.
+    for (&page.append_prefix16, 0..) |*row, pi| {
+        for (row, 0..) |*v, ki| v.* = @intCast(pi * 1000 + ki);
+    }
 
-    try store.write(0, &page);
-    const got = try store.read(0);
+    try store.write(1, &page);
+    const got = try store.read(1);
 
-    try std.testing.expectEqual(page.sst_count, got.sst_count);
-    try std.testing.expectEqual(root.NULL_FINGERPRINT, got.key_fingerprints[0]);
-    try std.testing.expectEqual(root.NULL_FINGERPRINT, got.key_fingerprints[94]);
-    try std.testing.expectEqual(@as(u32, 94), got.payload_slot_ids[94]);
+    try std.testing.expectEqual(@as(u8, root.A_MAX), got.append_count);
+    for (0..root.A_MAX) |pi| {
+        try std.testing.expectEqual(@as(u32, 1000) + @as(u32, @intCast(pi)), got.append_slot_ids[pi]);
+        try std.testing.expectEqualSlices(u16, &page.append_prefix16[pi], &got.append_prefix16[pi]);
+    }
 }
 
 test "NodePageStore pages across containers" {
@@ -362,11 +391,11 @@ test "NodePageStore pages across containers" {
     var store = NodePageStore.init(tmp.dir);
 
     var p0 = std.mem.zeroes(root.NodePage);
-    p0.sst_count = 1;
+    p0.sorted_count = 1;
     p0.child_commitments[0] = [_]u8{0x11} ** 32;
 
     var p1 = std.mem.zeroes(root.NodePage);
-    p1.sst_count = 2;
+    p1.sorted_count = 2;
     p1.child_commitments[0] = [_]u8{0x22} ** 32;
 
     const id0: root.NodePageId = (0 << 20) | 0;
@@ -376,8 +405,8 @@ test "NodePageStore pages across containers" {
 
     const g0 = try store.read(id0);
     const g1 = try store.read(id1);
-    try std.testing.expectEqual(@as(u8, 1), g0.sst_count);
-    try std.testing.expectEqual(@as(u8, 2), g1.sst_count);
+    try std.testing.expectEqual(@as(u8, 1), g0.sorted_count);
+    try std.testing.expectEqual(@as(u8, 2), g1.sorted_count);
     try std.testing.expectEqual(p0.child_commitments[0], g0.child_commitments[0]);
     try std.testing.expectEqual(p1.child_commitments[0], g1.child_commitments[0]);
 }
