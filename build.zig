@@ -115,6 +115,22 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
+    // Shared library for the Python ctypes bindings.
+    const lib = b.addLibrary(.{
+        .name = "prefixdb",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/c_api.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(lib);
+
+    const install_lib = b.addInstallArtifact(lib, .{});
+    const lib_step = b.step("lib", "Build the Python shared library (libprefixdb.so)");
+    lib_step.dependOn(&install_lib.step);
+
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.
