@@ -10,6 +10,7 @@ const std = @import("std");
 // ─── Re-export sub-modules ─────────────────────────────────────────────────────
 pub const merkle = @import("merkle.zig");
 pub const page_store = @import("page_store.zig");
+const cache_mod = @import("cache.zig");
 
 // ─── Re-export shared types from types.zig ─────────────────────────────────────
 const t = @import("types.zig");
@@ -169,60 +170,164 @@ pub fn Pool(comptime T: type) type {
     };
 }
 
+// ─── Cache configuration (§4.3) ───────────────────────────────────────────────
+
+/// Maximum node-page slots at depths 1–2 (64 L1 nodes + 4096 L2 nodes).
+/// Node pages with IDs in `0..PIN_NODE_CAP` are always kept in RAM.
+pub const PIN_NODE_CAP: u32 = CHILD_COUNT + CHILD_COUNT * CHILD_COUNT; // 4160
+
+pub const DEFAULT_NODE_CACHE_CAP: u32 = 1024;
+pub const DEFAULT_SST_CACHE_CAP: u32 = 4096;
+
+/// Controls the size of the two configurable caches for depths ≥ 3.
+pub const CacheConfig = struct {
+    /// LRU capacity for node pages at depth ≥ 3.
+    node_cap: u32 = DEFAULT_NODE_CACHE_CAP,
+    /// LRU capacity for SST (KV) pages across all depths.
+    sst_cap: u32 = DEFAULT_SST_CACHE_CAP,
+};
+
 // ─── Page heap (§4.3) ─────────────────────────────────────────────────────────
+//
+// Three storage tiers:
+//
+//   pin_nodes   — Pool(NodePage) for depths 1–2, always in RAM, IDs 0..PIN_NODE_CAP-1.
+//   node_cache  — LruCache(NodePage) for depths 3–5, configurable size, write-through
+//                 to disk (NodePageStore) when a store_dir is provided.  On a cache
+//                 miss the page is reloaded from disk.
+//   sst_cache   — LruCache(SstPage) for all depths, configurable size.  SST pages are
+//                 not written to disk in this implementation (count field not preserved
+//                 in the on-disk format); the cache acts as a bounded pool and returns
+//                 error.SstCacheFull when capacity is exceeded.
 
 pub const Heap = struct {
-    node_pool: Pool(NodePage),
-    sst_pool: Pool(SstPage),
+    // Depths 1-2: node pages pinned to RAM (never evicted).
+    pin_nodes: Pool(NodePage),
+
+    // Depths 3-5: node pages in an LRU cache, backed by disk when a store is available.
+    node_cache: cache_mod.LruCache(NodePage),
+    // Monotonically-increasing counter; each depth-≥3 node page gets a unique ID ≥ PIN_NODE_CAP.
+    next_node_id: NodePageId,
+
+    // All depths: SST (KV) pages in a bounded LRU cache.
+    sst_cache: cache_mod.LruCache(SstPage),
+    // Monotonically-increasing counter for SST page IDs.
+    next_sst_id: PayloadSlotId,
+
+    // Optional disk stores for node pages (write-through and miss-reload).
+    node_store: ?page_store.NodePageStore,
+    // sst_store reserved for a future release when the on-disk format includes count.
+    sst_store: ?page_store.SstPageStore,
+
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, node_cap: u32, sst_cap: u32) !Heap {
-        var node_pool = try Pool(NodePage).init(allocator, node_cap);
-        errdefer node_pool.deinit(allocator);
-        const sst_pool = try Pool(SstPage).init(allocator, sst_cap);
-        return .{ .node_pool = node_pool, .sst_pool = sst_pool, .allocator = allocator };
+    pub fn init(allocator: std.mem.Allocator, config: CacheConfig, store_dir: ?std.fs.Dir) !Heap {
+        var pin_nodes = try Pool(NodePage).init(allocator, PIN_NODE_CAP);
+        errdefer pin_nodes.deinit(allocator);
+
+        var node_cache = try cache_mod.LruCache(NodePage).init(allocator, config.node_cap);
+        errdefer node_cache.deinit(allocator);
+
+        const sst_cache = try cache_mod.LruCache(SstPage).init(allocator, config.sst_cap);
+
+        return .{
+            .pin_nodes = pin_nodes,
+            .node_cache = node_cache,
+            .next_node_id = PIN_NODE_CAP,
+            .sst_cache = sst_cache,
+            .next_sst_id = 0,
+            .node_store = if (store_dir) |d| page_store.NodePageStore.init(d) else null,
+            .sst_store = if (store_dir) |d| page_store.SstPageStore.init(d) else null,
+            .allocator = allocator,
+        };
     }
 
     pub fn deinit(self: *Heap) void {
-        self.node_pool.deinit(self.allocator);
-        self.sst_pool.deinit(self.allocator);
+        self.pin_nodes.deinit(self.allocator);
+        self.node_cache.deinit(self.allocator);
+        self.sst_cache.deinit(self.allocator);
     }
 
-    pub fn writeNodePage(self: *Heap, page: NodePage) !NodePageId {
-        const id = self.node_pool.alloc() orelse return error.NodePoolFull;
-        self.node_pool.pages[id] = page;
+    /// Write a node page.  Depth ≤ 2 → pinned pool; depth ≥ 3 → LRU cache + disk.
+    pub fn writeNodePage(self: *Heap, depth: u32, page: NodePage) !NodePageId {
+        if (depth <= 2) {
+            const id = self.pin_nodes.alloc() orelse return error.PinnedNodePoolFull;
+            self.pin_nodes.pages[id] = page;
+            return id;
+        }
+        // Depth 3-5: refuse without a disk store if the cache would need to evict.
+        if (self.node_cache.len >= self.node_cache.cap and self.node_store == null) {
+            return error.NodeCacheFull;
+        }
+        const id = self.next_node_id;
+        self.next_node_id += 1;
+        // Write-through: persist before inserting so an evicted entry is recoverable.
+        if (self.node_store) |*store| try store.write(id, &page);
+        try self.node_cache.put(id, page);
         return id;
     }
 
+    /// Write an SST page (write-through to disk when a store is configured).
+    /// Without a disk store the cache acts as a bounded pool; SstCacheFull is
+    /// returned rather than silently evicting data that cannot be recovered.
     pub fn writeSstPage(self: *Heap, page: SstPage) !PayloadSlotId {
-        const id = self.sst_pool.alloc() orelse return error.SstPoolFull;
-        self.sst_pool.pages[id] = page;
+        if (self.sst_store == null and self.sst_cache.len >= self.sst_cache.cap)
+            return error.SstCacheFull;
+        const id = self.next_sst_id;
+        self.next_sst_id += 1;
+        if (self.sst_store) |*store| try store.write(id, &page);
+        try self.sst_cache.put(id, page);
         return id;
     }
 
-    pub fn nodePagePtr(self: *Heap, id: NodePageId) ?*NodePage {
-        if (!self.node_pool.isLive(id)) return null;
-        return self.node_pool.getPtr(id);
+    /// Retrieve a node page by ID.  Returns null if the slot is no longer live.
+    /// For depth-≥3 IDs a cache miss triggers a disk load when a store is available.
+    pub fn getNodePage(self: *Heap, id: NodePageId) !?NodePage {
+        if (id < PIN_NODE_CAP) {
+            if (!self.pin_nodes.isLive(id)) return null;
+            return self.pin_nodes.pages[id];
+        }
+        // LRU cache lookup.
+        if (self.node_cache.get(id)) |page| return page;
+        // Cache miss: reload from disk.
+        if (self.node_store) |*store| {
+            const page = try store.read(id);
+            try self.node_cache.put(id, page);
+            return page;
+        }
+        return error.NodeNotInCache;
     }
 
-    pub fn sstPagePtr(self: *Heap, id: PayloadSlotId) ?*SstPage {
-        if (!self.sst_pool.isLive(id)) return null;
-        return self.sst_pool.getPtr(id);
+    /// Retrieve an SST page by ID.  On a cache miss, reloads from disk when a
+    /// store is configured.  Returns null only when no store is available and
+    /// the page is not in cache (should not happen under normal operation).
+    /// NOTE: the returned page's `count` field reflects the disk-read default
+    /// (PAGE_ENTRIES); callers must override it from the owning node's
+    /// sorted_page_counts / append_page_counts before using count-sensitive ops.
+    pub fn getSstPage(self: *Heap, id: PayloadSlotId) !?SstPage {
+        if (self.sst_cache.get(id)) |page| return page;
+        if (self.sst_store) |*store| {
+            const page = try store.read(id);
+            try self.sst_cache.put(id, page);
+            return page;
+        }
+        return null;
     }
 
     pub fn freeNodePage(self: *Heap, id: NodePageId) void {
-        self.node_pool.free(id);
+        if (id < PIN_NODE_CAP) {
+            self.pin_nodes.free(id);
+        } else {
+            self.node_cache.remove(id);
+        }
     }
 
     pub fn freeSstPage(self: *Heap, id: PayloadSlotId) void {
-        self.sst_pool.free(id);
+        self.sst_cache.remove(id);
     }
 };
 
 // ─── PrefixDB top-level engine (§1) ───────────────────────────────────────────
-
-pub const DEFAULT_NODE_CAP: u32 = 256;
-pub const DEFAULT_SST_CAP: u32 = 1024;
 
 /// Identifies a node (depth, prefix) for the compaction queue.
 pub const NodeCoord = struct {
@@ -238,11 +343,20 @@ pub const PrefixDB = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) !PrefixDB {
-        return initCapacity(allocator, DEFAULT_NODE_CAP, DEFAULT_SST_CAP);
+        return initWithConfig(allocator, .{}, null);
     }
 
+    /// Compatibility wrapper: maps the old (node_cap, sst_cap) pair to CacheConfig.
     pub fn initCapacity(allocator: std.mem.Allocator, node_cap: u32, sst_cap: u32) !PrefixDB {
-        var heap = try Heap.init(allocator, node_cap, sst_cap);
+        return initWithConfig(allocator, .{ .node_cap = node_cap, .sst_cap = sst_cap }, null);
+    }
+
+    pub fn initWithConfig(
+        allocator: std.mem.Allocator,
+        config: CacheConfig,
+        store_dir: ?std.fs.Dir,
+    ) !PrefixDB {
+        var heap = try Heap.init(allocator, config, store_dir);
         errdefer heap.deinit();
         return .{
             .l0 = L0Buffer.init(allocator),
@@ -274,7 +388,7 @@ pub const PrefixDB = struct {
     // ─── Read (§5.1) ──────────────────────────────────────────────────────────
 
     /// Return the most-recent value for key, or null if not present.
-    pub fn read(self: *PrefixDB, key: Key) ?Value {
+    pub fn read(self: *PrefixDB, key: Key) !?Value {
         // Step 1: L0 — scan backwards so the most-recent write is found first.
         var i: usize = self.l0.entries.items.len;
         while (i > 0) {
@@ -289,7 +403,7 @@ pub const PrefixDB = struct {
             const d: u32 = @intCast(d_usize);
             const p = prefixData(&key, d);
             const node_id = self.routing.get(d, p) orelse continue;
-            const node = self.heap.nodePagePtr(node_id) orelse continue;
+            const node = (try self.heap.getNodePage(node_id)) orelse continue;
 
             const q = prefix32(&key, d);
             const f = prefix16(&key, d);
@@ -300,10 +414,12 @@ pub const PrefixDB = struct {
             var j: usize = node.append_count;
             while (j > 0 and append_result == null) {
                 j -= 1;
-                if (filterContains(&node.append_prefix16[j], f)) {
+                if (filterContains(&node.append_prefix16[j], node.append_page_counts[j], f)) {
                     opp_count += 1;
-                    if (self.heap.sstPagePtr(node.append_slot_ids[j])) |sst| {
-                        append_result = binarySearchSst(sst, &key);
+                    if (try self.heap.getSstPage(node.append_slot_ids[j])) |sst_raw| {
+                        var sst = sst_raw;
+                        sst.count = node.append_page_counts[j];
+                        append_result = binarySearchSst(&sst, &key);
                     }
                 }
             }
@@ -311,17 +427,18 @@ pub const PrefixDB = struct {
             // Sorted zone (fallback when key not found in append zone).
             var sorted_result: ?Value = null;
             if (append_result == null and node.sorted_count > 0) {
-                // Upper-bound search: find first index where sorted_min4[idx] > q.
                 var lo: usize = 0;
                 var hi: usize = node.sorted_count;
                 while (lo < hi) {
                     const mid = lo + (hi - lo) / 2;
                     if (node.sorted_min4[mid] <= q) lo = mid + 1 else hi = mid;
                 }
-                // lo-1 is the last page whose min key ≤ q; that page may contain K.
                 if (lo > 0) {
-                    if (self.heap.sstPagePtr(node.sorted_slot_ids[lo - 1])) |sst| {
-                        sorted_result = binarySearchSst(sst, &key);
+                    const pg_idx = lo - 1;
+                    if (try self.heap.getSstPage(node.sorted_slot_ids[pg_idx])) |sst_raw| {
+                        var sst = sst_raw;
+                        sst.count = node.sorted_page_counts[pg_idx];
+                        sorted_result = binarySearchSst(&sst, &key);
                     }
                 }
             }
@@ -331,7 +448,6 @@ pub const PrefixDB = struct {
                 self.compaction_queue.append(self.allocator, .{ .depth = d, .prefix = p }) catch {};
             }
 
-            // Append zone overrides sorted zone; return on first depth that holds the key.
             const depth_result = append_result orelse sorted_result;
             if (depth_result != null) return depth_result;
         }
@@ -345,8 +461,6 @@ pub const PrefixDB = struct {
     fn flushL0Prefix(self: *PrefixDB, prefix: PrefixData) !void {
         const alloc = self.allocator;
 
-        // Collect unique keys: iterate L0 backwards so the first occurrence of
-        // each key we encounter is its most recent value.
         var map = std.AutoHashMap(Key, Value).init(alloc);
         defer map.deinit();
 
@@ -360,7 +474,6 @@ pub const PrefixDB = struct {
             }
         }
 
-        // Rebuild L0 without this prefix group.
         var new_entries = std.ArrayList(KvEntry){};
         errdefer new_entries.deinit(alloc);
         for (self.l0.entries.items) |e| {
@@ -373,7 +486,6 @@ pub const PrefixDB = struct {
 
         if (map.count() == 0) return;
 
-        // Sort unique entries by key.
         var sorted = std.ArrayList(KvEntry){};
         defer sorted.deinit(alloc);
         var it = map.iterator();
@@ -382,7 +494,6 @@ pub const PrefixDB = struct {
         }
         std.mem.sort(KvEntry, sorted.items, {}, kvLessThan);
 
-        // Write SST pages of up to PAGE_ENTRIES entries each.
         var offset: usize = 0;
         while (offset < sorted.items.len) {
             const end = @min(offset + PAGE_ENTRIES, sorted.items.len);
@@ -391,8 +502,7 @@ pub const PrefixDB = struct {
         }
     }
 
-    /// Build one SST page from `chunk`, compute its append_prefix16 filter, and
-    /// attach it to the L1 node for (depth, prefix) via CoW.
+    /// Build one SST page from `chunk` and attach it to the node's append zone.
     fn writeSstChunk(self: *PrefixDB, depth: u32, prefix: PrefixData, chunk: []const KvEntry) !void {
         std.debug.assert(chunk.len > 0 and chunk.len <= PAGE_ENTRIES);
 
@@ -401,13 +511,10 @@ pub const PrefixDB = struct {
         @memcpy(sst.entries[0..chunk.len], chunk);
         const sst_id = try self.heap.writeSstPage(sst);
 
-        // Build prefix16 filter.
-        // chunk is sorted by key and shares a 6-bit prefix, so prefix16 values
-        // are non-decreasing (§7.1).  Unused slots are padded with maxInt(u16).
         var filter = [_]u16{std.math.maxInt(u16)} ** PAGE_ENTRIES;
         for (chunk, 0..) |e, idx| filter[idx] = prefix16(&e.key, depth);
 
-        try self.appendSstToNode(depth, prefix, sst_id, filter);
+        try self.appendSstToNode(depth, prefix, sst_id, @intCast(chunk.len), filter);
     }
 
     /// Attach an SST page to a node's append zone (CoW node page update).
@@ -416,29 +523,28 @@ pub const PrefixDB = struct {
         depth: u32,
         prefix: PrefixData,
         sst_id: PayloadSlotId,
+        count: u8,
         filter: [PAGE_ENTRIES]u16,
     ) !void {
         const old_id = self.routing.get(depth, prefix);
 
-        // Copy current node state (or start fresh for a new node).
         var node = std.mem.zeroes(NodePage);
         if (old_id) |id| {
-            if (self.heap.nodePagePtr(id)) |ptr| node = ptr.*;
+            if (try self.heap.getNodePage(id)) |existing| node = existing;
         }
 
         std.debug.assert(node.append_count < A_MAX);
 
         const ac = node.append_count;
         node.append_slot_ids[ac] = sst_id;
+        node.append_page_counts[ac] = count;
         node.append_prefix16[ac] = filter;
         node.append_count += 1;
 
-        // CoW: allocate a new node page, update routing, release the old page.
-        const new_id = try self.heap.writeNodePage(node);
+        const new_id = try self.heap.writeNodePage(depth, node);
         try self.routing.put(depth, prefix, new_id);
         if (old_id) |id| self.heap.freeNodePage(id);
 
-        // Queue for append-to-sorted compaction when the append zone fills (§6.1).
         if (node.append_count == A_MAX) {
             self.compaction_queue.append(
                 self.allocator,
@@ -453,8 +559,8 @@ pub const PrefixDB = struct {
     pub fn runCompaction(self: *PrefixDB) !void {
         while (self.compaction_queue.pop()) |coord| {
             const node_id = self.routing.get(coord.depth, coord.prefix) orelse continue;
-            const node = self.heap.nodePagePtr(node_id) orelse continue;
-            if (coord.depth > 1 and self.countNodeEntries(coord.depth, coord.prefix) < MERGE_THRESHOLD) {
+            const node = (try self.heap.getNodePage(node_id)) orelse continue;
+            if (coord.depth > 1 and (try self.countNodeEntries(coord.depth, coord.prefix)) < MERGE_THRESHOLD) {
                 try self.downwardMerge(coord.depth, coord.prefix);
             } else if (node.sorted_count >= S_MAX) {
                 try self.upwardSplit(coord.depth, coord.prefix);
@@ -465,16 +571,13 @@ pub const PrefixDB = struct {
     }
 
     /// Count total live KV entries across all SST pages of a node.
-    fn countNodeEntries(self: *PrefixDB, depth: u32, prefix: PrefixData) u32 {
+    /// Reads counts from node metadata — no SST page loads needed.
+    fn countNodeEntries(self: *PrefixDB, depth: u32, prefix: PrefixData) !u32 {
         const node_id = self.routing.get(depth, prefix) orelse return 0;
-        const node = self.heap.nodePagePtr(node_id) orelse return 0;
+        const node = (try self.heap.getNodePage(node_id)) orelse return 0;
         var count: u32 = 0;
-        for (node.sorted_slot_ids[0..node.sorted_count]) |id| {
-            if (self.heap.sstPagePtr(id)) |sst| count += sst.count;
-        }
-        for (node.append_slot_ids[0..node.append_count]) |id| {
-            if (self.heap.sstPagePtr(id)) |sst| count += sst.count;
-        }
+        for (node.sorted_page_counts[0..node.sorted_count]) |c| count += c;
+        for (node.append_page_counts[0..node.append_count]) |c| count += c;
         return count;
     }
 
@@ -482,23 +585,24 @@ pub const PrefixDB = struct {
     fn appendToSortedMerge(self: *PrefixDB, depth: u32, prefix: PrefixData) !void {
         const alloc = self.allocator;
         const node_id = self.routing.get(depth, prefix) orelse return;
-        const node = self.heap.nodePagePtr(node_id) orelse return;
-        if (node.append_count == 0) return;
-        const old_node = node.*;
+        const old_node = (try self.heap.getNodePage(node_id)) orelse return;
+        if (old_node.append_count == 0) return;
 
-        // Gather all entries: sorted zone first (oldest), then append oldest→newest.
         var all_entries = std.ArrayList(KvEntry){};
         defer all_entries.deinit(alloc);
-        for (old_node.sorted_slot_ids[0..old_node.sorted_count]) |id| {
-            if (self.heap.sstPagePtr(id)) |sst|
-                for (sst.entries[0..sst.count]) |e| try all_entries.append(alloc, e);
+        for (0..old_node.sorted_count) |si| {
+            if (try self.heap.getSstPage(old_node.sorted_slot_ids[si])) |sst| {
+                const cnt = old_node.sorted_page_counts[si];
+                for (sst.entries[0..cnt]) |e| try all_entries.append(alloc, e);
+            }
         }
-        for (old_node.append_slot_ids[0..old_node.append_count]) |id| {
-            if (self.heap.sstPagePtr(id)) |sst|
-                for (sst.entries[0..sst.count]) |e| try all_entries.append(alloc, e);
+        for (0..old_node.append_count) |ai| {
+            if (try self.heap.getSstPage(old_node.append_slot_ids[ai])) |sst| {
+                const cnt = old_node.append_page_counts[ai];
+                for (sst.entries[0..cnt]) |e| try all_entries.append(alloc, e);
+            }
         }
 
-        // Dedup: put() in source order so last write (newest) wins.
         var dedup = std.AutoHashMap(Key, Value).init(alloc);
         defer dedup.deinit();
         for (all_entries.items) |e| try dedup.put(e.key, e.value);
@@ -509,11 +613,12 @@ pub const PrefixDB = struct {
         while (it.next()) |kv| try survivors.append(alloc, .{ .key = kv.key_ptr.*, .value = kv.value_ptr.* });
         std.mem.sort(KvEntry, survivors.items, {}, kvLessThan);
 
-        // Repartition into pages; check sub-prefix promotion for each full page.
         var new_ids = std.ArrayList(PayloadSlotId){};
         defer new_ids.deinit(alloc);
         var new_min4 = std.ArrayList(u32){};
         defer new_min4.deinit(alloc);
+        var new_counts = std.ArrayList(u8){};
+        defer new_counts.deinit(alloc);
 
         var offset: usize = 0;
         while (offset < survivors.items.len) {
@@ -536,18 +641,19 @@ pub const PrefixDB = struct {
             const sst_id = try self.heap.writeSstPage(sst);
             try new_ids.append(alloc, sst_id);
             try new_min4.append(alloc, prefix32(&chunk[0].key, depth));
+            try new_counts.append(alloc, sst.count);
             offset = end;
         }
 
-        // Build new node: empty append zone, updated sorted zone.
         var new_node = std.mem.zeroes(NodePage);
         new_node.sorted_count = @intCast(new_ids.items.len);
         new_node.append_count = 0;
         new_node.child_commitments = old_node.child_commitments;
         @memcpy(new_node.sorted_slot_ids[0..new_ids.items.len], new_ids.items);
         @memcpy(new_node.sorted_min4[0..new_min4.items.len], new_min4.items);
+        @memcpy(new_node.sorted_page_counts[0..new_counts.items.len], new_counts.items);
 
-        const new_node_id = try self.heap.writeNodePage(new_node);
+        const new_node_id = try self.heap.writeNodePage(depth, new_node);
         try self.routing.put(depth, prefix, new_node_id);
         self.heap.freeNodePage(node_id);
         for (old_node.sorted_slot_ids[0..old_node.sorted_count]) |id| self.heap.freeSstPage(id);
@@ -555,34 +661,28 @@ pub const PrefixDB = struct {
 
         if (new_node.sorted_count >= S_MAX)
             self.compaction_queue.append(alloc, .{ .depth = depth, .prefix = prefix }) catch {};
-        if (depth > 1 and self.countNodeEntries(depth, prefix) < MERGE_THRESHOLD)
+        if (depth > 1 and (try self.countNodeEntries(depth, prefix)) < MERGE_THRESHOLD)
             self.compaction_queue.append(alloc, .{ .depth = depth, .prefix = prefix }) catch {};
     }
 
-    /// Promote a full sorted page to the sorted zone of the L(k+1) child node.
+    /// Promote a full page to the append zone of the L(k+1) child node.
+    /// Using the append zone preserves the sorted_min4 strict-ordering invariant:
+    /// the child runs appendToSortedMerge when its append zone fills, building a
+    /// correct sorted zone from scratch.
     fn promoteSstPage(self: *PrefixDB, parent_depth: u32, chunk: []const KvEntry) !void {
         const child_depth = parent_depth + 1;
         const child_prefix = prefixData(&chunk[0].key, child_depth);
-        const old_child_id = self.routing.get(child_depth, child_prefix);
-        var cn = std.mem.zeroes(NodePage);
-        if (old_child_id) |id| { if (self.heap.nodePagePtr(id)) |ptr| { cn = ptr.*; } }
 
         var sst = std.mem.zeroes(SstPage);
         sst.count = @intCast(chunk.len);
         @memcpy(sst.entries[0..chunk.len], chunk);
         const sst_id = try self.heap.writeSstPage(sst);
 
-        const sc = cn.sorted_count;
-        std.debug.assert(sc < S_MAX);
-        cn.sorted_slot_ids[sc] = sst_id;
-        cn.sorted_min4[sc] = prefix32(&chunk[0].key, child_depth);
-        cn.sorted_count += 1;
+        // Build a sorted prefix16 filter over the chunk entries at child_depth.
+        var filter = [_]u16{std.math.maxInt(u16)} ** PAGE_ENTRIES;
+        for (chunk, 0..) |e, idx| filter[idx] = prefix16(&e.key, child_depth);
 
-        const new_cid = try self.heap.writeNodePage(cn);
-        try self.routing.put(child_depth, child_prefix, new_cid);
-        if (old_child_id) |id| self.heap.freeNodePage(id);
-        if (cn.sorted_count >= S_MAX)
-            self.compaction_queue.append(self.allocator, .{ .depth = child_depth, .prefix = child_prefix }) catch {};
+        try self.appendSstToNode(child_depth, child_prefix, sst_id, sst.count, filter);
     }
 
     /// §6.2: Merge all sorted pages; promote groups with ≥64 entries to L(k+1).
@@ -590,15 +690,16 @@ pub const PrefixDB = struct {
         if (depth >= MAX_DEPTH) return;
         const alloc = self.allocator;
         const node_id = self.routing.get(depth, prefix) orelse return;
-        const node = self.heap.nodePagePtr(node_id) orelse return;
-        const old_node = node.*;
+        const old_node = (try self.heap.getNodePage(node_id)) orelse return;
         const child_depth = depth + 1;
 
         var all_entries = std.ArrayList(KvEntry){};
         defer all_entries.deinit(alloc);
-        for (old_node.sorted_slot_ids[0..old_node.sorted_count]) |id| {
-            if (self.heap.sstPagePtr(id)) |sst|
-                for (sst.entries[0..sst.count]) |e| try all_entries.append(alloc, e);
+        for (0..old_node.sorted_count) |si| {
+            if (try self.heap.getSstPage(old_node.sorted_slot_ids[si])) |sst| {
+                const cnt = old_node.sorted_page_counts[si];
+                for (sst.entries[0..cnt]) |e| try all_entries.append(alloc, e);
+            }
         }
         std.mem.sort(KvEntry, all_entries.items, {}, kvLessThan);
 
@@ -606,9 +707,9 @@ pub const PrefixDB = struct {
         defer new_ids.deinit(alloc);
         var new_min4 = std.ArrayList(u32){};
         defer new_min4.deinit(alloc);
+        var new_counts = std.ArrayList(u8){};
+        defer new_counts.deinit(alloc);
 
-        // Remaining (non-promoted) entries are collected here, then repartitioned
-        // as a single batch (§6.2 step 5) to avoid producing many tiny pages.
         var remaining = std.ArrayList(KvEntry){};
         defer remaining.deinit(alloc);
 
@@ -627,16 +728,20 @@ pub const PrefixDB = struct {
                     const chunk = group[off..end];
                     const cur_id = self.routing.get(child_depth, cp);
                     var cn = std.mem.zeroes(NodePage);
-                    if (cur_id) |id| { if (self.heap.nodePagePtr(id)) |ptr| { cn = ptr.*; } }
+                    if (cur_id) |id| {
+                        if (try self.heap.getNodePage(id)) |existing| cn = existing;
+                    }
                     var sst = std.mem.zeroes(SstPage);
                     sst.count = @intCast(chunk.len);
                     @memcpy(sst.entries[0..chunk.len], chunk);
                     const sid = try self.heap.writeSstPage(sst);
                     if (cn.sorted_count < S_MAX) {
-                        cn.sorted_slot_ids[cn.sorted_count] = sid;
-                        cn.sorted_min4[cn.sorted_count] = prefix32(&chunk[0].key, child_depth);
+                        const sc = cn.sorted_count;
+                        cn.sorted_slot_ids[sc] = sid;
+                        cn.sorted_min4[sc] = prefix32(&chunk[0].key, child_depth);
+                        cn.sorted_page_counts[sc] = sst.count;
                         cn.sorted_count += 1;
-                        const ncid = try self.heap.writeNodePage(cn);
+                        const ncid = try self.heap.writeNodePage(child_depth, cn);
                         try self.routing.put(child_depth, cp, ncid);
                         if (cur_id) |id| self.heap.freeNodePage(id);
                         if (cn.sorted_count >= S_MAX)
@@ -650,7 +755,6 @@ pub const PrefixDB = struct {
             i = j;
         }
 
-        // Repartition all remaining (non-promoted) entries into full pages.
         var off: usize = 0;
         while (off < remaining.items.len) {
             const end = @min(off + PAGE_ENTRIES, remaining.items.len);
@@ -661,6 +765,7 @@ pub const PrefixDB = struct {
             const sid = try self.heap.writeSstPage(sst);
             try new_ids.append(alloc, sid);
             try new_min4.append(alloc, prefix32(&chunk[0].key, depth));
+            try new_counts.append(alloc, sst.count);
             off = end;
         }
 
@@ -670,12 +775,14 @@ pub const PrefixDB = struct {
         new_node.child_commitments = old_node.child_commitments;
         @memcpy(new_node.sorted_slot_ids[0..new_ids.items.len], new_ids.items);
         @memcpy(new_node.sorted_min4[0..new_min4.items.len], new_min4.items);
+        @memcpy(new_node.sorted_page_counts[0..new_counts.items.len], new_counts.items);
         for (0..old_node.append_count) |ai| {
             new_node.append_slot_ids[ai] = old_node.append_slot_ids[ai];
+            new_node.append_page_counts[ai] = old_node.append_page_counts[ai];
             new_node.append_prefix16[ai] = old_node.append_prefix16[ai];
         }
 
-        const new_node_id = try self.heap.writeNodePage(new_node);
+        const new_node_id = try self.heap.writeNodePage(depth, new_node);
         try self.routing.put(depth, prefix, new_node_id);
         self.heap.freeNodePage(node_id);
         for (old_node.sorted_slot_ids[0..old_node.sorted_count]) |id| self.heap.freeSstPage(id);
@@ -689,26 +796,29 @@ pub const PrefixDB = struct {
         const parent_prefix: PrefixData = prefix >> STRIDE;
 
         const child_id = self.routing.get(depth, prefix) orelse return;
-        const child = self.heap.nodePagePtr(child_id) orelse return;
-        const old_child = child.*;
+        const old_child = (try self.heap.getNodePage(child_id)) orelse return;
         const parent_id = self.routing.get(parent_depth, parent_prefix) orelse return;
-        const parent_ptr = self.heap.nodePagePtr(parent_id) orelse return;
-        const old_parent = parent_ptr.*;
+        const old_parent = (try self.heap.getNodePage(parent_id)) orelse return;
 
-        // Build merged map: parent entries first, child entries override (authoritative).
         var merged = std.AutoHashMap(Key, Value).init(alloc);
         defer merged.deinit();
-        for (old_parent.sorted_slot_ids[0..old_parent.sorted_count]) |id| {
-            if (self.heap.sstPagePtr(id)) |sst|
-                for (sst.entries[0..sst.count]) |e| try merged.put(e.key, e.value);
+        for (0..old_parent.sorted_count) |si| {
+            if (try self.heap.getSstPage(old_parent.sorted_slot_ids[si])) |sst| {
+                const cnt = old_parent.sorted_page_counts[si];
+                for (sst.entries[0..cnt]) |e| try merged.put(e.key, e.value);
+            }
         }
-        for (old_child.sorted_slot_ids[0..old_child.sorted_count]) |id| {
-            if (self.heap.sstPagePtr(id)) |sst|
-                for (sst.entries[0..sst.count]) |e| try merged.put(e.key, e.value);
+        for (0..old_child.sorted_count) |si| {
+            if (try self.heap.getSstPage(old_child.sorted_slot_ids[si])) |sst| {
+                const cnt = old_child.sorted_page_counts[si];
+                for (sst.entries[0..cnt]) |e| try merged.put(e.key, e.value);
+            }
         }
-        for (old_child.append_slot_ids[0..old_child.append_count]) |id| {
-            if (self.heap.sstPagePtr(id)) |sst|
-                for (sst.entries[0..sst.count]) |e| try merged.put(e.key, e.value);
+        for (0..old_child.append_count) |ai| {
+            if (try self.heap.getSstPage(old_child.append_slot_ids[ai])) |sst| {
+                const cnt = old_child.append_page_counts[ai];
+                for (sst.entries[0..cnt]) |e| try merged.put(e.key, e.value);
+            }
         }
 
         var survivors = std.ArrayList(KvEntry){};
@@ -718,12 +828,14 @@ pub const PrefixDB = struct {
         std.mem.sort(KvEntry, survivors.items, {}, kvLessThan);
 
         const pages_needed = (survivors.items.len + PAGE_ENTRIES - 1) / PAGE_ENTRIES;
-        if (pages_needed > S_MAX) return; // parent has no capacity; skip
+        if (pages_needed > S_MAX) return;
 
         var new_ids = std.ArrayList(PayloadSlotId){};
         defer new_ids.deinit(alloc);
         var new_min4 = std.ArrayList(u32){};
         defer new_min4.deinit(alloc);
+        var new_counts = std.ArrayList(u8){};
+        defer new_counts.deinit(alloc);
 
         var offset: usize = 0;
         while (offset < survivors.items.len) {
@@ -735,32 +847,33 @@ pub const PrefixDB = struct {
             const sid = try self.heap.writeSstPage(sst);
             try new_ids.append(alloc, sid);
             try new_min4.append(alloc, prefix32(&chunk[0].key, parent_depth));
+            try new_counts.append(alloc, sst.count);
             offset = end;
         }
 
-        // CoW parent.
         var new_parent = std.mem.zeroes(NodePage);
         new_parent.sorted_count = @intCast(new_ids.items.len);
         new_parent.append_count = old_parent.append_count;
         new_parent.child_commitments = old_parent.child_commitments;
         @memcpy(new_parent.sorted_slot_ids[0..new_ids.items.len], new_ids.items);
         @memcpy(new_parent.sorted_min4[0..new_min4.items.len], new_min4.items);
+        @memcpy(new_parent.sorted_page_counts[0..new_counts.items.len], new_counts.items);
         for (0..old_parent.append_count) |ai| {
             new_parent.append_slot_ids[ai] = old_parent.append_slot_ids[ai];
+            new_parent.append_page_counts[ai] = old_parent.append_page_counts[ai];
             new_parent.append_prefix16[ai] = old_parent.append_prefix16[ai];
         }
-        const new_parent_id = try self.heap.writeNodePage(new_parent);
+        const new_parent_id = try self.heap.writeNodePage(parent_depth, new_parent);
         try self.routing.put(parent_depth, parent_prefix, new_parent_id);
         self.heap.freeNodePage(parent_id);
         for (old_parent.sorted_slot_ids[0..old_parent.sorted_count]) |id| self.heap.freeSstPage(id);
 
-        // Delete child.
         _ = self.routing.remove(depth, prefix);
         self.heap.freeNodePage(child_id);
         for (old_child.sorted_slot_ids[0..old_child.sorted_count]) |id| self.heap.freeSstPage(id);
         for (old_child.append_slot_ids[0..old_child.append_count]) |id| self.heap.freeSstPage(id);
 
-        if (parent_depth > 1 and self.countNodeEntries(parent_depth, parent_prefix) < MERGE_THRESHOLD)
+        if (parent_depth > 1 and (try self.countNodeEntries(parent_depth, parent_prefix)) < MERGE_THRESHOLD)
             self.compaction_queue.append(alloc, .{ .depth = parent_depth, .prefix = parent_prefix }) catch {};
     }
 };
@@ -768,7 +881,6 @@ pub const PrefixDB = struct {
 // ─── Prefix helpers (§4.2.1, §7.1) ───────────────────────────────────────────
 
 /// prefixData(K, d) = top 6d bits of K, zero-padded into a u32.
-/// Used as the routing table key at depth d.
 pub fn prefixData(key: *const Key, depth: u32) PrefixData {
     const top4: u32 = (@as(u32, key[0]) << 24) | (@as(u32, key[1]) << 16) |
         (@as(u32, key[2]) << 8) | @as(u32, key[3]);
@@ -776,8 +888,7 @@ pub fn prefixData(key: *const Key, depth: u32) PrefixData {
     return top4 >> shift;
 }
 
-/// prefix32(K, k): the 32 bits of K immediately following the node's 6k-bit
-/// prefix, packed into a u32.  Used as the binary-search key in sorted_min4.
+/// prefix32(K, k): the 32 bits of K immediately following the node's 6k-bit prefix.
 pub fn prefix32(key: *const Key, depth: u32) u32 {
     const bit_offset = STRIDE * depth;
     const byte0: usize = bit_offset / 8;
@@ -790,8 +901,7 @@ pub fn prefix32(key: *const Key, depth: u32) u32 {
     return @truncate(raw >> shift);
 }
 
-/// prefix16(K, k): the 16 bits of K immediately following the node's 6k-bit
-/// prefix, packed into a u16.  Used to build and query append_prefix16 filters.
+/// prefix16(K, k): the 16 bits of K immediately following the node's 6k-bit prefix.
 pub fn prefix16(key: *const Key, depth: u32) u16 {
     const bit_offset = STRIDE * depth;
     const byte0: usize = bit_offset / 8;
@@ -808,7 +918,6 @@ fn kvLessThan(_: void, a: KvEntry, b: KvEntry) bool {
     return std.mem.order(u8, &a.key, &b.key) == .lt;
 }
 
-/// Binary search `sst.entries[0..sst.count]` for `key`; return its value or null.
 fn binarySearchSst(sst: *const SstPage, key: *const Key) ?Value {
     var lo: usize = 0;
     var hi: usize = sst.count;
@@ -823,10 +932,9 @@ fn binarySearchSst(sst: *const SstPage, key: *const Key) ?Value {
     return null;
 }
 
-/// Return true if `target` appears in the sorted 64-slot prefix16 filter.
-fn filterContains(filter: *const [PAGE_ENTRIES]u16, target: u16) bool {
+fn filterContains(filter: *const [PAGE_ENTRIES]u16, count: u8, target: u16) bool {
     var lo: usize = 0;
-    var hi: usize = PAGE_ENTRIES;
+    var hi: usize = count;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
         if (filter[mid] == target) return true;
@@ -837,9 +945,9 @@ fn filterContains(filter: *const [PAGE_ENTRIES]u16, target: u16) bool {
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
-// Pull sub-module tests into the test binary.
 test {
     _ = @import("page_store.zig");
+    _ = @import("cache.zig");
 }
 
 test "prefixData depth 1 extracts top 6 bits" {
@@ -853,25 +961,21 @@ test "prefixData depth 5 extracts top 30 bits" {
 }
 
 test "prefix32 depth 1 — bits [6,38) of key" {
-    // FC FF FF FF 00 → raw64=0xFC_FF_FF_FF_00, shift=2 → 0x3FFF_FFC0
     const key = [_]u8{ 0xFC, 0xFF, 0xFF, 0xFF, 0x00 } ++ [_]u8{0} ** 27;
     try std.testing.expectEqual(@as(u32, 0x3FFF_FFC0), prefix32(&key, 1));
 }
 
 test "prefix32 depth 4 — bit_in_byte = 0" {
-    // depth=4 → bit_offset=24, shift=8 → key[3..6]
     const key = [_]u8{0} ** 3 ++ [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE } ++ [_]u8{0} ** 24;
     try std.testing.expectEqual(@as(u32, 0xAABB_CCDD), prefix32(&key, 4));
 }
 
 test "prefix16 depth 1 — bits [6,22) of key" {
-    // FC 00 F0 → raw=0xFC_00_F0, shift=2 → 0x003C
     const key = [_]u8{ 0xFC, 0x00, 0xF0 } ++ [_]u8{0} ** 29;
     try std.testing.expectEqual(@as(u16, 0x003C), prefix16(&key, 1));
 }
 
 test "prefix16 depth 4 — bit_in_byte = 0" {
-    // depth=4 → shift=8 → key[3]<<8 | key[4]
     const key = [_]u8{0} ** 3 ++ [_]u8{ 0xAB, 0xCD, 0xFF } ++ [_]u8{0} ** 26;
     try std.testing.expectEqual(@as(u16, 0xABCD), prefix16(&key, 4));
 }
@@ -920,22 +1024,22 @@ test "Pool alloc, write, free, realloc" {
 }
 
 test "Heap write and retrieve node page" {
-    var heap = try Heap.init(std.testing.allocator, 8, 32);
+    var heap = try Heap.init(std.testing.allocator, .{ .node_cap = 8, .sst_cap = 32 }, null);
     defer heap.deinit();
     var page = std.mem.zeroes(NodePage);
     page.sorted_count = 2;
     page.append_count = 1;
-    const id = try heap.writeNodePage(page);
-    const p = heap.nodePagePtr(id).?;
-    try std.testing.expectEqual(@as(u8, 2), p.sorted_count);
-    try std.testing.expectEqual(@as(u8, 1), p.append_count);
+    // depth=1 → pinned pool
+    const id = try heap.writeNodePage(1, page);
+    const got = (try heap.getNodePage(id)).?;
+    try std.testing.expectEqual(@as(u8, 2), got.sorted_count);
+    try std.testing.expectEqual(@as(u8, 1), got.append_count);
     heap.freeNodePage(id);
-    try std.testing.expectEqual(@as(?*NodePage, null), heap.nodePagePtr(id));
+    try std.testing.expectEqual(@as(?NodePage, null), try heap.getNodePage(id));
 }
 
 // ─── Write / Read operation tests ─────────────────────────────────────────────
 
-/// Make a key in prefix group 0 (top 6 bits = 0) that is unique by `index`.
 fn testKey(index: u8) Key {
     var k = std.mem.zeroes(Key);
     k[31] = index;
@@ -949,14 +1053,14 @@ fn testVal(index: u8) Value {
 test "read returns null for unknown key" {
     var db = try PrefixDB.init(std.testing.allocator);
     defer db.deinit();
-    try std.testing.expectEqual(@as(?Value, null), db.read(testKey(7)));
+    try std.testing.expectEqual(@as(?Value, null), try db.read(testKey(7)));
 }
 
 test "write then read from L0" {
     var db = try PrefixDB.init(std.testing.allocator);
     defer db.deinit();
     try db.write(testKey(1), testVal(0xAA));
-    try std.testing.expectEqual(@as(?Value, testVal(0xAA)), db.read(testKey(1)));
+    try std.testing.expectEqual(@as(?Value, testVal(0xAA)), try db.read(testKey(1)));
 }
 
 test "L0 overwrite — most recent value returned" {
@@ -965,13 +1069,10 @@ test "L0 overwrite — most recent value returned" {
     try db.write(testKey(5), testVal(0x11));
     try db.write(testKey(5), testVal(0x22));
     try db.write(testKey(5), testVal(0x33));
-    try std.testing.expectEqual(@as(?Value, testVal(0x33)), db.read(testKey(5)));
+    try std.testing.expectEqual(@as(?Value, testVal(0x33)), try db.read(testKey(5)));
 }
 
 test "write 64 keys triggers L0 flush to L1 append zone" {
-    // 64 writes with the same 6-bit prefix (prefix group 0) fill L0 and trigger
-    // a flush.  After the flush L0 is empty and the routing table has a depth-1
-    // entry for the node.
     var db = try PrefixDB.init(std.testing.allocator);
     defer db.deinit();
 
@@ -979,15 +1080,11 @@ test "write 64 keys triggers L0 flush to L1 append zone" {
         try db.write(testKey(@intCast(i)), testVal(@intCast(i)));
     }
 
-    // L0 must be empty after the flush.
     try std.testing.expectEqual(@as(usize, 0), db.l0.entries.items.len);
-
-    // Routing table must have exactly one entry at depth 1, prefix 0.
     try std.testing.expect(db.routing.get(1, 0) != null);
 
-    // The node page must have 1 append-zone page and 0 sorted pages.
     const node_id = db.routing.get(1, 0).?;
-    const node = db.heap.nodePagePtr(node_id).?;
+    const node = (try db.heap.getNodePage(node_id)).?;
     try std.testing.expectEqual(@as(u8, 0), node.sorted_count);
     try std.testing.expectEqual(@as(u8, 1), node.append_count);
 }
@@ -1000,68 +1097,54 @@ test "read keys from L1 append zone after flush" {
         try db.write(testKey(@intCast(i)), testVal(@intCast(i)));
     }
 
-    // All 64 keys must be readable from the append zone.
     for (0..PAGE_ENTRIES) |i| {
-        const got = db.read(testKey(@intCast(i)));
+        const got = try db.read(testKey(@intCast(i)));
         try std.testing.expectEqual(@as(?Value, testVal(@intCast(i))), got);
     }
 
-    // A key that was never written must still return null.
-    try std.testing.expectEqual(@as(?Value, null), db.read(testKey(0xFF)));
+    try std.testing.expectEqual(@as(?Value, null), try db.read(testKey(0xFF)));
 }
 
 test "L0 value overrides L1 for the same key" {
-    // Write key, flush it to L1, then overwrite in L0.  The L0 copy must win.
     var db = try PrefixDB.init(std.testing.allocator);
     defer db.deinit();
 
-    // Write PAGE_ENTRIES keys to trigger flush.
     for (0..PAGE_ENTRIES) |i| {
         try db.write(testKey(@intCast(i)), testVal(0xAA));
     }
-    // key[0] is now in L1 with value 0xAA.
 
-    // Re-write key[0] in L0 with a new value.
     try db.write(testKey(0), testVal(0xBB));
-    try std.testing.expectEqual(@as(?Value, testVal(0xBB)), db.read(testKey(0)));
+    try std.testing.expectEqual(@as(?Value, testVal(0xBB)), try db.read(testKey(0)));
 
-    // All other keys are still readable from L1.
     for (1..PAGE_ENTRIES) |i| {
-        try std.testing.expectEqual(@as(?Value, testVal(0xAA)), db.read(testKey(@intCast(i))));
+        try std.testing.expectEqual(@as(?Value, testVal(0xAA)), try db.read(testKey(@intCast(i))));
     }
 }
 
 test "keys from a different prefix group remain in L0 after flush" {
-    // Prefix group 1: keys starting with 0b000001xx (key[0] = 0x04..0x07).
     var db = try PrefixDB.init(std.testing.allocator);
     defer db.deinit();
 
-    // One key in prefix group 1.
     var other_key = std.mem.zeroes(Key);
-    other_key[0] = 0x04; // top 6 bits = 0b000001 = prefix 1
+    other_key[0] = 0x04;
     try db.write(other_key, testVal(0xFF));
 
-    // Fill prefix group 0 to trigger its flush.
     for (0..PAGE_ENTRIES) |i| {
         try db.write(testKey(@intCast(i)), testVal(@intCast(i)));
     }
 
-    // Prefix 0 flushed; prefix 1 key must still be in L0.
     try std.testing.expectEqual(@as(usize, 1), db.l0.entries.items.len);
-    try std.testing.expectEqual(@as(?Value, testVal(0xFF)), db.read(other_key));
+    try std.testing.expectEqual(@as(?Value, testVal(0xFF)), try db.read(other_key));
 }
 
 test "two flushes: 128 distinct keys across two SST pages in append zone" {
-    var db = try PrefixDB.initCapacity(std.testing.allocator, DEFAULT_NODE_CAP, 2048);
+    var db = try PrefixDB.initCapacity(std.testing.allocator, DEFAULT_NODE_CACHE_CAP, 2048);
     defer db.deinit();
 
-    // First 64 keys: indices 0..63.  Triggers first flush (page 0 in append zone).
     for (0..PAGE_ENTRIES) |i| {
         try db.write(testKey(@intCast(i)), testVal(@intCast(i)));
     }
-    // Next 64 keys: indices 64..127 — same prefix group, triggers second flush.
     for (PAGE_ENTRIES..2 * PAGE_ENTRIES) |i| {
-        // Spread into a second unique byte to stay in prefix group 0 and be distinct.
         var k = std.mem.zeroes(Key);
         k[30] = 1;
         k[31] = @intCast(i - PAGE_ENTRIES);
@@ -1069,24 +1152,20 @@ test "two flushes: 128 distinct keys across two SST pages in append zone" {
     }
 
     const node_id = db.routing.get(1, 0).?;
-    const node = db.heap.nodePagePtr(node_id).?;
+    const node = (try db.heap.getNodePage(node_id)).?;
     try std.testing.expectEqual(@as(u8, 2), node.append_count);
 
-    // All 128 keys readable.
     for (0..PAGE_ENTRIES) |i| {
-        try std.testing.expectEqual(@as(?Value, testVal(@intCast(i))), db.read(testKey(@intCast(i))));
+        try std.testing.expectEqual(@as(?Value, testVal(@intCast(i))), try db.read(testKey(@intCast(i))));
     }
     for (PAGE_ENTRIES..2 * PAGE_ENTRIES) |i| {
         var k = std.mem.zeroes(Key);
         k[30] = 1;
         k[31] = @intCast(i - PAGE_ENTRIES);
-        try std.testing.expectEqual(@as(?Value, testVal(@intCast(i))), db.read(k));
+        try std.testing.expectEqual(@as(?Value, testVal(@intCast(i))), try db.read(k));
     }
 }
 
-/// Key in prefix group 0, differentiated by `batch` (byte 1) and `index` (byte 2).
-/// Using early bytes ensures prefix32/prefix16 values are distinct across batches,
-/// which satisfies the sorted_min4 strictly-increasing invariant after promotion.
 fn testKeyBatch(batch: u8, index: u8) Key {
     var k = std.mem.zeroes(Key);
     k[1] = batch;
@@ -1098,24 +1177,19 @@ test "deduplication in L0 flush — only latest value persisted" {
     var db = try PrefixDB.init(std.testing.allocator);
     defer db.deinit();
 
-    // Write key 0 first with value 0x11, then fill the rest to trigger flush.
     try db.write(testKey(0), testVal(0x11));
     for (1..PAGE_ENTRIES) |i| {
         try db.write(testKey(@intCast(i)), testVal(@intCast(i)));
     }
-    // key 0 has been seen once (value 0x11). Flush happens at exactly 64 raw entries.
-    // value should be 0x11.
-    try std.testing.expectEqual(@as(?Value, testVal(0x11)), db.read(testKey(0)));
+    try std.testing.expectEqual(@as(?Value, testVal(0x11)), try db.read(testKey(0)));
 
-    // Now write key 0 again (goes to L0).
     try db.write(testKey(0), testVal(0x22));
-    try std.testing.expectEqual(@as(?Value, testVal(0x22)), db.read(testKey(0)));
+    try std.testing.expectEqual(@as(?Value, testVal(0x22)), try db.read(testKey(0)));
 }
 
 // ─── Compaction tests ─────────────────────────────────────────────────────────
 
 test "appendToSortedMerge: clears append zone and keeps all keys readable" {
-    // 8 flushes × 64 keys = 512 unique keys fills the append zone to A_MAX.
     var db = try PrefixDB.initCapacity(std.testing.allocator, 512, 4096);
     defer db.deinit();
 
@@ -1126,21 +1200,19 @@ test "appendToSortedMerge: clears append zone and keeps all keys readable" {
     }
 
     const before_id = db.routing.get(1, 0).?;
-    const before = db.heap.nodePagePtr(before_id).?;
+    const before = (try db.heap.getNodePage(before_id)).?;
     try std.testing.expectEqual(@as(u8, A_MAX), before.append_count);
     try std.testing.expect(db.compaction_queue.items.len > 0);
 
     try db.runCompaction();
 
     const after_id = db.routing.get(1, 0).?;
-    const after = db.heap.nodePagePtr(after_id).?;
+    const after = (try db.heap.getNodePage(after_id)).?;
     try std.testing.expectEqual(@as(u8, 0), after.append_count);
-    // All pages may have been promoted to depth-2 (all keys share sub-prefix 0).
-    // The merge is successful if the append zone is clear and all keys are readable.
 
     for (0..A_MAX) |batch| {
         for (0..PAGE_ENTRIES) |i| {
-            const got = db.read(testKeyBatch(@intCast(batch), @intCast(i)));
+            const got = try db.read(testKeyBatch(@intCast(batch), @intCast(i)));
             try std.testing.expectEqual(@as(?Value, testVal(@intCast(i))), got);
         }
     }
@@ -1150,17 +1222,14 @@ test "appendToSortedMerge: newest value wins when same key appears in multiple a
     var db = try PrefixDB.initCapacity(std.testing.allocator, 512, 4096);
     defer db.deinit();
 
-    // Write key(0,0) with value 0x11 in the first batch.
     try db.write(testKeyBatch(0, 0), testVal(0x11));
     for (1..PAGE_ENTRIES) |i| {
         try db.write(testKeyBatch(0, @intCast(i)), testVal(@intCast(i)));
     }
-    // key(0,0) → value 0x11 is now in L1 append page 0.
 
-    // Fill 7 more batches so append zone reaches A_MAX; overwrite key(0,0) in batch 4.
     for (1..A_MAX) |batch| {
         const use_val: u8 = if (batch == 4) 0x99 else @intCast(batch);
-        try db.write(testKeyBatch(0, 0), testVal(use_val)); // key(0,0) overwritten
+        try db.write(testKeyBatch(0, 0), testVal(use_val));
         for (1..PAGE_ENTRIES) |i| {
             try db.write(testKeyBatch(@intCast(batch), @intCast(i)), testVal(@intCast(i)));
         }
@@ -1168,15 +1237,11 @@ test "appendToSortedMerge: newest value wins when same key appears in multiple a
 
     try db.runCompaction();
 
-    // After compaction, key(0,0) must have the value from the last overwrite (batch 7 → 0x07).
-    const got = db.read(testKeyBatch(0, 0));
+    const got = try db.read(testKeyBatch(0, 0));
     try std.testing.expectEqual(@as(?Value, testVal(A_MAX - 1)), got);
 }
 
 test "sub-prefix promotion: uniform sub-prefix page moves to depth-2 node" {
-    // testKeyBatch(b, i) keys have k[0]=0, k[1]=0 → depth-1 prefix=0, depth-2 prefix=0.
-    // A full page of 64 such keys passes the (prefix16>>10)==(prefix16>>10) check and
-    // is promoted to the depth-2 node during appendToSortedMerge.
     var db = try PrefixDB.initCapacity(std.testing.allocator, 512, 4096);
     defer db.deinit();
 
@@ -1188,64 +1253,57 @@ test "sub-prefix promotion: uniform sub-prefix page moves to depth-2 node" {
 
     try db.runCompaction();
 
-    // At least one page should have been promoted: depth-2 routing has an entry.
-    var found_depth2 = false;
-    for (0..64) |p| {
-        if (db.routing.get(2, @intCast(p)) != null) {
-            found_depth2 = true;
-            break;
+    // With promoteSstPage routing to append zone, pages may propagate past
+    // depth-2 all the way to depth-3 before settling. Check any depth > 1.
+    var found_deeper = false;
+    outer: for (2..MAX_DEPTH + 1) |d| {
+        const dd: u32 = @intCast(d);
+        for (0..64) |p| {
+            if (db.routing.get(dd, @intCast(p)) != null) {
+                found_deeper = true;
+                break :outer;
+            }
         }
     }
-    try std.testing.expect(found_depth2);
+    try std.testing.expect(found_deeper);
 
-    // All keys remain readable regardless of which zone holds them.
     for (0..A_MAX) |batch| {
         for (0..PAGE_ENTRIES) |i| {
-            const got = db.read(testKeyBatch(@intCast(batch), @intCast(i)));
+            const got = try db.read(testKeyBatch(@intCast(batch), @intCast(i)));
             try std.testing.expectEqual(@as(?Value, testVal(@intCast(i))), got);
         }
     }
 }
 
 test "upwardSplit: promoted depth-2 node triggers split when sorted zone fills" {
-    // Force S_MAX sorted pages into a depth-2 node by promoting many depth-1 pages,
-    // then verify the node triggers an upward split (routing entry at depth-3 or fewer
-    // sorted pages at depth-2).
-    // Use large pool capacities; S_MAX=123 sorted pages × 64 entries = 7872 entries.
     var db = try PrefixDB.initCapacity(std.testing.allocator, 4096, 32768);
     defer db.deinit();
 
-    // Write S_MAX * A_MAX * PAGE_ENTRIES entries — but that is enormous.
-    // Instead, manually inject a depth-2 node with sorted_count = S_MAX and queue it.
     var node2 = std.mem.zeroes(NodePage);
     for (0..S_MAX) |si| {
         var sst = std.mem.zeroes(SstPage);
         sst.count = 1;
-        // Use keys with depth-2 prefix=0 but distinct byte 31 offsets.
         sst.entries[0].key[31] = @intCast(si);
         sst.entries[0].value = testVal(@intCast(si));
         const sid = try db.heap.writeSstPage(sst);
         node2.sorted_slot_ids[si] = sid;
         node2.sorted_min4[si] = prefix32(&sst.entries[0].key, 2);
+        node2.sorted_page_counts[si] = 1;
         node2.sorted_count += 1;
     }
-    const nid2 = try db.heap.writeNodePage(node2);
+    // depth=2 → pinned pool
+    const nid2 = try db.heap.writeNodePage(2, node2);
     try db.routing.put(2, 0, nid2);
 
-    // Queue and run compaction — should trigger upward split.
     try db.compaction_queue.append(db.allocator, .{ .depth = 2, .prefix = 0 });
     try db.runCompaction();
 
-    // All 123 entries share depth-3 prefix=0 (keys differ only at byte 31, beyond
-    // the 18-bit depth-3 prefix window).  So the group size = 123 >= 64 and ALL
-    // entries are promoted to depth-3.  Depth-2 sorted_count drops to 0.
     if (db.routing.get(2, 0)) |id| {
-        const n = db.heap.nodePagePtr(id).?;
+        const n = (try db.heap.getNodePage(id)).?;
         try std.testing.expectEqual(@as(u8, 0), n.sorted_count);
     }
-    // Depth-3 must have ceil(123/64) = 2 pages.
     const d3id = db.routing.get(3, 0).?;
-    const d3n = db.heap.nodePagePtr(d3id).?;
+    const d3n = (try db.heap.getNodePage(d3id)).?;
     try std.testing.expectEqual(@as(u8, 2), d3n.sorted_count);
 }
 
@@ -1253,23 +1311,23 @@ test "downwardMerge: sparse child node is absorbed into parent" {
     var db = try PrefixDB.initCapacity(std.testing.allocator, 512, 4096);
     defer db.deinit();
 
-    // Manually create a sparse depth-2 node (< MERGE_THRESHOLD = 16 entries).
-    const child_prefix: PrefixData = 0; // depth-2 prefix 0
+    const child_prefix: PrefixData = 0;
     var child_node = std.mem.zeroes(NodePage);
     var sst = std.mem.zeroes(SstPage);
-    sst.count = 5; // 5 entries < MERGE_THRESHOLD
+    sst.count = 5;
     for (0..5) |idx| {
-        sst.entries[idx].key[31] = @intCast(idx + 200); // distinct values
+        sst.entries[idx].key[31] = @intCast(idx + 200);
         sst.entries[idx].value = testVal(@intCast(idx + 200));
     }
     const csst_id = try db.heap.writeSstPage(sst);
     child_node.sorted_slot_ids[0] = csst_id;
     child_node.sorted_min4[0] = prefix32(&sst.entries[0].key, 2);
+    child_node.sorted_page_counts[0] = 5;
     child_node.sorted_count = 1;
-    const cid = try db.heap.writeNodePage(child_node);
+    // depth=2 → pinned pool
+    const cid = try db.heap.writeNodePage(2, child_node);
     try db.routing.put(2, child_prefix, cid);
 
-    // Manually create parent depth-1 node with a few entries.
     var parent_node = std.mem.zeroes(NodePage);
     var psst = std.mem.zeroes(SstPage);
     psst.count = 3;
@@ -1280,23 +1338,22 @@ test "downwardMerge: sparse child node is absorbed into parent" {
     const psst_id = try db.heap.writeSstPage(psst);
     parent_node.sorted_slot_ids[0] = psst_id;
     parent_node.sorted_min4[0] = prefix32(&psst.entries[0].key, 1);
+    parent_node.sorted_page_counts[0] = 3;
     parent_node.sorted_count = 1;
-    const pid = try db.heap.writeNodePage(parent_node);
+    // depth=1 → pinned pool
+    const pid = try db.heap.writeNodePage(1, parent_node);
     try db.routing.put(1, 0, pid);
 
-    // Queue the sparse child for downward merge and run.
     try db.compaction_queue.append(db.allocator, .{ .depth = 2, .prefix = child_prefix });
     try db.runCompaction();
 
-    // Child node must be removed from routing.
     try std.testing.expectEqual(@as(?NodePageId, null), db.routing.get(2, child_prefix));
 
-    // All 8 entries (3 parent + 5 child) must be in the parent's sorted zone.
     const new_pid = db.routing.get(1, 0).?;
-    const new_parent = db.heap.nodePagePtr(new_pid).?;
+    const new_parent = (try db.heap.getNodePage(new_pid)).?;
     var total: u32 = 0;
     for (new_parent.sorted_slot_ids[0..new_parent.sorted_count]) |id| {
-        total += db.heap.sstPagePtr(id).?.count;
+        total += (try db.heap.getSstPage(id)).?.count;
     }
     try std.testing.expectEqual(@as(u32, 8), total);
 }

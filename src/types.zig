@@ -14,7 +14,7 @@ pub const ZERO_HASH = merkle.ZERO_HASH;
 pub const STRIDE: u32 = 6;
 pub const PAGE_ENTRIES: u32 = 64;
 pub const CHILD_COUNT: u32 = 64;
-pub const S_MAX: u32 = 123; // sorted zone capacity per node
+pub const S_MAX: u32 = 108; // sorted zone capacity per node
 pub const A_MAX: u32 = 8; // append zone capacity per node
 pub const MAX_DEPTH: u32 = 5;
 pub const MERGE_THRESHOLD: u32 = 16;
@@ -48,11 +48,13 @@ pub const SstPage = struct {
 // On-disk: exactly 4096 bytes (one physical page).
 //   4 B    header (sorted_count u8, append_count u8, _pad[2])
 //   2048 B child_commitments[64]
-//   492 B  sorted_slot_ids[123]   (u32 each)
-//   492 B  sorted_min4[123]       (u32 boundary prefix per sorted page, §7.1)
-//   32 B   append_slot_ids[8]     (u32 each)
-//   1024 B append_prefix16[8][64] (u16 per key, per append page, §7.1)
-//   4 B    _reserved
+//   432 B  sorted_slot_ids[108]        (u32 each)
+//   432 B  sorted_min4[108]            (u32 boundary prefix per sorted page, §7.1)
+//   108 B  sorted_page_counts[108]     (u8 entry count per sorted page, 1..64)
+//   8 B    append_page_counts[8]       (u8 entry count per append page, 1..64)
+//   32 B   append_slot_ids[8]          (u32 each)
+//   1024 B append_prefix16[8][64]      (u16 per key, per append page, §7.1)
+//   8 B    _reserved
 
 pub const NodePage = struct {
     sorted_count: u8,
@@ -60,6 +62,8 @@ pub const NodePage = struct {
     child_commitments: [CHILD_COUNT]Hash,
     sorted_slot_ids: [S_MAX]PayloadSlotId,
     sorted_min4: [S_MAX]u32,
+    sorted_page_counts: [S_MAX]u8,
+    append_page_counts: [A_MAX]u8,
     append_slot_ids: [A_MAX]PayloadSlotId,
     append_prefix16: [A_MAX][PAGE_ENTRIES]u16,
 };

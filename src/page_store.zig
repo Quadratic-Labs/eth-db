@@ -5,17 +5,19 @@
 //!   bits 19..0   →  local_page    (up to 2^20 pages per file = 4 GiB per file)
 //!
 //! On-disk SST page: exactly 4096 bytes = 64 × KvEntry.
-//! The in-memory `count` field is NOT written — it is recovered from the
-//! node-page sorted_min4 / append_prefix16 arrays (§4.2.2).
+//! The in-memory `count` field is NOT written to disk; it is stored in the
+//! owning node-page's sorted_page_counts / append_page_counts arrays (§4.2.2).
 //!
 //! On-disk node page: exactly 4096 bytes (one physical page).
 //!   bytes    0 –    3  : header (sorted_count u8, append_count u8, _pad[2])
-//!   bytes    4 – 2051  : child_commitments[64]      (64 × 32 = 2048 B)
-//!   bytes 2052 – 2543  : sorted_slot_ids[123]        (123 × 4 = 492 B, LE u32)
-//!   bytes 2544 – 3035  : sorted_min4[123]            (123 × 4 = 492 B, LE u32)
-//!   bytes 3036 – 3067  : append_slot_ids[8]          (8 × 4 = 32 B, LE u32)
-//!   bytes 3068 – 4091  : append_prefix16[8][64]      (8 × 64 × 2 = 1024 B, LE u16)
-//!   bytes 4092 – 4095  : _reserved (zero)
+//!   bytes    4 – 2051  : child_commitments[64]          (64 × 32 = 2048 B)
+//!   bytes 2052 – 2483  : sorted_slot_ids[108]            (108 × 4 = 432 B, LE u32)
+//!   bytes 2484 – 2915  : sorted_min4[108]                (108 × 4 = 432 B, LE u32)
+//!   bytes 2916 – 3023  : sorted_page_counts[108]         (108 × 1 = 108 B)
+//!   bytes 3024 – 3031  : append_page_counts[8]           (8 × 1 = 8 B)
+//!   bytes 3032 – 3063  : append_slot_ids[8]              (8 × 4 = 32 B, LE u32)
+//!   bytes 3064 – 4087  : append_prefix16[8][64]          (8 × 64 × 2 = 1024 B, LE u16)
+//!   bytes 4088 – 4095  : _reserved (zero)
 
 const std = @import("std");
 const root = @import("types.zig");
@@ -90,14 +92,16 @@ pub const SstPageStore = struct {
 const NODE_PAGE_SIZE: u32 = 4096;
 const NODE_COMMITMENTS_OFF: u32 = 4;
 const NODE_SORTED_IDS_OFF: u32 = 2052; // 4 + 2048
-const NODE_SORTED_MIN4_OFF: u32 = 2544; // 2052 + 492
-const NODE_APPEND_IDS_OFF: u32 = 3036; // 2544 + 492
-const NODE_APPEND_PREFIX16_OFF: u32 = 3068; // 3036 + 32
-// _reserved: 4092–4095
+const NODE_SORTED_MIN4_OFF: u32 = 2484; // 2052 + 432
+const NODE_SORTED_COUNTS_OFF: u32 = 2916; // 2484 + 432
+const NODE_APPEND_COUNTS_OFF: u32 = 3024; // 2916 + 108
+const NODE_APPEND_IDS_OFF: u32 = 3032; // 3024 + 8
+const NODE_APPEND_PREFIX16_OFF: u32 = 3064; // 3032 + 32
+// _reserved: 4088–4095
 
 comptime {
     // Verify the on-disk layout totals exactly one physical page.
-    const tail = NODE_APPEND_PREFIX16_OFF + root.A_MAX * root.PAGE_ENTRIES * 2 + 4;
+    const tail = NODE_APPEND_PREFIX16_OFF + root.A_MAX * root.PAGE_ENTRIES * 2 + 8;
     if (tail != NODE_PAGE_SIZE) @compileError("NodePage layout does not fit in 4096 bytes");
 }
 
@@ -120,6 +124,12 @@ fn serialiseNodePage(page: *const root.NodePage, buf: *[NODE_PAGE_SIZE]u8) void 
         std.mem.writeInt(u32, buf[NODE_SORTED_MIN4_OFF + i * 4 ..][0..4], m, .little);
     }
 
+    // sorted_page_counts: 108 × u8
+    @memcpy(buf[NODE_SORTED_COUNTS_OFF..][0..root.S_MAX], &page.sorted_page_counts);
+
+    // append_page_counts: 8 × u8
+    @memcpy(buf[NODE_APPEND_COUNTS_OFF..][0..root.A_MAX], &page.append_page_counts);
+
     // append_slot_ids: 8 × u32, little-endian
     for (page.append_slot_ids, 0..) |id, i| {
         std.mem.writeInt(u32, buf[NODE_APPEND_IDS_OFF + i * 4 ..][0..4], id, .little);
@@ -133,7 +143,7 @@ fn serialiseNodePage(page: *const root.NodePage, buf: *[NODE_PAGE_SIZE]u8) void 
     }
 
     // trailing reserved bytes
-    @memset(buf[4092..4096], 0);
+    @memset(buf[4088..4096], 0);
 }
 
 fn deserialiseNodePage(buf: *const [NODE_PAGE_SIZE]u8) root.NodePage {
@@ -150,6 +160,10 @@ fn deserialiseNodePage(buf: *const [NODE_PAGE_SIZE]u8) root.NodePage {
     for (0..root.S_MAX) |i| {
         page.sorted_min4[i] = std.mem.readInt(u32, buf[NODE_SORTED_MIN4_OFF + i * 4 ..][0..4], .little);
     }
+
+    @memcpy(&page.sorted_page_counts, buf[NODE_SORTED_COUNTS_OFF..][0..root.S_MAX]);
+
+    @memcpy(&page.append_page_counts, buf[NODE_APPEND_COUNTS_OFF..][0..root.A_MAX]);
 
     for (0..root.A_MAX) |i| {
         page.append_slot_ids[i] = std.mem.readInt(u32, buf[NODE_APPEND_IDS_OFF + i * 4 ..][0..4], .little);
@@ -354,8 +368,8 @@ test "NodePageStore round-trip — full sorted zone" {
     const got = try store.read(0);
 
     try std.testing.expectEqual(@as(u8, root.S_MAX), got.sorted_count);
-    try std.testing.expectEqual(@as(u32, 122), got.sorted_slot_ids[122]);
-    try std.testing.expectEqual(@as(u32, 122 * 0x100), got.sorted_min4[122]);
+    try std.testing.expectEqual(@as(u32, root.S_MAX - 1), got.sorted_slot_ids[root.S_MAX - 1]);
+    try std.testing.expectEqual(@as(u32, (root.S_MAX - 1) * 0x100), got.sorted_min4[root.S_MAX - 1]);
     for (page.child_commitments, got.child_commitments) |a, b| {
         try std.testing.expectEqual(a, b);
     }

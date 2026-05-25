@@ -44,7 +44,7 @@ export fn prefixdb_put(state: *State, key: *const [32]u8, value: *const [32]u8) 
 
 /// Returns 0 and fills value_out if found; 1 if not found (or deleted); -1 on error.
 export fn prefixdb_get(state: *State, key: *const [32]u8, value_out: *[32]u8) i32 {
-    const result = state.db.read(key.*);
+    const result = state.db.read(key.*) catch return -1;
     if (result) |v| {
         if (std.mem.eql(u8, &v, &TOMBSTONE)) return 1;
         value_out.* = v;
