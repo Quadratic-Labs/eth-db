@@ -39,9 +39,9 @@ Output formats
 
 Usage examples
 --------------
-  python simulate.py -n 1000 --format csv -o accesses.csv --stats
-  python simulate.py -n 500  --pool-size 200 --alpha 1.5 --format binary -o accesses.bin
-  python simulate.py -n 2000 --min-block-size 50 --max-block-size 1200 --read-prob 0.9
+  python generate_kv_blocks.py -n 1000 --format csv -o accesses.csv --stats
+  python generate_kv_blocks.py -n 500  --pool-size 200 --alpha 1.5 --format binary -o accesses.bin
+  python generate_kv_blocks.py -n 2000 --min-block-size 50 --max-block-size 1200 --read-prob 0.9
 """
 
 from __future__ import annotations
