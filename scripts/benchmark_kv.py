@@ -261,6 +261,13 @@ def _run_block(
     sst_cache_hit_rate = round(sst_hits / max(sst_total, 1), 4)
     write_amp = round(raw_metrics.compaction_sst_writes / max(raw_metrics.write_ops, 1), 4)
 
+    m = raw_metrics.as_dict()
+    elapsed_s = sum(read_lats) + sum(write_lats)
+    disk_reads  = m.get("disk_node_reads", 0) + m.get("disk_sst_reads", 0)
+    disk_writes = m.get("disk_node_writes", 0) + m.get("disk_sst_writes", 0)
+    disk_read_iops  = disk_reads  / max(elapsed_s, 1e-12)
+    disk_write_iops = disk_writes / max(elapsed_s, 1e-12)
+
     return {
         "block_no": block_no,
         "reads": n_r,
@@ -282,6 +289,8 @@ def _run_block(
         "filter_selectivity": filter_selectivity,
         "sst_cache_hit_rate": sst_cache_hit_rate,
         "write_amp": write_amp,
+        "disk_read_iops":  round(disk_read_iops, 1),
+        "disk_write_iops": round(disk_write_iops, 1),
     }
 
 
@@ -313,6 +322,9 @@ def run_benchmark(
     gen: WorkloadGenerator,
     num_blocks: int,
     print_every: int,
+    node_cap: int | None = None,
+    sst_cap: int | None = None,
+    db_dir: str | None = None,
 ) -> tuple[list[dict], dict]:
     """Drive the workload against a single PrefixDB instance, collect metrics."""
     block_metrics: list[dict] = []
@@ -324,7 +336,7 @@ def run_benchmark(
     current_block_ops: list[tuple] = []
     current_block_no = 1
 
-    with PrefixDB() as db:
+    with PrefixDB(path=db_dir, node_cap=node_cap, sst_cap=sst_cap) as db:
         for record in gen.generate_blocks(num_blocks):
             block_no = record[0]
             if block_no != current_block_no:
@@ -376,6 +388,10 @@ def run_benchmark(
     total_sst_miss   = _sum_metric("sst_cache_misses")
     total_fp         = _sum_metric("append_filter_probes")
     total_fh         = _sum_metric("append_filter_hits")
+    total_disk_node_reads  = _sum_metric("disk_node_reads")
+    total_disk_node_writes = _sum_metric("disk_node_writes")
+    total_disk_sst_reads   = _sum_metric("disk_sst_reads")
+    total_disk_sst_writes  = _sum_metric("disk_sst_writes")
 
     summary = {
         "total_blocks":    num_blocks,
@@ -409,6 +425,10 @@ def run_benchmark(
             "total_compaction_sst_writes": total_cmp_writes,
             "total_l0_flushes":            _sum_metric("l0_flushes"),
             "total_compaction_ops":        _sum_metric("compaction_ops"),
+            "total_disk_node_reads":       total_disk_node_reads,
+            "total_disk_node_writes":      total_disk_node_writes,
+            "total_disk_sst_reads":        total_disk_sst_reads,
+            "total_disk_sst_writes":       total_disk_sst_writes,
         },
     }
 
@@ -440,6 +460,12 @@ def parse_args() -> argparse.Namespace:
                    help="Output JSON file (default: metrics.json)")
     p.add_argument("--print-every", type=int, default=10,
                    help="Print progress every N blocks; 0 to disable (default: 10)")
+    p.add_argument("--node-cache", type=int, default=None, metavar="N",
+                   help="LRU capacity for routing-node pages (default: engine default = 1024)")
+    p.add_argument("--sst-cache",  type=int, default=None, metavar="N",
+                   help="LRU capacity for SST (KV) pages (default: engine default = 4096)")
+    p.add_argument("--db-dir", default=None, metavar="PATH",
+                   help="Directory for persistent database (enables disk I/O; auto-recovers on restart)")
     return p.parse_args()
 
 
@@ -458,11 +484,19 @@ def main() -> None:
         "max_block_size":  args.max_block_size,
         "read_prob":       args.read_prob,
         "seed":            args.seed,
+        "node_cache_cap":  args.node_cache,
+        "sst_cache_cap":   args.sst_cache,
+        "db_dir":          args.db_dir,
     }
 
+    cache_info = ""
+    if args.node_cache is not None or args.sst_cache is not None:
+        nc = args.node_cache if args.node_cache is not None else 1024
+        sc = args.sst_cache  if args.sst_cache  is not None else 4096
+        cache_info = f", node_cache={nc}, sst_cache={sc}"
     print(
         f"Starting benchmark: {args.blocks} blocks, "
-        f"pool={args.pool_size}, alpha={args.alpha}, read_prob={args.read_prob:.0%}",
+        f"pool={args.pool_size}, alpha={args.alpha}, read_prob={args.read_prob:.0%}{cache_info}",
         file=sys.stderr,
     )
 
@@ -479,7 +513,12 @@ def main() -> None:
         seed=args.seed,
     )
 
-    block_metrics, summary = run_benchmark(gen, args.blocks, args.print_every)
+    block_metrics, summary = run_benchmark(
+        gen, args.blocks, args.print_every,
+        node_cap=args.node_cache,
+        sst_cap=args.sst_cache,
+        db_dir=args.db_dir,
+    )
 
     with open(args.output, "w") as f:
         json.dump({"config": config, "summary": summary, "blocks": block_metrics}, f, indent=2)

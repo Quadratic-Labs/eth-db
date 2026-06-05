@@ -28,6 +28,104 @@ pub const PAGE_SIZE: u32 = 4096;
 /// Directory handle + I/O interface bundled for disk-store operations.
 pub const DiskStore = struct { dir: Io.Dir, io: Io };
 
+pub const MANIFEST_MAGIC: u32 = 0x01_42_44_50;
+pub const MANIFEST_VERSION: u32 = 1;
+
+/// Fixed-size header written at offset 0 of manifest.bin.
+pub const ManifestHeader = extern struct {
+    magic: u32,
+    version: u32,
+    next_node_id: u32,
+    next_sst_id: u32,
+    pin_used_words: u32,
+    routing_count: u32,
+    l0_count: u32,
+    _pad: u32 = 0,
+};
+
+/// One routing-table entry (depth + prefix → node_id).
+pub const ManifestRouteEntry = extern struct {
+    depth: u32,
+    prefix: u32,
+    node_id: u32,
+};
+
+/// Deserialized manifest data (caller owns the slices).
+pub const ManifestData = struct {
+    header: ManifestHeader,
+    pin_used: []u64,
+    routes: []ManifestRouteEntry,
+    l0: []root.KvEntry,
+
+    pub fn deinit(self: *ManifestData, allocator: std.mem.Allocator) void {
+        allocator.free(self.pin_used);
+        allocator.free(self.routes);
+        allocator.free(self.l0);
+    }
+};
+
+pub fn writeManifest(
+    store: DiskStore,
+    header: ManifestHeader,
+    pin_used: []const u64,
+    routes: []const ManifestRouteEntry,
+    l0: []const root.KvEntry,
+) !void {
+    const f = try store.dir.createFile(store.io, "manifest.bin", .{ .truncate = true });
+    defer f.close(store.io);
+    var off: u64 = 0;
+    try f.writePositionalAll(store.io, std.mem.asBytes(&header), off);
+    off += @sizeOf(ManifestHeader);
+    try f.writePositionalAll(store.io, std.mem.sliceAsBytes(pin_used), off);
+    off += pin_used.len * @sizeOf(u64);
+    try f.writePositionalAll(store.io, std.mem.sliceAsBytes(routes), off);
+    off += routes.len * @sizeOf(ManifestRouteEntry);
+    try f.writePositionalAll(store.io, std.mem.sliceAsBytes(l0), off);
+}
+
+pub fn readManifest(store: DiskStore, allocator: std.mem.Allocator) !ManifestData {
+    const f = try store.dir.openFile(store.io, "manifest.bin", .{});
+    defer f.close(store.io);
+    var off: u64 = 0;
+
+    var header: ManifestHeader = undefined;
+    const hn = try f.readPositionalAll(store.io, std.mem.asBytes(&header), off);
+    if (hn != @sizeOf(ManifestHeader)) return error.ManifestTruncated;
+    off += @sizeOf(ManifestHeader);
+    if (header.magic != MANIFEST_MAGIC) return error.ManifestBadMagic;
+    if (header.version != MANIFEST_VERSION) return error.ManifestVersionMismatch;
+
+    const pin_used = try allocator.alloc(u64, header.pin_used_words);
+    errdefer allocator.free(pin_used);
+    if (pin_used.len > 0) {
+        const pn = try f.readPositionalAll(store.io, std.mem.sliceAsBytes(pin_used), off);
+        if (pn != pin_used.len * @sizeOf(u64)) return error.ManifestTruncated;
+        off += pin_used.len * @sizeOf(u64);
+    }
+
+    const routes = try allocator.alloc(ManifestRouteEntry, header.routing_count);
+    errdefer allocator.free(routes);
+    if (routes.len > 0) {
+        const rn = try f.readPositionalAll(store.io, std.mem.sliceAsBytes(routes), off);
+        if (rn != routes.len * @sizeOf(ManifestRouteEntry)) return error.ManifestTruncated;
+        off += routes.len * @sizeOf(ManifestRouteEntry);
+    }
+
+    const l0 = try allocator.alloc(root.KvEntry, header.l0_count);
+    errdefer allocator.free(l0);
+    if (l0.len > 0) {
+        const ln = try f.readPositionalAll(store.io, std.mem.sliceAsBytes(l0), off);
+        if (ln != l0.len * @sizeOf(root.KvEntry)) return error.ManifestTruncated;
+    }
+
+    return .{
+        .header = header,
+        .pin_used = pin_used,
+        .routes = routes,
+        .l0 = l0,
+    };
+}
+
 // ─── Address helpers ──────────────────────────────────────────────────────────
 
 inline fn containerId(id: u32) u32 {

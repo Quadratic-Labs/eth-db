@@ -61,6 +61,10 @@ pub const HeapStats = if (options.enable_metrics) struct {
     sst_cache_misses: u64 = 0,
     node_cache_hits: u64 = 0,
     node_cache_misses: u64 = 0,
+    disk_node_reads: u64 = 0,
+    disk_node_writes: u64 = 0,
+    disk_sst_reads: u64 = 0,
+    disk_sst_writes: u64 = 0,
 } else struct {};
 
 // ─── Routing table (§4.2.1) ───────────────────────────────────────────────────
@@ -180,6 +184,29 @@ pub fn Pool(comptime T: type) type {
             return @intCast(self.pages.len);
         }
 
+        /// Mark slot `id` as live and set its page data. Used during recovery.
+        /// The `used` bitmap bit must NOT already be set.
+        pub fn restoreSlot(self: *Self, id: u32, page: T) void {
+            std.debug.assert(!self.isLive(id));
+            self.pages[id] = page;
+            setBit(self.used, id);
+            self.live_count += 1;
+        }
+
+        /// Rebuild the embedded free-list links for all dead slots.
+        /// Call once after all `restoreSlot` calls are done.
+        pub fn rebuildFreeList(self: *Self) void {
+            self.free_head = NONE;
+            var i: u32 = @intCast(self.pages.len);
+            while (i > 0) {
+                i -= 1;
+                if (!self.isLive(i)) {
+                    writeLink(self.pages, i, self.free_head);
+                    self.free_head = i;
+                }
+            }
+        }
+
         fn readLink(pages: []T, id: u32) u32 {
             const src: *const [4]u8 = @ptrCast(&pages[id]);
             return std.mem.readInt(u32, src, .little);
@@ -293,7 +320,10 @@ pub const Heap = struct {
         const id = self.next_node_id;
         self.next_node_id += 1;
         // Write-through: persist before inserting so an evicted entry is recoverable.
-        if (self.node_store) |*store| try store.write(id, &page);
+        if (self.node_store) |*store| {
+            try store.write(id, &page);
+            if (comptime options.enable_metrics) self.heap_stats.disk_node_writes += 1;
+        }
         try self.node_cache.put(id, page);
         return id;
     }
@@ -306,7 +336,10 @@ pub const Heap = struct {
             return error.SstCacheFull;
         const id = self.next_sst_id;
         self.next_sst_id += 1;
-        if (self.sst_store) |*store| try store.write(id, &page);
+        if (self.sst_store) |*store| {
+            try store.write(id, &page);
+            if (comptime options.enable_metrics) self.heap_stats.disk_sst_writes += 1;
+        }
         try self.sst_cache.put(id, page);
         return id;
     }
@@ -331,6 +364,7 @@ pub const Heap = struct {
         if (comptime options.enable_metrics) self.heap_stats.node_cache_misses += 1;
         if (self.node_store) |*store| {
             const page = try store.read(id);
+            if (comptime options.enable_metrics) self.heap_stats.disk_node_reads += 1;
             try self.node_cache.put(id, page);
             return page;
         }
@@ -351,6 +385,7 @@ pub const Heap = struct {
         if (comptime options.enable_metrics) self.heap_stats.sst_cache_misses += 1;
         if (self.sst_store) |*store| {
             const page = try store.read(id);
+            if (comptime options.enable_metrics) self.heap_stats.disk_sst_reads += 1;
             try self.sst_cache.put(id, page);
             return page;
         }
@@ -409,6 +444,132 @@ pub const PrefixDB = struct {
             .compaction_queue = std.ArrayList(NodeCoord).empty,
             .allocator = allocator,
         };
+    }
+
+    /// Open (or create fresh) a PrefixDB backed by `store`.
+    /// If `manifest.bin` is present in the store directory, the database state
+    /// is recovered from disk.  Otherwise, a fresh empty database is created.
+    pub fn openWithConfig(
+        allocator: std.mem.Allocator,
+        config: CacheConfig,
+        store: page_store.DiskStore,
+    ) !PrefixDB {
+        // Try to read an existing manifest.
+        var manifest = page_store.readManifest(store, allocator) catch |err| switch (err) {
+            error.FileNotFound => {
+                // Fresh database — no recovery needed.
+                return initWithConfig(allocator, config, store);
+            },
+            else => return err,
+        };
+        defer manifest.deinit(allocator);
+        if (manifest.header.magic != page_store.MANIFEST_MAGIC)
+            return error.ManifestBadMagic;
+
+        // Build a fresh engine skeleton with the disk store wired in.
+        var heap = try Heap.init(allocator, config, store);
+        errdefer heap.deinit();
+
+        // Restore counters.
+        heap.next_node_id = manifest.header.next_node_id;
+        heap.next_sst_id  = manifest.header.next_sst_id;
+
+        // Restore pin_nodes bitmap from manifest and reload page data from disk.
+        const used_words = manifest.pin_used.len;
+        if (used_words > 0) {
+            const ns = heap.node_store orelse return error.StoreRequired;
+            _ = ns;
+            // Copy the bitmap into the pool's used[] array.
+            const copy_words = @min(used_words, heap.pin_nodes.used.len);
+            @memcpy(heap.pin_nodes.used[0..copy_words], manifest.pin_used[0..copy_words]);
+            // Reload each live pin_node from disk.
+            for (0..@intCast(heap.pin_nodes.capacity())) |i| {
+                const id: u32 = @intCast(i);
+                if (heap.pin_nodes.isLive(id)) {
+                    const page = try @constCast(&heap.node_store.?).read(id);
+                    heap.pin_nodes.pages[id] = page;
+                    heap.pin_nodes.live_count += 1;
+                }
+            }
+            heap.pin_nodes.rebuildFreeList();
+        }
+
+        // Restore routing table.
+        var routing = RoutingTable.init(allocator);
+        errdefer routing.deinit();
+        for (manifest.routes) |r| {
+            try routing.put(r.depth, r.prefix, r.node_id);
+        }
+
+        // Restore L0 buffer.
+        var l0 = L0Buffer.init(allocator);
+        errdefer l0.deinit();
+        for (manifest.l0) |entry| {
+            try l0.append(entry);
+        }
+
+        return .{
+            .l0 = l0,
+            .routing = routing,
+            .heap = heap,
+            .compaction_queue = std.ArrayList(NodeCoord).empty,
+            .allocator = allocator,
+        };
+    }
+
+    /// Persist the current state to `store`.
+    /// Writes all live pin_nodes to node_store, then writes manifest.bin.
+    /// Must be called before process exit to preserve the database.
+    pub fn flush(self: *PrefixDB, store: page_store.DiskStore) !void {
+        // Write live pin_nodes (depths 1-2) to node_store.
+        if (self.heap.node_store) |*ns| {
+            for (0..@intCast(self.heap.pin_nodes.capacity())) |i| {
+                const id: u32 = @intCast(i);
+                if (self.heap.pin_nodes.isLive(id)) {
+                    try ns.write(id, &self.heap.pin_nodes.pages[id]);
+                }
+            }
+        }
+
+        // Count routing entries.
+        var route_count: u32 = 0;
+        for (&self.routing.maps) |*m| route_count += @as(u32, @intCast(m.count()));
+
+        // Count L0 entries.
+        const l0_count: u32 = @intCast(self.l0.entries.items.len);
+
+        const header = page_store.ManifestHeader{
+            .magic         = page_store.MANIFEST_MAGIC,
+            .version       = page_store.MANIFEST_VERSION,
+            .next_node_id  = self.heap.next_node_id,
+            .next_sst_id   = self.heap.next_sst_id,
+            .pin_used_words = @intCast(self.heap.pin_nodes.used.len),
+            .routing_count = route_count,
+            .l0_count      = l0_count,
+            ._pad          = 0,
+        };
+
+        // Build routing entries slice.
+        var routes = try std.ArrayList(page_store.ManifestRouteEntry).initCapacity(self.allocator, route_count);
+        defer routes.deinit(self.allocator);
+        for (&self.routing.maps, 0..) |*m, di| {
+            var it = m.iterator();
+            while (it.next()) |kv| {
+                routes.appendAssumeCapacity(.{
+                    .depth   = @intCast(di + 1),
+                    .prefix  = kv.key_ptr.*,
+                    .node_id = kv.value_ptr.*,
+                });
+            }
+        }
+
+        try page_store.writeManifest(
+            store,
+            header,
+            self.heap.pin_nodes.used,
+            routes.items,
+            self.l0.entries.items,
+        );
     }
 
     pub fn deinit(self: *PrefixDB) void {

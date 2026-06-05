@@ -36,6 +36,9 @@ _Buf32 = ctypes.c_ubyte * 32
 _lib.prefixdb_init.restype = ctypes.c_void_p
 _lib.prefixdb_init.argtypes = []
 
+_lib.prefixdb_init_capacity.restype = ctypes.c_void_p
+_lib.prefixdb_init_capacity.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+
 _lib.prefixdb_deinit.restype = None
 _lib.prefixdb_deinit.argtypes = [ctypes.c_void_p]
 
@@ -50,6 +53,12 @@ _lib.prefixdb_del.argtypes = [ctypes.c_void_p, _Buf32]
 
 _lib.prefixdb_compact.restype = ctypes.c_int
 _lib.prefixdb_compact.argtypes = [ctypes.c_void_p]
+
+_lib.prefixdb_open.restype = ctypes.c_void_p
+_lib.prefixdb_open.argtypes = [ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32]
+
+_lib.prefixdb_flush.restype = ctypes.c_int
+_lib.prefixdb_flush.argtypes = [ctypes.c_void_p]
 
 
 class Metrics(ctypes.Structure):
@@ -80,6 +89,10 @@ class Metrics(ctypes.Structure):
         ("compaction_ops",        ctypes.c_uint64),
         ("compaction_sst_reads",  ctypes.c_uint64),
         ("compaction_sst_writes", ctypes.c_uint64),
+        ("disk_node_reads",       ctypes.c_uint64),
+        ("disk_node_writes",      ctypes.c_uint64),
+        ("disk_sst_reads",        ctypes.c_uint64),
+        ("disk_sst_writes",       ctypes.c_uint64),
     ]
 
     def as_dict(self) -> dict:
@@ -100,10 +113,30 @@ def _buf32(b: bytes) -> _Buf32:
 
 
 class PrefixDB:
-    """In-memory PrefixDB store. Use as a context manager for safe cleanup."""
+    """PrefixDB store, optionally disk-backed. Use as a context manager for safe cleanup.
 
-    def __init__(self) -> None:
-        self._handle = _lib.prefixdb_init()
+    Args:
+        path:     Directory path for persistent storage. If provided, the database
+                  is opened from disk (recovering an existing manifest.bin if present).
+                  If None, an in-memory database is created.
+        node_cap: LRU capacity for routing-node pages (default: 1024).
+        sst_cap:  LRU capacity for SST (key-value) pages (default: 4096).
+
+    Each node page is ~4 KiB; each SST page is 4 KiB × 64 entries.
+    Pass both to control how aggressively the engine caches in RAM.
+    """
+
+    def __init__(self, path: str | None = None, node_cap: int | None = None, sst_cap: int | None = None) -> None:
+        if path is not None:
+            nc = node_cap if node_cap is not None else 0
+            sc = sst_cap  if sst_cap  is not None else 0
+            self._handle = _lib.prefixdb_open(path.encode(), nc, sc)
+        elif node_cap is not None or sst_cap is not None:
+            nc = node_cap if node_cap is not None else 1024
+            sc = sst_cap  if sst_cap  is not None else 4096
+            self._handle = _lib.prefixdb_init_capacity(nc, sc)
+        else:
+            self._handle = _lib.prefixdb_init()
         if not self._handle:
             raise RuntimeError("prefixdb_init failed — out of memory?")
 
@@ -152,6 +185,12 @@ class PrefixDB:
         rc = _lib.prefixdb_compact(self._handle)
         if rc != 0:
             raise RuntimeError(f"compaction failed (rc={rc})")
+
+    def flush(self) -> None:
+        """Write manifest + pin_nodes to disk. No-op for in-memory databases."""
+        rc = _lib.prefixdb_flush(self._handle)
+        if rc != 0:
+            raise RuntimeError(f"flush failed (rc={rc})")
 
     def get_metrics(self) -> Metrics:
         """Return a snapshot of all internal counters.
