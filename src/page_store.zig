@@ -21,8 +21,12 @@
 
 const std = @import("std");
 const root = @import("types.zig");
+const Io = std.Io;
 
 pub const PAGE_SIZE: u32 = 4096;
+
+/// Directory handle + I/O interface bundled for disk-store operations.
+pub const DiskStore = struct { dir: Io.Dir, io: Io };
 
 // ─── Address helpers ──────────────────────────────────────────────────────────
 
@@ -44,19 +48,19 @@ inline fn fileOffset(local: u32) u64 {
 /// inside `dir`.  Each file is a flat array of 4 KiB pages; the local page
 /// index is used as the seek offset.  The store does not own `dir`.
 pub const SstPageStore = struct {
-    dir: std.fs.Dir,
+    dir: Io.Dir,
+    io: Io,
 
-    pub fn init(dir: std.fs.Dir) SstPageStore {
-        return .{ .dir = dir };
+    pub fn init(dir: Io.Dir, io: Io) SstPageStore {
+        return .{ .dir = dir, .io = io };
     }
 
     /// Write `page.entries` (4096 bytes) to the heap slot `id`.
     /// `page.count` is not written to disk.
     pub fn write(self: *SstPageStore, id: root.PayloadSlotId, page: *const root.SstPage) !void {
         const f = try self.openContainer(containerId(id), .write);
-        defer f.close();
-        try f.seekTo(fileOffset(localPage(id)));
-        try f.writeAll(std.mem.asBytes(&page.entries));
+        defer f.close(self.io);
+        try f.writePositionalAll(self.io, std.mem.asBytes(&page.entries), fileOffset(localPage(id)));
     }
 
     /// Read the SST page at heap slot `id`.
@@ -64,10 +68,9 @@ pub const SstPageStore = struct {
     /// from the associated node-page filter data.
     pub fn read(self: *SstPageStore, id: root.PayloadSlotId) !root.SstPage {
         const f = try self.openContainer(containerId(id), .read);
-        defer f.close();
-        try f.seekTo(fileOffset(localPage(id)));
+        defer f.close(self.io);
         var page = std.mem.zeroes(root.SstPage);
-        const n = try f.readAll(std.mem.asBytes(&page.entries));
+        const n = try f.readPositionalAll(self.io, std.mem.asBytes(&page.entries), fileOffset(localPage(id)));
         if (n != @sizeOf(@TypeOf(page.entries))) return error.UnexpectedEof;
         page.count = @intCast(root.PAGE_ENTRIES);
         return page;
@@ -77,12 +80,12 @@ pub const SstPageStore = struct {
 
     const OpenMode = enum { read, write };
 
-    fn openContainer(self: *SstPageStore, cid: u32, mode: OpenMode) !std.fs.File {
+    fn openContainer(self: *SstPageStore, cid: u32, mode: OpenMode) !Io.File {
         var buf: [24]u8 = undefined;
         const name = try std.fmt.bufPrint(&buf, "sst_{x:0>8}.dat", .{cid});
         return switch (mode) {
-            .read => self.dir.openFile(name, .{}),
-            .write => self.dir.createFile(name, .{ .truncate = false }),
+            .read => self.dir.openFile(self.io, name, .{}),
+            .write => self.dir.createFile(self.io, name, .{ .truncate = false }),
         };
     }
 };
@@ -184,10 +187,11 @@ fn deserialiseNodePage(buf: *const [NODE_PAGE_SIZE]u8) root.NodePage {
 /// Each NodePageId maps to a 4 KiB block: bits 31..20 select the container
 /// file, bits 19..0 give the block index within the file.
 pub const NodePageStore = struct {
-    dir: std.fs.Dir,
+    dir: Io.Dir,
+    io: Io,
 
-    pub fn init(dir: std.fs.Dir) NodePageStore {
-        return .{ .dir = dir };
+    pub fn init(dir: Io.Dir, io: Io) NodePageStore {
+        return .{ .dir = dir, .io = io };
     }
 
     /// Serialise and write a node page to disk.
@@ -195,30 +199,28 @@ pub const NodePageStore = struct {
         var buf: [NODE_PAGE_SIZE]u8 = undefined;
         serialiseNodePage(page, &buf);
         const f = try self.openContainer(containerId(id), .write);
-        defer f.close();
-        try f.seekTo(fileOffset(localPage(id)));
-        try f.writeAll(&buf);
+        defer f.close(self.io);
+        try f.writePositionalAll(self.io, &buf, fileOffset(localPage(id)));
     }
 
     /// Read and deserialise a node page from disk.
     pub fn read(self: *NodePageStore, id: root.NodePageId) !root.NodePage {
         var buf: [NODE_PAGE_SIZE]u8 = undefined;
         const f = try self.openContainer(containerId(id), .read);
-        defer f.close();
-        try f.seekTo(fileOffset(localPage(id)));
-        const n = try f.readAll(&buf);
+        defer f.close(self.io);
+        const n = try f.readPositionalAll(self.io, &buf, fileOffset(localPage(id)));
         if (n != NODE_PAGE_SIZE) return error.UnexpectedEof;
         return deserialiseNodePage(&buf);
     }
 
     const OpenMode = enum { read, write };
 
-    fn openContainer(self: *NodePageStore, cid: u32, mode: OpenMode) !std.fs.File {
+    fn openContainer(self: *NodePageStore, cid: u32, mode: OpenMode) !Io.File {
         var buf: [25]u8 = undefined;
         const name = try std.fmt.bufPrint(&buf, "node_{x:0>8}.dat", .{cid});
         return switch (mode) {
-            .read => self.dir.openFile(name, .{}),
-            .write => self.dir.createFile(name, .{ .truncate = false }),
+            .read => self.dir.openFile(self.io, name, .{}),
+            .write => self.dir.createFile(self.io, name, .{ .truncate = false }),
         };
     }
 };
@@ -228,7 +230,7 @@ pub const NodePageStore = struct {
 test "SstPageStore write and read round-trip" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var store = SstPageStore.init(tmp.dir);
+    var store = SstPageStore.init(tmp.dir, std.testing.io);
 
     var page = std.mem.zeroes(root.SstPage);
     page.count = 2;
@@ -247,7 +249,7 @@ test "SstPageStore write and read round-trip" {
 test "SstPageStore multiple pages in one container" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var store = SstPageStore.init(tmp.dir);
+    var store = SstPageStore.init(tmp.dir, std.testing.io);
 
     var pa = std.mem.zeroes(root.SstPage);
     pa.entries[0].key = [_]u8{0xAA} ** 32;
@@ -266,7 +268,7 @@ test "SstPageStore multiple pages in one container" {
 test "SstPageStore pages across containers" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var store = SstPageStore.init(tmp.dir);
+    var store = SstPageStore.init(tmp.dir, std.testing.io);
 
     var p0 = std.mem.zeroes(root.SstPage);
     p0.entries[0].key = [_]u8{0x11} ** 32;
@@ -288,7 +290,7 @@ test "SstPageStore pages across containers" {
 test "SstPageStore non-zero offset within container" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var store = SstPageStore.init(tmp.dir);
+    var store = SstPageStore.init(tmp.dir, std.testing.io);
 
     const id: root.PayloadSlotId = 7;
     var page = std.mem.zeroes(root.SstPage);
@@ -303,7 +305,7 @@ test "SstPageStore non-zero offset within container" {
 test "SstPageStore all 64 entries preserved" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var store = SstPageStore.init(tmp.dir);
+    var store = SstPageStore.init(tmp.dir, std.testing.io);
 
     var page = std.mem.zeroes(root.SstPage);
     page.count = root.PAGE_ENTRIES;
@@ -322,7 +324,7 @@ test "SstPageStore all 64 entries preserved" {
 test "NodePageStore write and read round-trip — sparse page" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var store = NodePageStore.init(tmp.dir);
+    var store = NodePageStore.init(tmp.dir, std.testing.io);
 
     var page = std.mem.zeroes(root.NodePage);
     page.sorted_count = 2;
@@ -355,7 +357,7 @@ test "NodePageStore write and read round-trip — sparse page" {
 test "NodePageStore round-trip — full sorted zone" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var store = NodePageStore.init(tmp.dir);
+    var store = NodePageStore.init(tmp.dir, std.testing.io);
 
     var page = std.mem.zeroes(root.NodePage);
     page.sorted_count = root.S_MAX;
@@ -378,7 +380,7 @@ test "NodePageStore round-trip — full sorted zone" {
 test "NodePageStore round-trip — full append zone" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var store = NodePageStore.init(tmp.dir);
+    var store = NodePageStore.init(tmp.dir, std.testing.io);
 
     var page = std.mem.zeroes(root.NodePage);
     page.sorted_count = 0;
@@ -402,7 +404,7 @@ test "NodePageStore round-trip — full append zone" {
 test "NodePageStore pages across containers" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var store = NodePageStore.init(tmp.dir);
+    var store = NodePageStore.init(tmp.dir, std.testing.io);
 
     var p0 = std.mem.zeroes(root.NodePage);
     p0.sorted_count = 1;

@@ -17,7 +17,7 @@ const Value = root.Value;
 const TOMBSTONE: Value = [_]u8{0xFF} ** 32;
 
 const State = struct {
-    gpa: std.heap.GeneralPurposeAllocator(.{}),
+    gpa: std.heap.DebugAllocator(.{}),
     db: PrefixDB,
 };
 

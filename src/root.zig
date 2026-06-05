@@ -252,7 +252,7 @@ pub const Heap = struct {
     allocator: std.mem.Allocator,
     heap_stats: HeapStats = .{},
 
-    pub fn init(allocator: std.mem.Allocator, config: CacheConfig, store_dir: ?std.fs.Dir) !Heap {
+    pub fn init(allocator: std.mem.Allocator, config: CacheConfig, store: ?page_store.DiskStore) !Heap {
         var pin_nodes = try Pool(NodePage).init(allocator, PIN_NODE_CAP);
         errdefer pin_nodes.deinit(allocator);
 
@@ -267,8 +267,8 @@ pub const Heap = struct {
             .next_node_id = PIN_NODE_CAP,
             .sst_cache = sst_cache,
             .next_sst_id = 0,
-            .node_store = if (store_dir) |d| page_store.NodePageStore.init(d) else null,
-            .sst_store = if (store_dir) |d| page_store.SstPageStore.init(d) else null,
+            .node_store = if (store) |s| page_store.NodePageStore.init(s.dir, s.io) else null,
+            .sst_store = if (store) |s| page_store.SstPageStore.init(s.dir, s.io) else null,
             .allocator = allocator,
         };
     }
@@ -398,15 +398,15 @@ pub const PrefixDB = struct {
     pub fn initWithConfig(
         allocator: std.mem.Allocator,
         config: CacheConfig,
-        store_dir: ?std.fs.Dir,
+        store: ?page_store.DiskStore,
     ) !PrefixDB {
-        var heap = try Heap.init(allocator, config, store_dir);
+        var heap = try Heap.init(allocator, config, store);
         errdefer heap.deinit();
         return .{
             .l0 = L0Buffer.init(allocator),
             .routing = RoutingTable.init(allocator),
             .heap = heap,
-            .compaction_queue = std.ArrayList(NodeCoord){},
+            .compaction_queue = std.ArrayList(NodeCoord).empty,
             .allocator = allocator,
         };
     }
@@ -528,7 +528,7 @@ pub const PrefixDB = struct {
             }
         }
 
-        var new_entries = std.ArrayList(KvEntry){};
+        var new_entries = std.ArrayList(KvEntry).empty;
         errdefer new_entries.deinit(alloc);
         for (self.l0.entries.items) |e| {
             if (prefixData(&e.key, 1) != prefix) {
@@ -540,7 +540,7 @@ pub const PrefixDB = struct {
 
         if (map.count() == 0) return;
 
-        var sorted = std.ArrayList(KvEntry){};
+        var sorted = std.ArrayList(KvEntry).empty;
         defer sorted.deinit(alloc);
         var it = map.iterator();
         while (it.next()) |kv| {
@@ -646,7 +646,7 @@ pub const PrefixDB = struct {
         const old_node = (try self.heap.getNodePage(node_id)) orelse return;
         if (old_node.append_count == 0) return;
 
-        var all_entries = std.ArrayList(KvEntry){};
+        var all_entries = std.ArrayList(KvEntry).empty;
         defer all_entries.deinit(alloc);
         for (0..old_node.sorted_count) |si| {
             if (try self.heap.getSstPage(old_node.sorted_slot_ids[si])) |sst| {
@@ -667,17 +667,17 @@ pub const PrefixDB = struct {
         defer dedup.deinit();
         for (all_entries.items) |e| try dedup.put(e.key, e.value);
 
-        var survivors = std.ArrayList(KvEntry){};
+        var survivors = std.ArrayList(KvEntry).empty;
         defer survivors.deinit(alloc);
         var it = dedup.iterator();
         while (it.next()) |kv| try survivors.append(alloc, .{ .key = kv.key_ptr.*, .value = kv.value_ptr.* });
         std.mem.sort(KvEntry, survivors.items, {}, kvLessThan);
 
-        var new_ids = std.ArrayList(PayloadSlotId){};
+        var new_ids = std.ArrayList(PayloadSlotId).empty;
         defer new_ids.deinit(alloc);
-        var new_min4 = std.ArrayList(u32){};
+        var new_min4 = std.ArrayList(u32).empty;
         defer new_min4.deinit(alloc);
-        var new_counts = std.ArrayList(u8){};
+        var new_counts = std.ArrayList(u8).empty;
         defer new_counts.deinit(alloc);
 
         var offset: usize = 0;
@@ -755,7 +755,7 @@ pub const PrefixDB = struct {
         const old_node = (try self.heap.getNodePage(node_id)) orelse return;
         const child_depth = depth + 1;
 
-        var all_entries = std.ArrayList(KvEntry){};
+        var all_entries = std.ArrayList(KvEntry).empty;
         defer all_entries.deinit(alloc);
         for (0..old_node.sorted_count) |si| {
             if (try self.heap.getSstPage(old_node.sorted_slot_ids[si])) |sst| {
@@ -766,14 +766,14 @@ pub const PrefixDB = struct {
         }
         std.mem.sort(KvEntry, all_entries.items, {}, kvLessThan);
 
-        var new_ids = std.ArrayList(PayloadSlotId){};
+        var new_ids = std.ArrayList(PayloadSlotId).empty;
         defer new_ids.deinit(alloc);
-        var new_min4 = std.ArrayList(u32){};
+        var new_min4 = std.ArrayList(u32).empty;
         defer new_min4.deinit(alloc);
-        var new_counts = std.ArrayList(u8){};
+        var new_counts = std.ArrayList(u8).empty;
         defer new_counts.deinit(alloc);
 
-        var remaining = std.ArrayList(KvEntry){};
+        var remaining = std.ArrayList(KvEntry).empty;
         defer remaining.deinit(alloc);
 
         var i: usize = 0;
@@ -889,7 +889,7 @@ pub const PrefixDB = struct {
             }
         }
 
-        var survivors = std.ArrayList(KvEntry){};
+        var survivors = std.ArrayList(KvEntry).empty;
         defer survivors.deinit(alloc);
         var mit = merged.iterator();
         while (mit.next()) |kv| try survivors.append(alloc, .{ .key = kv.key_ptr.*, .value = kv.value_ptr.* });
@@ -898,11 +898,11 @@ pub const PrefixDB = struct {
         const pages_needed = (survivors.items.len + PAGE_ENTRIES - 1) / PAGE_ENTRIES;
         if (pages_needed > S_MAX) return;
 
-        var new_ids = std.ArrayList(PayloadSlotId){};
+        var new_ids = std.ArrayList(PayloadSlotId).empty;
         defer new_ids.deinit(alloc);
-        var new_min4 = std.ArrayList(u32){};
+        var new_min4 = std.ArrayList(u32).empty;
         defer new_min4.deinit(alloc);
-        var new_counts = std.ArrayList(u8){};
+        var new_counts = std.ArrayList(u8).empty;
         defer new_counts.deinit(alloc);
 
         var offset: usize = 0;
