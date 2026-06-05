@@ -52,6 +52,47 @@ _lib.prefixdb_compact.restype = ctypes.c_int
 _lib.prefixdb_compact.argtypes = [ctypes.c_void_p]
 
 
+class Metrics(ctypes.Structure):
+    """Snapshot of internal PrefixDB counters.
+
+    All fields are zero when the library was built without -Denable_metrics=true.
+
+    Useful derived ratios:
+      read_amp           = read_sst_loads / read_ops
+      filter_selectivity = 1 - append_filter_hits / append_filter_probes
+      sst_cache_hit_rate = sst_cache_hits / (sst_cache_hits + sst_cache_misses)
+      write_amp          = compaction_sst_writes / write_ops
+    """
+    _fields_ = [
+        ("read_ops",              ctypes.c_uint64),
+        ("write_ops",             ctypes.c_uint64),
+        ("l0_hits",               ctypes.c_uint64),
+        ("read_sst_loads",        ctypes.c_uint64),
+        ("read_node_loads",       ctypes.c_uint64),
+        ("append_filter_probes",  ctypes.c_uint64),
+        ("append_filter_hits",    ctypes.c_uint64),
+        ("sst_cache_hits",        ctypes.c_uint64),
+        ("sst_cache_misses",      ctypes.c_uint64),
+        ("node_cache_hits",       ctypes.c_uint64),
+        ("node_cache_misses",     ctypes.c_uint64),
+        ("l0_flushes",            ctypes.c_uint64),
+        ("compaction_calls",      ctypes.c_uint64),
+        ("compaction_ops",        ctypes.c_uint64),
+        ("compaction_sst_reads",  ctypes.c_uint64),
+        ("compaction_sst_writes", ctypes.c_uint64),
+    ]
+
+    def as_dict(self) -> dict:
+        return {name: getattr(self, name) for name, _ in self._fields_}
+
+
+_lib.prefixdb_get_metrics.restype = ctypes.c_int
+_lib.prefixdb_get_metrics.argtypes = [ctypes.c_void_p, ctypes.POINTER(Metrics)]
+
+_lib.prefixdb_reset_metrics.restype = ctypes.c_int
+_lib.prefixdb_reset_metrics.argtypes = [ctypes.c_void_p]
+
+
 def _buf32(b: bytes) -> _Buf32:
     if len(b) > 32:
         raise ValueError(f"key/value must be ≤32 bytes, got {len(b)}")
@@ -111,3 +152,23 @@ class PrefixDB:
         rc = _lib.prefixdb_compact(self._handle)
         if rc != 0:
             raise RuntimeError(f"compaction failed (rc={rc})")
+
+    def get_metrics(self) -> Metrics:
+        """Return a snapshot of all internal counters.
+
+        All fields are zero when the library was built without -Denable_metrics=true.
+        """
+        out = Metrics()
+        rc = _lib.prefixdb_get_metrics(self._handle, ctypes.byref(out))
+        if rc != 0:
+            raise RuntimeError(f"get_metrics failed (rc={rc})")
+        return out
+
+    def reset_metrics(self) -> None:
+        """Reset all internal counters to zero.
+
+        No-op when the library was built without -Denable_metrics=true.
+        """
+        rc = _lib.prefixdb_reset_metrics(self._handle)
+        if rc != 0:
+            raise RuntimeError(f"reset_metrics failed (rc={rc})")

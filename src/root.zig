@@ -6,6 +6,7 @@
 //! page_store.zig imports types.zig directly, keeping the dependency graph acyclic.
 
 const std = @import("std");
+const options = @import("options");
 
 // ─── Re-export sub-modules ─────────────────────────────────────────────────────
 pub const merkle = @import("merkle.zig");
@@ -32,6 +33,35 @@ pub const PayloadSlotId = t.PayloadSlotId;
 pub const PrefixData = t.PrefixData;
 pub const SstPage = t.SstPage;
 pub const NodePage = t.NodePage;
+
+// ─── Optional instrumentation structs ─────────────────────────────────────────
+//
+// Both structs are zero-size when enable_metrics=false: fields are dead-code
+// eliminated and the `stats`/`heap_stats` fields add 0 bytes to their owners.
+
+/// Per-operation counters held by PrefixDB.
+pub const DbStats = if (options.enable_metrics) struct {
+    read_ops: u64 = 0,
+    write_ops: u64 = 0,
+    l0_hits: u64 = 0,
+    read_sst_loads: u64 = 0,
+    read_node_loads: u64 = 0,
+    append_filter_probes: u64 = 0,
+    append_filter_hits: u64 = 0,
+    l0_flushes: u64 = 0,
+    compaction_calls: u64 = 0,
+    compaction_ops: u64 = 0,
+    compaction_sst_reads: u64 = 0,
+    compaction_sst_writes: u64 = 0,
+} else struct {};
+
+/// Cache hit/miss counters held by Heap.
+pub const HeapStats = if (options.enable_metrics) struct {
+    sst_cache_hits: u64 = 0,
+    sst_cache_misses: u64 = 0,
+    node_cache_hits: u64 = 0,
+    node_cache_misses: u64 = 0,
+} else struct {};
 
 // ─── Routing table (§4.2.1) ───────────────────────────────────────────────────
 
@@ -220,6 +250,7 @@ pub const Heap = struct {
     sst_store: ?page_store.SstPageStore,
 
     allocator: std.mem.Allocator,
+    heap_stats: HeapStats = .{},
 
     pub fn init(allocator: std.mem.Allocator, config: CacheConfig, store_dir: ?std.fs.Dir) !Heap {
         var pin_nodes = try Pool(NodePage).init(allocator, PIN_NODE_CAP);
@@ -284,12 +315,20 @@ pub const Heap = struct {
     /// For depth-≥3 IDs a cache miss triggers a disk load when a store is available.
     pub fn getNodePage(self: *Heap, id: NodePageId) !?NodePage {
         if (id < PIN_NODE_CAP) {
-            if (!self.pin_nodes.isLive(id)) return null;
+            if (!self.pin_nodes.isLive(id)) {
+                if (comptime options.enable_metrics) self.heap_stats.node_cache_misses += 1;
+                return null;
+            }
+            if (comptime options.enable_metrics) self.heap_stats.node_cache_hits += 1;
             return self.pin_nodes.pages[id];
         }
         // LRU cache lookup.
-        if (self.node_cache.get(id)) |page| return page;
+        if (self.node_cache.get(id)) |page| {
+            if (comptime options.enable_metrics) self.heap_stats.node_cache_hits += 1;
+            return page;
+        }
         // Cache miss: reload from disk.
+        if (comptime options.enable_metrics) self.heap_stats.node_cache_misses += 1;
         if (self.node_store) |*store| {
             const page = try store.read(id);
             try self.node_cache.put(id, page);
@@ -305,7 +344,11 @@ pub const Heap = struct {
     /// (PAGE_ENTRIES); callers must override it from the owning node's
     /// sorted_page_counts / append_page_counts before using count-sensitive ops.
     pub fn getSstPage(self: *Heap, id: PayloadSlotId) !?SstPage {
-        if (self.sst_cache.get(id)) |page| return page;
+        if (self.sst_cache.get(id)) |page| {
+            if (comptime options.enable_metrics) self.heap_stats.sst_cache_hits += 1;
+            return page;
+        }
+        if (comptime options.enable_metrics) self.heap_stats.sst_cache_misses += 1;
         if (self.sst_store) |*store| {
             const page = try store.read(id);
             try self.sst_cache.put(id, page);
@@ -341,6 +384,7 @@ pub const PrefixDB = struct {
     heap: Heap,
     compaction_queue: std.ArrayList(NodeCoord),
     allocator: std.mem.Allocator,
+    stats: DbStats = .{},
 
     pub fn init(allocator: std.mem.Allocator) !PrefixDB {
         return initWithConfig(allocator, .{}, null);
@@ -378,6 +422,7 @@ pub const PrefixDB = struct {
 
     /// Append (K, V) to L0; flush to L1 when the prefix group reaches PAGE_ENTRIES.
     pub fn write(self: *PrefixDB, key: Key, value: Value) !void {
+        if (comptime options.enable_metrics) self.stats.write_ops += 1;
         try self.l0.append(.{ .key = key, .value = value });
         const p = prefixData(&key, 1);
         if (self.l0.prefixCount(@intCast(p)) >= PAGE_ENTRIES) {
@@ -389,11 +434,14 @@ pub const PrefixDB = struct {
 
     /// Return the most-recent value for key, or null if not present.
     pub fn read(self: *PrefixDB, key: Key) !?Value {
+        if (comptime options.enable_metrics) self.stats.read_ops += 1;
+
         // Step 1: L0 — scan backwards so the most-recent write is found first.
         var i: usize = self.l0.entries.items.len;
         while (i > 0) {
             i -= 1;
             if (std.mem.eql(u8, &self.l0.entries.items[i].key, &key)) {
+                if (comptime options.enable_metrics) self.stats.l0_hits += 1;
                 return self.l0.entries.items[i].value;
             }
         }
@@ -404,6 +452,7 @@ pub const PrefixDB = struct {
             const p = prefixData(&key, d);
             const node_id = self.routing.get(d, p) orelse continue;
             const node = (try self.heap.getNodePage(node_id)) orelse continue;
+            if (comptime options.enable_metrics) self.stats.read_node_loads += 1;
 
             const q = prefix32(&key, d);
             const f = prefix16(&key, d);
@@ -414,9 +463,12 @@ pub const PrefixDB = struct {
             var j: usize = node.append_count;
             while (j > 0 and append_result == null) {
                 j -= 1;
+                if (comptime options.enable_metrics) self.stats.append_filter_probes += 1;
                 if (filterContains(&node.append_prefix16[j], node.append_page_counts[j], f)) {
+                    if (comptime options.enable_metrics) self.stats.append_filter_hits += 1;
                     opp_count += 1;
                     if (try self.heap.getSstPage(node.append_slot_ids[j])) |sst_raw| {
+                        if (comptime options.enable_metrics) self.stats.read_sst_loads += 1;
                         var sst = sst_raw;
                         sst.count = node.append_page_counts[j];
                         append_result = binarySearchSst(&sst, &key);
@@ -436,6 +488,7 @@ pub const PrefixDB = struct {
                 if (lo > 0) {
                     const pg_idx = lo - 1;
                     if (try self.heap.getSstPage(node.sorted_slot_ids[pg_idx])) |sst_raw| {
+                        if (comptime options.enable_metrics) self.stats.read_sst_loads += 1;
                         var sst = sst_raw;
                         sst.count = node.sorted_page_counts[pg_idx];
                         sorted_result = binarySearchSst(&sst, &key);
@@ -459,6 +512,7 @@ pub const PrefixDB = struct {
 
     /// Flush all L0 entries for `prefix` to L1, deduplicating and sorting them.
     fn flushL0Prefix(self: *PrefixDB, prefix: PrefixData) !void {
+        if (comptime options.enable_metrics) self.stats.l0_flushes += 1;
         const alloc = self.allocator;
 
         var map = std.AutoHashMap(Key, Value).init(alloc);
@@ -557,14 +611,18 @@ pub const PrefixDB = struct {
 
     /// Drain the compaction queue, running the appropriate procedure per node.
     pub fn runCompaction(self: *PrefixDB) !void {
+        if (comptime options.enable_metrics) self.stats.compaction_calls += 1;
         while (self.compaction_queue.pop()) |coord| {
             const node_id = self.routing.get(coord.depth, coord.prefix) orelse continue;
             const node = (try self.heap.getNodePage(node_id)) orelse continue;
             if (coord.depth > 1 and (try self.countNodeEntries(coord.depth, coord.prefix)) < MERGE_THRESHOLD) {
+                if (comptime options.enable_metrics) self.stats.compaction_ops += 1;
                 try self.downwardMerge(coord.depth, coord.prefix);
             } else if (node.sorted_count >= S_MAX) {
+                if (comptime options.enable_metrics) self.stats.compaction_ops += 1;
                 try self.upwardSplit(coord.depth, coord.prefix);
             } else if (node.append_count > 0) {
+                if (comptime options.enable_metrics) self.stats.compaction_ops += 1;
                 try self.appendToSortedMerge(coord.depth, coord.prefix);
             }
         }
@@ -592,12 +650,14 @@ pub const PrefixDB = struct {
         defer all_entries.deinit(alloc);
         for (0..old_node.sorted_count) |si| {
             if (try self.heap.getSstPage(old_node.sorted_slot_ids[si])) |sst| {
+                if (comptime options.enable_metrics) self.stats.compaction_sst_reads += 1;
                 const cnt = old_node.sorted_page_counts[si];
                 for (sst.entries[0..cnt]) |e| try all_entries.append(alloc, e);
             }
         }
         for (0..old_node.append_count) |ai| {
             if (try self.heap.getSstPage(old_node.append_slot_ids[ai])) |sst| {
+                if (comptime options.enable_metrics) self.stats.compaction_sst_reads += 1;
                 const cnt = old_node.append_page_counts[ai];
                 for (sst.entries[0..cnt]) |e| try all_entries.append(alloc, e);
             }
@@ -630,6 +690,7 @@ pub const PrefixDB = struct {
                 const f63 = prefix16(&chunk[PAGE_ENTRIES - 1].key, depth);
                 if (f0 >> 10 == f63 >> 10) {
                     try self.promoteSstPage(depth, chunk);
+                    if (comptime options.enable_metrics) self.stats.compaction_sst_writes += 1;
                     offset = end;
                     continue;
                 }
@@ -639,6 +700,7 @@ pub const PrefixDB = struct {
             sst.count = @intCast(chunk.len);
             @memcpy(sst.entries[0..chunk.len], chunk);
             const sst_id = try self.heap.writeSstPage(sst);
+            if (comptime options.enable_metrics) self.stats.compaction_sst_writes += 1;
             try new_ids.append(alloc, sst_id);
             try new_min4.append(alloc, prefix32(&chunk[0].key, depth));
             try new_counts.append(alloc, sst.count);
@@ -697,6 +759,7 @@ pub const PrefixDB = struct {
         defer all_entries.deinit(alloc);
         for (0..old_node.sorted_count) |si| {
             if (try self.heap.getSstPage(old_node.sorted_slot_ids[si])) |sst| {
+                if (comptime options.enable_metrics) self.stats.compaction_sst_reads += 1;
                 const cnt = old_node.sorted_page_counts[si];
                 for (sst.entries[0..cnt]) |e| try all_entries.append(alloc, e);
             }
@@ -735,6 +798,7 @@ pub const PrefixDB = struct {
                     sst.count = @intCast(chunk.len);
                     @memcpy(sst.entries[0..chunk.len], chunk);
                     const sid = try self.heap.writeSstPage(sst);
+                    if (comptime options.enable_metrics) self.stats.compaction_sst_writes += 1;
                     if (cn.sorted_count < S_MAX) {
                         const sc = cn.sorted_count;
                         cn.sorted_slot_ids[sc] = sid;
@@ -763,6 +827,7 @@ pub const PrefixDB = struct {
             sst.count = @intCast(chunk.len);
             @memcpy(sst.entries[0..chunk.len], chunk);
             const sid = try self.heap.writeSstPage(sst);
+            if (comptime options.enable_metrics) self.stats.compaction_sst_writes += 1;
             try new_ids.append(alloc, sid);
             try new_min4.append(alloc, prefix32(&chunk[0].key, depth));
             try new_counts.append(alloc, sst.count);
@@ -804,18 +869,21 @@ pub const PrefixDB = struct {
         defer merged.deinit();
         for (0..old_parent.sorted_count) |si| {
             if (try self.heap.getSstPage(old_parent.sorted_slot_ids[si])) |sst| {
+                if (comptime options.enable_metrics) self.stats.compaction_sst_reads += 1;
                 const cnt = old_parent.sorted_page_counts[si];
                 for (sst.entries[0..cnt]) |e| try merged.put(e.key, e.value);
             }
         }
         for (0..old_child.sorted_count) |si| {
             if (try self.heap.getSstPage(old_child.sorted_slot_ids[si])) |sst| {
+                if (comptime options.enable_metrics) self.stats.compaction_sst_reads += 1;
                 const cnt = old_child.sorted_page_counts[si];
                 for (sst.entries[0..cnt]) |e| try merged.put(e.key, e.value);
             }
         }
         for (0..old_child.append_count) |ai| {
             if (try self.heap.getSstPage(old_child.append_slot_ids[ai])) |sst| {
+                if (comptime options.enable_metrics) self.stats.compaction_sst_reads += 1;
                 const cnt = old_child.append_page_counts[ai];
                 for (sst.entries[0..cnt]) |e| try merged.put(e.key, e.value);
             }
@@ -845,6 +913,7 @@ pub const PrefixDB = struct {
             sst.count = @intCast(chunk.len);
             @memcpy(sst.entries[0..chunk.len], chunk);
             const sid = try self.heap.writeSstPage(sst);
+            if (comptime options.enable_metrics) self.stats.compaction_sst_writes += 1;
             try new_ids.append(alloc, sid);
             try new_min4.append(alloc, prefix32(&chunk[0].key, parent_depth));
             try new_counts.append(alloc, sst.count);

@@ -16,10 +16,15 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
-    // It's also possible to define more custom flags to toggle optional features
-    // of this build script using `b.option()`. All defined flags (including
-    // target and optimize options) will be listed when running `zig build --help`
-    // in this directory.
+
+    const enable_metrics = b.option(
+        bool,
+        "enable_metrics",
+        "Compile in page-scan and operation counters (zero overhead when false, default: false)",
+    ) orelse false;
+    const build_opts = b.addOptions();
+    build_opts.addOption(bool, "enable_metrics", enable_metrics);
+
 
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
@@ -28,6 +33,11 @@ pub fn build(b: *std.Build) void {
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
+    // It's also possible to define more custom flags to toggle optional features
+    // of this build script using `b.option()`. All defined flags (including
+    // target and optimize options) will be listed when running `zig build --help`
+    // in this directory.
+
     const mod = b.addModule("eth_db", .{
         // The root source file is the "entry point" of this module. Users of
         // this module will only be able to access public declarations contained
@@ -40,6 +50,7 @@ pub fn build(b: *std.Build) void {
         // which requires us to specify a target.
         .target = target,
     });
+    mod.addOptions("options", build_opts);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -87,6 +98,7 @@ pub fn build(b: *std.Build) void {
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden
     // by passing `--prefix` or `-p`.
+    exe.root_module.addOptions("options", build_opts);
     b.installArtifact(exe);
 
     // This creates a top level step. Top level steps have a name and can be
@@ -125,6 +137,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    lib.root_module.addOptions("options", build_opts);
     b.installArtifact(lib);
 
     const install_lib = b.addInstallArtifact(lib, .{});
@@ -144,9 +157,12 @@ pub fn build(b: *std.Build) void {
     // Creates an executable that will run `test` blocks from the executable's
     // root module. Note that test executables only test one module at a time,
     // hence why we have to create two separate ones.
+    mod_tests.root_module.addOptions("options", build_opts);
+
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
+    exe_tests.root_module.addOptions("options", build_opts);
 
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
