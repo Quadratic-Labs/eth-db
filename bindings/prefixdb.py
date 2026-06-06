@@ -60,6 +60,9 @@ _lib.prefixdb_open.argtypes = [ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32
 _lib.prefixdb_flush.restype = ctypes.c_int
 _lib.prefixdb_flush.argtypes = [ctypes.c_void_p]
 
+_lib.prefixdb_estimate_key_count.restype = ctypes.c_int64
+_lib.prefixdb_estimate_key_count.argtypes = [ctypes.c_void_p]
+
 
 class Metrics(ctypes.Structure):
     """Snapshot of internal PrefixDB counters.
@@ -191,6 +194,16 @@ class PrefixDB:
         rc = _lib.prefixdb_flush(self._handle)
         if rc != 0:
             raise RuntimeError(f"flush failed (rc={rc})")
+
+    def estimate_key_count(self) -> int:
+        """Return an estimated upper-bound count of stored keys.
+
+        Reads node page-count metadata only — no SST page loads or disk I/O.
+        Overcounts tombstones (deleted keys) and uncompacted duplicate writes.
+        Call compact() first for a tighter estimate.
+        Returns -1 on internal error.
+        """
+        return _lib.prefixdb_estimate_key_count(self._handle)
 
     def get_metrics(self) -> Metrics:
         """Return a snapshot of all internal counters.

@@ -740,7 +740,7 @@ pub const PrefixDB = struct {
         sst_id: PayloadSlotId,
         count: u8,
         filter: [PAGE_ENTRIES]u16,
-    ) !void {
+    ) anyerror!void {
         const old_id = self.routing.get(depth, prefix);
 
         var node = std.mem.zeroes(NodePage);
@@ -748,7 +748,14 @@ pub const PrefixDB = struct {
             if (try self.heap.getNodePage(id)) |existing| node = existing;
         }
 
-        std.debug.assert(node.append_count < A_MAX);
+        // Append zone full: compact inline so we always have room.
+        if (node.append_count >= A_MAX) {
+            try self.appendToSortedMerge(depth, prefix);
+            node = std.mem.zeroes(NodePage);
+            if (self.routing.get(depth, prefix)) |id| {
+                if (try self.heap.getNodePage(id)) |compacted| node = compacted;
+            }
+        }
 
         const ac = node.append_count;
         node.append_slot_ids[ac] = sst_id;
@@ -798,6 +805,24 @@ pub const PrefixDB = struct {
         for (node.sorted_page_counts[0..node.sorted_count]) |c| count += c;
         for (node.append_page_counts[0..node.append_count]) |c| count += c;
         return count;
+    }
+
+    /// Estimated total number of stored entries (upper bound).
+    /// Reads node page-count metadata only — no SST page loads, no disk I/O.
+    /// Overcounts tombstones (deleted keys) and uncompacted duplicate writes.
+    /// Run `compact()` first for a tighter estimate.
+    pub fn estimateKeyCount(self: *PrefixDB) !u64 {
+        var total: u64 = self.l0.entries.items.len;
+        for (&self.routing.maps) |*map| {
+            var it = map.iterator();
+            while (it.next()) |entry| {
+                const node_id = entry.value_ptr.*;
+                const node = (try self.heap.getNodePage(node_id)) orelse continue;
+                for (node.sorted_page_counts[0..node.sorted_count]) |c| total += c;
+                for (node.append_page_counts[0..node.append_count]) |c| total += c;
+            }
+        }
+        return total;
     }
 
     /// §6.1: Merge the append zone into the sorted zone; promote homogeneous pages up.

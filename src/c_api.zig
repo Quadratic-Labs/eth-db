@@ -29,7 +29,7 @@ fn globalIo() std.Io {
 
 export fn prefixdb_init() ?*State {
     const state = std.heap.page_allocator.create(State) catch return null;
-    state.gpa = .{};
+    state.* = .{ .gpa = .{}, .db = undefined, .store = null };
     state.db = PrefixDB.init(state.gpa.allocator()) catch {
         _ = state.gpa.deinit();
         std.heap.page_allocator.destroy(state);
@@ -40,7 +40,7 @@ export fn prefixdb_init() ?*State {
 
 export fn prefixdb_init_capacity(node_cap: u32, sst_cap: u32) ?*State {
     const state = std.heap.page_allocator.create(State) catch return null;
-    state.gpa = .{};
+    state.* = .{ .gpa = .{}, .db = undefined, .store = null };
     state.db = PrefixDB.initCapacity(state.gpa.allocator(), node_cap, sst_cap) catch {
         _ = state.gpa.deinit();
         std.heap.page_allocator.destroy(state);
@@ -91,6 +91,14 @@ export fn prefixdb_flush(state: *State) i32 {
     const store = state.store orelse return 0; // no-op for in-memory
     state.db.flush(store) catch return -1;
     return 0;
+}
+
+/// Returns an estimated key count (upper bound).  -1 on internal error.
+/// Reads node metadata only — no SST loads or disk I/O.
+/// Overcounts tombstones and uncompacted duplicates; call compact() first for a tighter estimate.
+export fn prefixdb_estimate_key_count(state: *State) i64 {
+    const n = state.db.estimateKeyCount() catch return -1;
+    return @intCast(n);
 }
 
 export fn prefixdb_put(state: *State, key: *const [32]u8, value: *const [32]u8) i32 {
