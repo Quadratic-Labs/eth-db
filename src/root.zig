@@ -750,6 +750,16 @@ pub const PrefixDB = struct {
 
         // Append zone full: compact inline so we always have room.
         if (node.append_count >= A_MAX) {
+            // Guard: merging append into sorted could produce sorted_count + append_count
+            // pages in the worst case (no promotion). Run upwardSplit first to drain the
+            // sorted zone before it overflows S_MAX.
+            if (@as(u32, node.sorted_count) + @as(u32, node.append_count) > S_MAX) {
+                try self.upwardSplit(depth, prefix);
+                node = std.mem.zeroes(NodePage);
+                if (self.routing.get(depth, prefix)) |id| {
+                    if (try self.heap.getNodePage(id)) |split| node = split;
+                }
+            }
             try self.appendToSortedMerge(depth, prefix);
             node = std.mem.zeroes(NodePage);
             if (self.routing.get(depth, prefix)) |id| {
@@ -996,6 +1006,12 @@ pub const PrefixDB = struct {
                         if (cur_id) |id| self.heap.freeNodePage(id);
                         if (cn.sorted_count >= S_MAX)
                             self.compaction_queue.append(alloc, .{ .depth = child_depth, .prefix = cp }) catch {};
+                    } else {
+                        // Child sorted zone full: keep entries in parent and free the
+                        // just-written SST rather than leaking it.
+                        self.heap.freeSstPage(sid);
+                        for (chunk) |e| try remaining.append(alloc, e);
+                        self.compaction_queue.append(alloc, .{ .depth = child_depth, .prefix = cp }) catch {};
                     }
                     off = end;
                 }
