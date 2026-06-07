@@ -692,7 +692,7 @@ pub const PrefixDB = struct {
     /// callers do not need a separate flushL0All call.
     pub fn commitBlock(self: *PrefixDB) !Hash {
         if (comptime options.enable_metrics) self.stats.commit_block_calls += 1;
-        const t0 = if (comptime options.enable_metrics) std.time.nanoTimestamp() else {};
+        const t0 = if (comptime options.enable_metrics) monoNs() else {};
 
         try self.flushL0All();
 
@@ -765,8 +765,7 @@ pub const PrefixDB = struct {
         }
         const root = childMerkleRoot(root_children);
         if (comptime options.enable_metrics) {
-            const elapsed: u64 = @intCast(std.time.nanoTimestamp() - t0);
-            self.stats.commit_block_ns += elapsed;
+            self.stats.commit_block_ns += monoNs() - t0;
         }
         return root;
     }
@@ -1140,6 +1139,15 @@ pub const PrefixDB = struct {
             self.compaction_queue.append(alloc, .{ .depth = parent_depth, .prefix = parent_prefix }) catch {};
     }
 };
+
+// ─── Monotonic clock (Zig 0.16 has no std.time.nanoTimestamp) ─────────────────
+
+fn monoNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s +
+        @as(u64, @intCast(ts.nsec));
+}
 
 // ─── Commitment helpers ───────────────────────────────────────────────────────
 
