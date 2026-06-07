@@ -124,116 +124,9 @@ pub const L0Buffer = struct {
     }
 };
 
-// ─── Pool(T) ──────────────────────────────────────────────────────────────────
-
-pub fn Pool(comptime T: type) type {
-    if (@sizeOf(T) < @sizeOf(u32)) @compileError("Pool(T): T must be ≥ 4 bytes");
-    return struct {
-        const Self = @This();
-        pub const NONE: u32 = std.math.maxInt(u32);
-
-        pages: []T,
-        used: []u64,
-        free_head: u32,
-        live_count: u32,
-
-        pub fn init(allocator: std.mem.Allocator, cap: u32) !Self {
-            std.debug.assert(cap > 0 and cap < NONE);
-            const words = (cap + 63) / 64;
-            const pages = try allocator.alloc(T, cap);
-            errdefer allocator.free(pages);
-            const used = try allocator.alloc(u64, words);
-            @memset(used, 0);
-            for (0..cap) |i| {
-                const next: u32 = if (i + 1 < cap) @intCast(i + 1) else NONE;
-                writeLink(pages, @intCast(i), next);
-            }
-            return .{ .pages = pages, .used = used, .free_head = 0, .live_count = 0 };
-        }
-
-        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-            allocator.free(self.pages);
-            allocator.free(self.used);
-        }
-
-        pub fn alloc(self: *Self) ?u32 {
-            if (self.free_head == NONE) return null;
-            const id = self.free_head;
-            self.free_head = readLink(self.pages, id);
-            setBit(self.used, id);
-            self.live_count += 1;
-            return id;
-        }
-
-        pub fn free(self: *Self, id: u32) void {
-            writeLink(self.pages, id, self.free_head);
-            self.free_head = id;
-            clearBit(self.used, id);
-            self.live_count -= 1;
-        }
-
-        pub fn getPtr(self: *Self, id: u32) *T {
-            return &self.pages[id];
-        }
-
-        pub fn isLive(self: *const Self, id: u32) bool {
-            return (self.used[id >> 6] >> @as(u6, @intCast(id & 63))) & 1 == 1;
-        }
-
-        pub fn capacity(self: *const Self) u32 {
-            return @intCast(self.pages.len);
-        }
-
-        /// Mark slot `id` as live and set its page data. Used during recovery.
-        /// The `used` bitmap bit must NOT already be set.
-        pub fn restoreSlot(self: *Self, id: u32, page: T) void {
-            std.debug.assert(!self.isLive(id));
-            self.pages[id] = page;
-            setBit(self.used, id);
-            self.live_count += 1;
-        }
-
-        /// Rebuild the embedded free-list links for all dead slots.
-        /// Call once after all `restoreSlot` calls are done.
-        pub fn rebuildFreeList(self: *Self) void {
-            self.free_head = NONE;
-            var i: u32 = @intCast(self.pages.len);
-            while (i > 0) {
-                i -= 1;
-                if (!self.isLive(i)) {
-                    writeLink(self.pages, i, self.free_head);
-                    self.free_head = i;
-                }
-            }
-        }
-
-        fn readLink(pages: []T, id: u32) u32 {
-            const src: *const [4]u8 = @ptrCast(&pages[id]);
-            return std.mem.readInt(u32, src, .little);
-        }
-
-        fn writeLink(pages: []T, id: u32, next: u32) void {
-            const dst: *[4]u8 = @ptrCast(&pages[id]);
-            std.mem.writeInt(u32, dst, next, .little);
-        }
-
-        fn setBit(words: []u64, id: u32) void {
-            words[id >> 6] |= @as(u64, 1) << @as(u6, @intCast(id & 63));
-        }
-
-        fn clearBit(words: []u64, id: u32) void {
-            words[id >> 6] &= ~(@as(u64, 1) << @as(u6, @intCast(id & 63)));
-        }
-    };
-}
-
 // ─── Cache configuration (§4.3) ───────────────────────────────────────────────
 
-/// Maximum node-page slots at depths 1–2 (64 L1 nodes + 4096 L2 nodes).
-/// Node pages with IDs in `0..PIN_NODE_CAP` are always kept in RAM.
-pub const PIN_NODE_CAP: u32 = CHILD_COUNT + CHILD_COUNT * CHILD_COUNT; // 4160
-
-pub const DEFAULT_NODE_CACHE_CAP: u32 = 1024;
+pub const DEFAULT_NODE_CACHE_CAP: u32 = 16384;
 pub const DEFAULT_SST_CACHE_CAP: u32 = 4096;
 
 /// Controls the size of the two configurable caches for depths ≥ 3.
@@ -246,24 +139,21 @@ pub const CacheConfig = struct {
 
 // ─── Page heap (§4.3) ─────────────────────────────────────────────────────────
 //
-// Three storage tiers:
+// Two storage tiers:
 //
-//   pin_nodes   — Pool(NodePage) for depths 1–2, always in RAM, IDs 0..PIN_NODE_CAP-1.
-//   node_cache  — LruCache(NodePage) for depths 3–5, configurable size, write-through
+//   node_cache  — LruCache(NodePage) for all depths, configurable size, write-through
 //                 to disk (NodePageStore) when a store_dir is provided.  On a cache
-//                 miss the page is reloaded from disk.
+//                 miss the page is reloaded from disk.  Default capacity (16 384) covers
+//                 all possible depth-1/2 nodes plus a large depth-3/5 working set.
 //   sst_cache   — LruCache(SstPage) for all depths, configurable size.  SST pages are
 //                 not written to disk in this implementation (count field not preserved
 //                 in the on-disk format); the cache acts as a bounded pool and returns
 //                 error.SstCacheFull when capacity is exceeded.
 
 pub const Heap = struct {
-    // Depths 1-2: node pages pinned to RAM (never evicted).
-    pin_nodes: Pool(NodePage),
-
-    // Depths 3-5: node pages in an LRU cache, backed by disk when a store is available.
+    // All depths: node pages in an LRU cache, backed by disk when a store is available.
     node_cache: cache_mod.LruCache(NodePage),
-    // Monotonically-increasing counter; each depth-≥3 node page gets a unique ID ≥ PIN_NODE_CAP.
+    // Monotonically-increasing counter; each node page gets a unique ID.
     next_node_id: NodePageId,
 
     // All depths: SST (KV) pages in a bounded LRU cache.
@@ -280,18 +170,14 @@ pub const Heap = struct {
     heap_stats: HeapStats = .{},
 
     pub fn init(allocator: std.mem.Allocator, config: CacheConfig, store: ?page_store.DiskStore) !Heap {
-        var pin_nodes = try Pool(NodePage).init(allocator, PIN_NODE_CAP);
-        errdefer pin_nodes.deinit(allocator);
-
         var node_cache = try cache_mod.LruCache(NodePage).init(allocator, config.node_cap);
         errdefer node_cache.deinit(allocator);
 
         const sst_cache = try cache_mod.LruCache(SstPage).init(allocator, config.sst_cap);
 
         return .{
-            .pin_nodes = pin_nodes,
             .node_cache = node_cache,
-            .next_node_id = PIN_NODE_CAP,
+            .next_node_id = 0,
             .sst_cache = sst_cache,
             .next_sst_id = 0,
             .node_store = if (store) |s| page_store.NodePageStore.init(s.dir, s.io) else null,
@@ -301,19 +187,13 @@ pub const Heap = struct {
     }
 
     pub fn deinit(self: *Heap) void {
-        self.pin_nodes.deinit(self.allocator);
         self.node_cache.deinit(self.allocator);
         self.sst_cache.deinit(self.allocator);
     }
 
-    /// Write a node page.  Depth ≤ 2 → pinned pool; depth ≥ 3 → LRU cache + disk.
+    /// Write a node page.  Refuse without a disk store if the cache would need to evict.
     pub fn writeNodePage(self: *Heap, depth: u32, page: NodePage) !NodePageId {
-        if (depth <= 2) {
-            const id = self.pin_nodes.alloc() orelse return error.PinnedNodePoolFull;
-            self.pin_nodes.pages[id] = page;
-            return id;
-        }
-        // Depth 3-5: refuse without a disk store if the cache would need to evict.
+        _ = depth;
         if (self.node_cache.len >= self.node_cache.cap and self.node_store == null) {
             return error.NodeCacheFull;
         }
@@ -344,23 +224,12 @@ pub const Heap = struct {
         return id;
     }
 
-    /// Retrieve a node page by ID.  Returns null if the slot is no longer live.
-    /// For depth-≥3 IDs a cache miss triggers a disk load when a store is available.
+    /// Retrieve a node page by ID.  Cache miss triggers a disk load when a store is available.
     pub fn getNodePage(self: *Heap, id: NodePageId) !?NodePage {
-        if (id < PIN_NODE_CAP) {
-            if (!self.pin_nodes.isLive(id)) {
-                if (comptime options.enable_metrics) self.heap_stats.node_cache_misses += 1;
-                return null;
-            }
-            if (comptime options.enable_metrics) self.heap_stats.node_cache_hits += 1;
-            return self.pin_nodes.pages[id];
-        }
-        // LRU cache lookup.
         if (self.node_cache.get(id)) |page| {
             if (comptime options.enable_metrics) self.heap_stats.node_cache_hits += 1;
             return page;
         }
-        // Cache miss: reload from disk.
         if (comptime options.enable_metrics) self.heap_stats.node_cache_misses += 1;
         if (self.node_store) |*store| {
             const page = try store.read(id);
@@ -393,11 +262,7 @@ pub const Heap = struct {
     }
 
     pub fn freeNodePage(self: *Heap, id: NodePageId) void {
-        if (id < PIN_NODE_CAP) {
-            self.pin_nodes.free(id);
-        } else {
-            self.node_cache.remove(id);
-        }
+        self.node_cache.remove(id);
     }
 
     pub fn freeSstPage(self: *Heap, id: PayloadSlotId) void {
@@ -474,26 +339,6 @@ pub const PrefixDB = struct {
         heap.next_node_id = manifest.header.next_node_id;
         heap.next_sst_id  = manifest.header.next_sst_id;
 
-        // Restore pin_nodes bitmap from manifest and reload page data from disk.
-        const used_words = manifest.pin_used.len;
-        if (used_words > 0) {
-            const ns = heap.node_store orelse return error.StoreRequired;
-            _ = ns;
-            // Copy the bitmap into the pool's used[] array.
-            const copy_words = @min(used_words, heap.pin_nodes.used.len);
-            @memcpy(heap.pin_nodes.used[0..copy_words], manifest.pin_used[0..copy_words]);
-            // Reload each live pin_node from disk.
-            for (0..@intCast(heap.pin_nodes.capacity())) |i| {
-                const id: u32 = @intCast(i);
-                if (heap.pin_nodes.isLive(id)) {
-                    const page = try @constCast(&heap.node_store.?).read(id);
-                    heap.pin_nodes.pages[id] = page;
-                    heap.pin_nodes.live_count += 1;
-                }
-            }
-            heap.pin_nodes.rebuildFreeList();
-        }
-
         // Restore routing table.
         var routing = RoutingTable.init(allocator);
         errdefer routing.deinit();
@@ -521,16 +366,6 @@ pub const PrefixDB = struct {
     /// Writes all live pin_nodes to node_store, then writes manifest.bin.
     /// Must be called before process exit to preserve the database.
     pub fn flush(self: *PrefixDB, store: page_store.DiskStore) !void {
-        // Write live pin_nodes (depths 1-2) to node_store.
-        if (self.heap.node_store) |*ns| {
-            for (0..@intCast(self.heap.pin_nodes.capacity())) |i| {
-                const id: u32 = @intCast(i);
-                if (self.heap.pin_nodes.isLive(id)) {
-                    try ns.write(id, &self.heap.pin_nodes.pages[id]);
-                }
-            }
-        }
-
         // Count routing entries.
         var route_count: u32 = 0;
         for (&self.routing.maps) |*m| route_count += @as(u32, @intCast(m.count()));
@@ -543,10 +378,8 @@ pub const PrefixDB = struct {
             .version       = page_store.MANIFEST_VERSION,
             .next_node_id  = self.heap.next_node_id,
             .next_sst_id   = self.heap.next_sst_id,
-            .pin_used_words = @intCast(self.heap.pin_nodes.used.len),
             .routing_count = route_count,
             .l0_count      = l0_count,
-            ._pad          = 0,
         };
 
         // Build routing entries slice.
@@ -566,7 +399,6 @@ pub const PrefixDB = struct {
         try page_store.writeManifest(
             store,
             header,
-            self.heap.pin_nodes.used,
             routes.items,
             self.l0.entries.items,
         );
@@ -1279,21 +1111,6 @@ test "L0Buffer append and prefixCount" {
     try std.testing.expectEqual(@as(usize, 0), l0.prefixCount(1));
 }
 
-test "Pool alloc, write, free, realloc" {
-    var pool = try Pool(SstPage).init(std.testing.allocator, 4);
-    defer pool.deinit(std.testing.allocator);
-    const a = pool.alloc().?;
-    const b = pool.alloc().?;
-    try std.testing.expect(a != b);
-    try std.testing.expect(pool.isLive(a));
-    pool.free(a);
-    try std.testing.expect(!pool.isLive(a));
-    const c = pool.alloc().?;
-    try std.testing.expectEqual(a, c);
-    pool.free(b);
-    pool.free(c);
-}
-
 test "Heap write and retrieve node page" {
     var heap = try Heap.init(std.testing.allocator, .{ .node_cap = 8, .sst_cap = 32 }, null);
     defer heap.deinit();
@@ -1306,7 +1123,7 @@ test "Heap write and retrieve node page" {
     try std.testing.expectEqual(@as(u8, 2), got.sorted_count);
     try std.testing.expectEqual(@as(u8, 1), got.append_count);
     heap.freeNodePage(id);
-    try std.testing.expectEqual(@as(?NodePage, null), try heap.getNodePage(id));
+    try std.testing.expectError(error.NodeNotInCache, heap.getNodePage(id));
 }
 
 // ─── Write / Read operation tests ─────────────────────────────────────────────

@@ -29,7 +29,7 @@ pub const PAGE_SIZE: u32 = 4096;
 pub const DiskStore = struct { dir: Io.Dir, io: Io };
 
 pub const MANIFEST_MAGIC: u32 = 0x01_42_44_50;
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 2;
 
 /// Fixed-size header written at offset 0 of manifest.bin.
 pub const ManifestHeader = extern struct {
@@ -37,7 +37,7 @@ pub const ManifestHeader = extern struct {
     version: u32,
     next_node_id: u32,
     next_sst_id: u32,
-    pin_used_words: u32,
+    _pad2: u32 = 0,
     routing_count: u32,
     l0_count: u32,
     _pad: u32 = 0,
@@ -53,12 +53,10 @@ pub const ManifestRouteEntry = extern struct {
 /// Deserialized manifest data (caller owns the slices).
 pub const ManifestData = struct {
     header: ManifestHeader,
-    pin_used: []u64,
     routes: []ManifestRouteEntry,
     l0: []root.KvEntry,
 
     pub fn deinit(self: *ManifestData, allocator: std.mem.Allocator) void {
-        allocator.free(self.pin_used);
         allocator.free(self.routes);
         allocator.free(self.l0);
     }
@@ -67,7 +65,6 @@ pub const ManifestData = struct {
 pub fn writeManifest(
     store: DiskStore,
     header: ManifestHeader,
-    pin_used: []const u64,
     routes: []const ManifestRouteEntry,
     l0: []const root.KvEntry,
 ) !void {
@@ -76,8 +73,6 @@ pub fn writeManifest(
     var off: u64 = 0;
     try f.writePositionalAll(store.io, std.mem.asBytes(&header), off);
     off += @sizeOf(ManifestHeader);
-    try f.writePositionalAll(store.io, std.mem.sliceAsBytes(pin_used), off);
-    off += pin_used.len * @sizeOf(u64);
     try f.writePositionalAll(store.io, std.mem.sliceAsBytes(routes), off);
     off += routes.len * @sizeOf(ManifestRouteEntry);
     try f.writePositionalAll(store.io, std.mem.sliceAsBytes(l0), off);
@@ -94,14 +89,6 @@ pub fn readManifest(store: DiskStore, allocator: std.mem.Allocator) !ManifestDat
     off += @sizeOf(ManifestHeader);
     if (header.magic != MANIFEST_MAGIC) return error.ManifestBadMagic;
     if (header.version != MANIFEST_VERSION) return error.ManifestVersionMismatch;
-
-    const pin_used = try allocator.alloc(u64, header.pin_used_words);
-    errdefer allocator.free(pin_used);
-    if (pin_used.len > 0) {
-        const pn = try f.readPositionalAll(store.io, std.mem.sliceAsBytes(pin_used), off);
-        if (pn != pin_used.len * @sizeOf(u64)) return error.ManifestTruncated;
-        off += pin_used.len * @sizeOf(u64);
-    }
 
     const routes = try allocator.alloc(ManifestRouteEntry, header.routing_count);
     errdefer allocator.free(routes);
@@ -120,7 +107,6 @@ pub fn readManifest(store: DiskStore, allocator: std.mem.Allocator) !ManifestDat
 
     return .{
         .header = header,
-        .pin_used = pin_used,
         .routes = routes,
         .l0 = l0,
     };

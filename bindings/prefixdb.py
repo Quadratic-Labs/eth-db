@@ -122,7 +122,7 @@ class PrefixDB:
         path:     Directory path for persistent storage. If provided, the database
                   is opened from disk (recovering an existing manifest.bin if present).
                   If None, an in-memory database is created.
-        node_cap: LRU capacity for routing-node pages (default: 1024).
+        node_cap: LRU capacity for routing-node pages (default: 16384).
         sst_cap:  LRU capacity for SST (key-value) pages (default: 4096).
 
     Each node page is ~4 KiB; each SST page is 4 KiB × 64 entries.
@@ -135,7 +135,7 @@ class PrefixDB:
             sc = sst_cap  if sst_cap  is not None else 0
             self._handle = _lib.prefixdb_open(path.encode(), nc, sc)
         elif node_cap is not None or sst_cap is not None:
-            nc = node_cap if node_cap is not None else 1024
+            nc = node_cap if node_cap is not None else 16384
             sc = sst_cap  if sst_cap  is not None else 4096
             self._handle = _lib.prefixdb_init_capacity(nc, sc)
         else:
@@ -190,7 +190,7 @@ class PrefixDB:
             raise RuntimeError(f"compaction failed (rc={rc})")
 
     def flush(self) -> None:
-        """Write manifest + pin_nodes to disk. No-op for in-memory databases."""
+        """Write manifest to disk. No-op for in-memory databases."""
         rc = _lib.prefixdb_flush(self._handle)
         if rc != 0:
             raise RuntimeError(f"flush failed (rc={rc})")
