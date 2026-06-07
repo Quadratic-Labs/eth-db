@@ -283,6 +283,8 @@ pub const PrefixDB = struct {
     routing: RoutingTable,
     heap: Heap,
     compaction_queue: std.ArrayList(NodeCoord),
+    /// Nodes whose SST data changed since the last commitBlock call.
+    dirty_nodes: std.AutoHashMap(NodeCoord, void),
     allocator: std.mem.Allocator,
     stats: DbStats = .{},
 
@@ -307,6 +309,7 @@ pub const PrefixDB = struct {
             .routing = RoutingTable.init(allocator),
             .heap = heap,
             .compaction_queue = std.ArrayList(NodeCoord).empty,
+            .dirty_nodes = std.AutoHashMap(NodeCoord, void).init(allocator),
             .allocator = allocator,
         };
     }
@@ -358,6 +361,7 @@ pub const PrefixDB = struct {
             .routing = routing,
             .heap = heap,
             .compaction_queue = std.ArrayList(NodeCoord).empty,
+            .dirty_nodes = std.AutoHashMap(NodeCoord, void).init(allocator),
             .allocator = allocator,
         };
     }
@@ -409,6 +413,11 @@ pub const PrefixDB = struct {
         self.routing.deinit();
         self.heap.deinit();
         self.compaction_queue.deinit(self.allocator);
+        self.dirty_nodes.deinit();
+    }
+
+    fn markDirty(self: *PrefixDB, depth: u32, prefix: PrefixData) void {
+        self.dirty_nodes.put(.{ .depth = depth, .prefix = prefix }, {}) catch {};
     }
 
     // ─── Write (§5.2) ─────────────────────────────────────────────────────────
@@ -608,6 +617,7 @@ pub const PrefixDB = struct {
         const new_id = try self.heap.writeNodePage(depth, node);
         try self.routing.put(depth, prefix, new_id);
         if (old_id) |id| self.heap.freeNodePage(id);
+        self.markDirty(depth, prefix);
 
         if (node.append_count == A_MAX) {
             self.compaction_queue.append(
@@ -615,6 +625,136 @@ pub const PrefixDB = struct {
                 .{ .depth = depth, .prefix = prefix },
             ) catch {};
         }
+    }
+
+    // ─── Block commitment (§9) ────────────────────────────────────────────────
+
+    /// Flush every remaining L0 entry to L1 regardless of group size.
+    pub fn flushL0All(self: *PrefixDB) !void {
+        var prefixes = std.AutoHashMap(PrefixData, void).init(self.allocator);
+        defer prefixes.deinit();
+        for (self.l0.entries.items) |e| {
+            try prefixes.put(prefixData(&e.key, 1), {});
+        }
+        var list = std.ArrayList(PrefixData).empty;
+        defer list.deinit(self.allocator);
+        var it = prefixes.iterator();
+        while (it.next()) |entry| try list.append(self.allocator, entry.key_ptr.*);
+        for (list.items) |p| try self.flushL0Prefix(p);
+    }
+
+    /// Hash the logical key-value content of a single node (deduplicated, sorted).
+    /// Append zone entries override sorted zone entries for the same key.
+    fn nodeDataHash(self: *PrefixDB, node: NodePage) !Hash {
+        var dedup = std.AutoHashMap(Key, Value).init(self.allocator);
+        defer dedup.deinit();
+        for (0..node.sorted_count) |si| {
+            if (try self.heap.getSstPage(node.sorted_slot_ids[si])) |sst| {
+                const cnt = node.sorted_page_counts[si];
+                for (sst.entries[0..cnt]) |e| try dedup.put(e.key, e.value);
+            }
+        }
+        for (0..node.append_count) |ai| {
+            if (try self.heap.getSstPage(node.append_slot_ids[ai])) |sst| {
+                const cnt = node.append_page_counts[ai];
+                for (sst.entries[0..cnt]) |e| try dedup.put(e.key, e.value);
+            }
+        }
+        if (dedup.count() == 0) return ZERO_HASH;
+        var entries = std.ArrayList(KvEntry).empty;
+        defer entries.deinit(self.allocator);
+        var eit = dedup.iterator();
+        while (eit.next()) |kv| {
+            try entries.append(self.allocator, .{ .key = kv.key_ptr.*, .value = kv.value_ptr.* });
+        }
+        std.mem.sort(KvEntry, entries.items, {}, kvLessThan);
+        var hasher = std.crypto.hash.Blake3.init(.{});
+        for (entries.items) |e| {
+            hasher.update(&e.key);
+            hasher.update(&e.value);
+        }
+        var out: Hash = undefined;
+        hasher.final(&out);
+        return out;
+    }
+
+    /// Compute the Merkle root of a node's commitment by walking up dirty nodes
+    /// deepest-first, propagating each child's hash into its parent's
+    /// child_commitments slot (CoW rewrite), then returning a Merkle root over
+    /// all depth-1 commitments.
+    ///
+    /// Call once per block after all writes are done.  Flushes L0 internally so
+    /// callers do not need a separate flushL0All call.
+    pub fn commitBlock(self: *PrefixDB) !Hash {
+        try self.flushL0All();
+
+        // Seed worklist from dirty set and clear it for future writes.
+        var worklist = std.AutoHashMap(NodeCoord, void).init(self.allocator);
+        defer worklist.deinit();
+        {
+            var it = self.dirty_nodes.iterator();
+            while (it.next()) |entry| try worklist.put(entry.key_ptr.*, {});
+            self.dirty_nodes.clearRetainingCapacity();
+        }
+
+        // Process deepest nodes first so children are committed before parents.
+        var depth: u32 = MAX_DEPTH;
+        while (true) {
+            var at_depth = std.ArrayList(PrefixData).empty;
+            defer at_depth.deinit(self.allocator);
+            {
+                var wit = worklist.iterator();
+                while (wit.next()) |entry| {
+                    if (entry.key_ptr.depth == depth) {
+                        try at_depth.append(self.allocator, entry.key_ptr.prefix);
+                    }
+                }
+            }
+
+            for (at_depth.items) |prefix| {
+                _ = worklist.remove(.{ .depth = depth, .prefix = prefix });
+
+                const node_id = self.routing.get(depth, prefix) orelse continue;
+                const node = (try self.heap.getNodePage(node_id)) orelse continue;
+
+                const data_hash = try self.nodeDataHash(node);
+                const child_root = childMerkleRoot(node.child_commitments);
+                const commitment = merkle.pairHash(&data_hash, &child_root);
+
+                if (depth > 1) {
+                    const parent_depth = depth - 1;
+                    const parent_prefix = prefix >> STRIDE;
+                    const child_idx = prefix & (CHILD_COUNT - 1);
+
+                    if (self.routing.get(parent_depth, parent_prefix)) |parent_id| {
+                        if (try self.heap.getNodePage(parent_id)) |parent_old| {
+                            var parent = parent_old;
+                            parent.child_commitments[child_idx] = commitment;
+                            const new_pid = try self.heap.writeNodePage(parent_depth, parent);
+                            try self.routing.put(parent_depth, parent_prefix, new_pid);
+                            self.heap.freeNodePage(parent_id);
+                            // Ensure the parent is (re)processed to propagate further.
+                            try worklist.put(.{ .depth = parent_depth, .prefix = parent_prefix }, {});
+                        }
+                    }
+                }
+            }
+
+            if (depth == 1) break;
+            depth -= 1;
+        }
+
+        // Build the root commitment: a Merkle tree over the 64 depth-1 slots.
+        var root_children: [CHILD_COUNT]Hash = [_]Hash{ZERO_HASH} ** CHILD_COUNT;
+        for (0..CHILD_COUNT) |p| {
+            const pp: PrefixData = @intCast(p);
+            const node_id = self.routing.get(1, pp) orelse continue;
+            const node = (try self.heap.getNodePage(node_id)) orelse continue;
+            const data_hash = try self.nodeDataHash(node);
+            const child_root = childMerkleRoot(node.child_commitments);
+            root_children[p] = merkle.pairHash(&data_hash, &child_root);
+        }
+        return childMerkleRoot(root_children);
     }
 
     // ─── Compaction (§6) ──────────────────────────────────────────────────────
@@ -748,6 +888,7 @@ pub const PrefixDB = struct {
         self.heap.freeNodePage(node_id);
         for (old_node.sorted_slot_ids[0..old_node.sorted_count]) |id| self.heap.freeSstPage(id);
         for (old_node.append_slot_ids[0..old_node.append_count]) |id| self.heap.freeSstPage(id);
+        self.markDirty(depth, prefix);
 
         if (new_node.sorted_count >= S_MAX)
             self.compaction_queue.append(alloc, .{ .depth = depth, .prefix = prefix }) catch {};
@@ -836,6 +977,7 @@ pub const PrefixDB = struct {
                         const ncid = try self.heap.writeNodePage(child_depth, cn);
                         try self.routing.put(child_depth, cp, ncid);
                         if (cur_id) |id| self.heap.freeNodePage(id);
+                        self.markDirty(child_depth, cp);
                         if (cn.sorted_count >= S_MAX)
                             self.compaction_queue.append(alloc, .{ .depth = child_depth, .prefix = cp }) catch {};
                     } else {
@@ -885,6 +1027,7 @@ pub const PrefixDB = struct {
         try self.routing.put(depth, prefix, new_node_id);
         self.heap.freeNodePage(node_id);
         for (old_node.sorted_slot_ids[0..old_node.sorted_count]) |id| self.heap.freeSstPage(id);
+        self.markDirty(depth, prefix);
     }
 
     /// §6.3: Merge a sparse child node back into its parent's sorted zone.
@@ -958,6 +1101,8 @@ pub const PrefixDB = struct {
         new_parent.sorted_count = @intCast(new_ids.items.len);
         new_parent.append_count = old_parent.append_count;
         new_parent.child_commitments = old_parent.child_commitments;
+        // Child is absorbed: clear its commitment slot so the parent's Merkle path is clean.
+        new_parent.child_commitments[prefix & (CHILD_COUNT - 1)] = ZERO_HASH;
         @memcpy(new_parent.sorted_slot_ids[0..new_ids.items.len], new_ids.items);
         @memcpy(new_parent.sorted_min4[0..new_min4.items.len], new_min4.items);
         @memcpy(new_parent.sorted_page_counts[0..new_counts.items.len], new_counts.items);
@@ -970,6 +1115,7 @@ pub const PrefixDB = struct {
         try self.routing.put(parent_depth, parent_prefix, new_parent_id);
         self.heap.freeNodePage(parent_id);
         for (old_parent.sorted_slot_ids[0..old_parent.sorted_count]) |id| self.heap.freeSstPage(id);
+        self.markDirty(parent_depth, parent_prefix);
 
         _ = self.routing.remove(depth, prefix);
         self.heap.freeNodePage(child_id);
@@ -980,6 +1126,23 @@ pub const PrefixDB = struct {
             self.compaction_queue.append(alloc, .{ .depth = parent_depth, .prefix = parent_prefix }) catch {};
     }
 };
+
+// ─── Commitment helpers ───────────────────────────────────────────────────────
+
+/// Binary Merkle root over exactly CHILD_COUNT (64) hashes.
+/// Six rounds of pairHash reduce 64 leaves to one root.
+pub fn childMerkleRoot(commitments: [CHILD_COUNT]Hash) Hash {
+    var level = commitments;
+    var size: usize = CHILD_COUNT;
+    while (size > 1) {
+        var i: usize = 0;
+        while (i < size / 2) : (i += 1) {
+            level[i] = merkle.pairHash(&level[2 * i], &level[2 * i + 1]);
+        }
+        size /= 2;
+    }
+    return level[0];
+}
 
 // ─── Prefix helpers (§4.2.1, §7.1) ───────────────────────────────────────────
 
@@ -1393,6 +1556,56 @@ test "upwardSplit: promoted depth-2 node triggers split when sorted zone fills" 
     const d3id = db.routing.get(3, 0).?;
     const d3n = (try db.heap.getNodePage(d3id)).?;
     try std.testing.expectEqual(@as(u8, 2), d3n.sorted_count);
+}
+
+test "commitBlock: empty db returns ZERO_HASH root" {
+    var db = try PrefixDB.init(std.testing.allocator);
+    defer db.deinit();
+    const root = try db.commitBlock();
+    try std.testing.expectEqual(ZERO_HASH, root);
+}
+
+test "commitBlock: deterministic — same writes yield same root" {
+    var db1 = try PrefixDB.init(std.testing.allocator);
+    defer db1.deinit();
+    var db2 = try PrefixDB.init(std.testing.allocator);
+    defer db2.deinit();
+
+    for (0..PAGE_ENTRIES) |i| {
+        try db1.write(testKey(@intCast(i)), testVal(@intCast(i)));
+        try db2.write(testKey(@intCast(i)), testVal(@intCast(i)));
+    }
+
+    const r1 = try db1.commitBlock();
+    const r2 = try db2.commitBlock();
+    try std.testing.expectEqual(r1, r2);
+    try std.testing.expect(!std.mem.eql(u8, &r1, &ZERO_HASH));
+}
+
+test "commitBlock: different writes yield different roots" {
+    var db1 = try PrefixDB.init(std.testing.allocator);
+    defer db1.deinit();
+    var db2 = try PrefixDB.init(std.testing.allocator);
+    defer db2.deinit();
+
+    try db1.write(testKey(1), testVal(0xAA));
+    try db2.write(testKey(1), testVal(0xBB));
+
+    const r1 = try db1.commitBlock();
+    const r2 = try db2.commitBlock();
+    try std.testing.expect(!std.mem.eql(u8, &r1, &r2));
+}
+
+test "commitBlock: root stable after second call with no new writes" {
+    var db = try PrefixDB.init(std.testing.allocator);
+    defer db.deinit();
+
+    for (0..PAGE_ENTRIES) |i| {
+        try db.write(testKey(@intCast(i)), testVal(@intCast(i)));
+    }
+    const r1 = try db.commitBlock();
+    const r2 = try db.commitBlock();
+    try std.testing.expectEqual(r1, r2);
 }
 
 test "downwardMerge: sparse child node is absorbed into parent" {
