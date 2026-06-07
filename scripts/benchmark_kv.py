@@ -168,12 +168,8 @@ def derive_key(account: bytes, storage_key: bytes) -> bytes:
 # ---------------------------------------------------------------------------
 
 def compute_state_root(writes: dict[bytes, bytes]) -> bytes:
-    """
-    Produce a 32-byte block state root.
-
-    Hashes sorted (key, value) pairs written in the block, mirroring the
-    leaf-level input to a Merkle commitment scheme.
-    """
+    """Legacy Python-side root (sha256 over sorted block writes).  Not used in
+    the main benchmark path — kept for reference / unit-testing only."""
     h = hashlib.sha256()
     for k in sorted(writes):
         h.update(k)
@@ -236,9 +232,9 @@ def _run_block(
             if result is not None:
                 read_hits += 1
 
-    t_sr0 = time.perf_counter()
-    state_root = compute_state_root(block_writes)
-    state_root_lat = time.perf_counter() - t_sr0
+    # commit_block flushes L0 and recomputes the full Merkle commitment tree.
+    # Latency comes from the Zig-side nanosecond timer stored in commit_block_ns.
+    state_root = db.commit_block()
 
     t_cmp0 = time.perf_counter()
     db.compact()
@@ -246,6 +242,7 @@ def _run_block(
 
     raw_metrics = db.get_metrics()
     db.reset_metrics()
+    commit_ns = raw_metrics.commit_block_ns
 
     n_r = len(read_lats)
     n_w = len(write_lats)
@@ -273,7 +270,7 @@ def _run_block(
         "reads": n_r,
         "writes": n_w,
         "ops": n_r + n_w,
-        "block_duration_ms": round((total_op_time + state_root_lat + compaction_lat) * 1e3, 3),
+        "block_duration_ms": round((total_op_time + commit_ns / 1e9 + compaction_lat) * 1e3, 3),
         "read_throughput_ops_s":  round(n_r / max(sum(read_lats),  1e-12), 1),
         "write_throughput_ops_s": round(n_w / max(sum(write_lats), 1e-12), 1),
         "read_latency":  _latency_stats(read_lats),
@@ -281,7 +278,8 @@ def _run_block(
         "read_hit_rate": round(read_hits / max(n_r, 1), 4),
         "block_unique_writes": len(block_writes),
         "state_root": state_root.hex(),
-        "state_root_latency_us": round(state_root_lat * 1e6, 2),
+        "state_root_latency_us": round(commit_ns / 1e3, 2),
+        "commit_nodes_processed": raw_metrics.commit_nodes_processed,
         "compaction_latency_ms": round(compaction_lat * 1e3, 3),
         # Internal metrics (non-zero only when built with -Denable_metrics=true).
         "metrics": raw_metrics.as_dict(),
@@ -308,6 +306,7 @@ def _print_progress(bm: dict, total_blocks: int, elapsed: float) -> None:
         f"r_p99={bm['read_latency']['p99_us']:.1f}µs  "
         f"w_p99={bm['write_latency']['p99_us']:.1f}µs  "
         f"hit={bm['read_hit_rate']:.1%}  "
+        f"commit={bm['state_root_latency_us']:.0f}µs  "
         f"cmp={bm['compaction_latency_ms']:.1f}ms  "
         f"elapsed={elapsed:.1f}s  eta={eta:.1f}s",
         file=sys.stderr,
@@ -425,10 +424,12 @@ def run_benchmark(
             "total_compaction_sst_writes": total_cmp_writes,
             "total_l0_flushes":            _sum_metric("l0_flushes"),
             "total_compaction_ops":        _sum_metric("compaction_ops"),
-            "total_disk_node_reads":       total_disk_node_reads,
-            "total_disk_node_writes":      total_disk_node_writes,
-            "total_disk_sst_reads":        total_disk_sst_reads,
-            "total_disk_sst_writes":       total_disk_sst_writes,
+            "total_disk_node_reads":         total_disk_node_reads,
+            "total_disk_node_writes":        total_disk_node_writes,
+            "total_disk_sst_reads":          total_disk_sst_reads,
+            "total_disk_sst_writes":         total_disk_sst_writes,
+            "total_commit_nodes_processed":  _sum_metric("commit_nodes_processed"),
+            "total_commit_block_ns":         _sum_metric("commit_block_ns"),
         },
     }
 
@@ -533,6 +534,9 @@ def main() -> None:
         f"w_lat={s['weighted_mean_write_latency_us']:.1f}µs\n"
         f"  write_amp={s['write_amplification']}  space_amp={s['space_amplification']}  "
         f"cmp_frac={s['compaction_fraction']:.1%}\n"
+        f"  commit_total={i['total_commit_block_ns']/1e6:.1f}ms  "
+        f"commit_nodes={i['total_commit_nodes_processed']}  "
+        f"state_root_total={s['state_root_total_us']/1e3:.1f}ms\n"
         f"  [internal] read_amp={i['read_amp']}  write_amp={i['write_amp']}  "
         f"sst_hit={i['sst_cache_hit_rate']:.1%}  filter_sel={i['filter_selectivity']:.1%}",
         file=sys.stderr,

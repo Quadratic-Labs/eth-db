@@ -92,15 +92,21 @@ class Metrics(ctypes.Structure):
         ("compaction_ops",        ctypes.c_uint64),
         ("compaction_sst_reads",  ctypes.c_uint64),
         ("compaction_sst_writes", ctypes.c_uint64),
-        ("disk_node_reads",       ctypes.c_uint64),
-        ("disk_node_writes",      ctypes.c_uint64),
-        ("disk_sst_reads",        ctypes.c_uint64),
-        ("disk_sst_writes",       ctypes.c_uint64),
+        ("disk_node_reads",         ctypes.c_uint64),
+        ("disk_node_writes",        ctypes.c_uint64),
+        ("disk_sst_reads",          ctypes.c_uint64),
+        ("disk_sst_writes",         ctypes.c_uint64),
+        ("commit_block_calls",      ctypes.c_uint64),
+        ("commit_nodes_processed",  ctypes.c_uint64),
+        ("commit_block_ns",         ctypes.c_uint64),
     ]
 
     def as_dict(self) -> dict:
         return {name: getattr(self, name) for name, _ in self._fields_}
 
+
+_lib.prefixdb_commit_block.restype = ctypes.c_int
+_lib.prefixdb_commit_block.argtypes = [ctypes.c_void_p, _Buf32]
 
 _lib.prefixdb_get_metrics.restype = ctypes.c_int
 _lib.prefixdb_get_metrics.argtypes = [ctypes.c_void_p, ctypes.POINTER(Metrics)]
@@ -188,6 +194,15 @@ class PrefixDB:
         rc = _lib.prefixdb_compact(self._handle)
         if rc != 0:
             raise RuntimeError(f"compaction failed (rc={rc})")
+
+    def commit_block(self) -> bytes:
+        """Flush L0, recompute child_commitments for all dirty nodes, return the
+        32-byte Merkle root hash for the current state."""
+        hash_out = _Buf32()
+        rc = _lib.prefixdb_commit_block(self._handle, hash_out)
+        if rc != 0:
+            raise RuntimeError(f"commit_block failed (rc={rc})")
+        return bytes(hash_out)
 
     def flush(self) -> None:
         """Write manifest to disk. No-op for in-memory databases."""

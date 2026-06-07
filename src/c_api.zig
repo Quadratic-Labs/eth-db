@@ -127,6 +127,14 @@ export fn prefixdb_compact(state: *State) i32 {
     return 0;
 }
 
+/// Flush L0, update child_commitments along all dirty paths, and write the
+/// 32-byte Merkle root into hash_out.  Returns 0 on success, -1 on error.
+export fn prefixdb_commit_block(state: *State, hash_out: *[32]u8) i32 {
+    const h = state.db.commitBlock() catch return -1;
+    hash_out.* = h;
+    return 0;
+}
+
 // ─── Metrics ──────────────────────────────────────────────────────────────────
 
 /// C-compatible metrics snapshot.  Fields are always present; all are zero
@@ -152,6 +160,9 @@ pub const PrefixDBMetrics = extern struct {
     disk_node_writes: u64,
     disk_sst_reads: u64,
     disk_sst_writes: u64,
+    commit_block_calls: u64,
+    commit_nodes_processed: u64,
+    commit_block_ns: u64,
 };
 
 /// Fill *out with a snapshot of all internal counters.
@@ -177,10 +188,13 @@ export fn prefixdb_get_metrics(state: *State, out: *PrefixDBMetrics) i32 {
             .compaction_ops       = s.compaction_ops,
             .compaction_sst_reads = s.compaction_sst_reads,
             .compaction_sst_writes = s.compaction_sst_writes,
-            .disk_node_reads      = h.disk_node_reads,
-            .disk_node_writes     = h.disk_node_writes,
-            .disk_sst_reads       = h.disk_sst_reads,
-            .disk_sst_writes      = h.disk_sst_writes,
+            .disk_node_reads        = h.disk_node_reads,
+            .disk_node_writes       = h.disk_node_writes,
+            .disk_sst_reads         = h.disk_sst_reads,
+            .disk_sst_writes        = h.disk_sst_writes,
+            .commit_block_calls     = s.commit_block_calls,
+            .commit_nodes_processed = s.commit_nodes_processed,
+            .commit_block_ns        = s.commit_block_ns,
         };
     } else {
         out.* = std.mem.zeroes(PrefixDBMetrics);
