@@ -53,6 +53,11 @@ pub const DbStats = if (options.enable_metrics) struct {
     compaction_ops: u64 = 0,
     compaction_sst_reads: u64 = 0,
     compaction_sst_writes: u64 = 0,
+    commit_block_calls: u64 = 0,
+    /// Total dirty nodes processed across all commitBlock calls.
+    commit_nodes_processed: u64 = 0,
+    /// Cumulative wall-clock nanoseconds spent inside commitBlock.
+    commit_block_ns: u64 = 0,
 } else struct {};
 
 /// Cache hit/miss counters held by Heap.
@@ -686,6 +691,9 @@ pub const PrefixDB = struct {
     /// Call once per block after all writes are done.  Flushes L0 internally so
     /// callers do not need a separate flushL0All call.
     pub fn commitBlock(self: *PrefixDB) !Hash {
+        if (comptime options.enable_metrics) self.stats.commit_block_calls += 1;
+        const t0 = if (comptime options.enable_metrics) std.time.nanoTimestamp() else {};
+
         try self.flushL0All();
 
         // Seed worklist from dirty set and clear it for future writes.
@@ -713,6 +721,7 @@ pub const PrefixDB = struct {
 
             for (at_depth.items) |prefix| {
                 _ = worklist.remove(.{ .depth = depth, .prefix = prefix });
+                if (comptime options.enable_metrics) self.stats.commit_nodes_processed += 1;
 
                 const node_id = self.routing.get(depth, prefix) orelse continue;
                 const node = (try self.heap.getNodePage(node_id)) orelse continue;
@@ -754,7 +763,12 @@ pub const PrefixDB = struct {
             const child_root = childMerkleRoot(node.child_commitments);
             root_children[p] = merkle.pairHash(&data_hash, &child_root);
         }
-        return childMerkleRoot(root_children);
+        const root = childMerkleRoot(root_children);
+        if (comptime options.enable_metrics) {
+            const elapsed: u64 = @intCast(std.time.nanoTimestamp() - t0);
+            self.stats.commit_block_ns += elapsed;
+        }
+        return root;
     }
 
     // ─── Compaction (§6) ──────────────────────────────────────────────────────
