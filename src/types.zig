@@ -14,8 +14,8 @@ pub const ZERO_HASH = merkle.ZERO_HASH;
 pub const STRIDE: u32 = 6;
 pub const PAGE_ENTRIES: u32 = 64;
 pub const CHILD_COUNT: u32 = 64;
-pub const S_MAX: u32 = 108; // sorted zone capacity per node
-pub const A_MAX: u32 = 8; // append zone capacity per node
+pub const S_MAX: u32 = 104; // sorted zone capacity per node
+pub const A_MAX: u32 = 12; // append zone capacity per node
 pub const MERGE_THRESHOLD: u32 = 16;
 pub const T_OPP: u32 = 2;
 
@@ -44,27 +44,57 @@ pub const SstPage = struct {
     count: u8,
 };
 
-// ─── Node page (§4.2.2) ───────────────────────────────────────────────────────
+// ─── Node (index) page — commitments decoupled ────────────────────────────────
 //
 // On-disk: exactly 4096 bytes (one physical page).
 //   4 B    header (sorted_count u8, append_count u8, _pad[2])
-//   2048 B child_commitments[64]
-//   432 B  sorted_slot_ids[108]        (u32 each)
-//   432 B  sorted_min4[108]            (u32 boundary prefix per sorted page, §7.1)
-//   108 B  sorted_page_counts[108]     (u8 entry count per sorted page, 1..64)
-//   8 B    append_page_counts[8]       (u8 entry count per append page, 1..64)
-//   32 B   append_slot_ids[8]          (u32 each)
-//   1024 B append_prefix16[8][64]      (u16 per key, per append page, §7.1)
-//   8 B    _reserved
+//   416 B  sorted_slot_ids[104]        (u32 each)
+//   416 B  sorted_min4[104]            (u32 boundary prefix per sorted page, §7.1)
+//   104 B  sorted_page_counts[104]     (u8 entry count per sorted page, 1..64)
+//   12 B   append_page_counts[12]      (u8 entry count per append page, 1..64)
+//   48 B   append_slot_ids[12]         (u32 each)
+//   3072 B append_prefix32[12][64]     (u32 per key, per append page, §7.1)
+//   24 B   _reserved
 
 pub const NodePage = struct {
     sorted_count: u8,
     append_count: u8,
-    child_commitments: [CHILD_COUNT]Hash,
     sorted_slot_ids: [S_MAX]PayloadSlotId,
     sorted_min4: [S_MAX]u32,
     sorted_page_counts: [S_MAX]u8,
     append_page_counts: [A_MAX]u8,
     append_slot_ids: [A_MAX]PayloadSlotId,
-    append_prefix16: [A_MAX][PAGE_ENTRIES]u16,
+    append_prefix32: [A_MAX][PAGE_ENTRIES]u32,
+};
+
+// ─── Commitment page (docs/commitment_redesign.md §3.1) ───────────────────────
+//
+// The complete 6-level binary subtree of one (depth, prefix) node, stored as an
+// implicit heap: h[1] is the node's own subtree commitment, h[2i]/h[2i+1] are
+// the children of h[i], and h[64..127] are the 64 child-slot values at depth+1.
+// All values follow the canonical pass-through `combine` rule (§2), so stored
+// internals are canonical trie values usable directly in Merkle proofs.
+//
+// On-disk: exactly 4096 bytes.
+//   4 B    header (version u8, flags u8, _pad[2])
+//   8 B    leaf_valid (u64 LE) — lazy-leaf validity bitmap
+//   20 B   _reserved
+//   4064 B h[1..127] (127 × 32 B)
+
+pub const CommitmentPageId = u32;
+/// Sentinel for "no persisted commitment page" in routing/manifest entries.
+pub const CMT_NONE: CommitmentPageId = std.math.maxInt(u32);
+
+pub const CommitmentPage = struct {
+    /// Bit c set ⇔ h[64+c] holds the canonical value of child slot c.
+    /// Invalid leaves are filled lazily (gather or child h[1]) before any
+    /// internal value of this page is used.
+    leaf_valid: u64,
+    /// Implicit heap; h[0] is unused padding.
+    h: [128]Hash,
+
+    pub const EMPTY = CommitmentPage{
+        .leaf_valid = 0,
+        .h = [_]Hash{ZERO_HASH} ** 128,
+    };
 };

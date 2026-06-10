@@ -39,6 +39,33 @@ pub fn hash64(input: [64]u8) Hash {
     return out;
 }
 
+// ─── Canonical sparse-trie rules (docs/commitment_redesign.md §2) ──────────────
+
+/// Leaf commitment of one key-value pair.  The 65-byte input (vs combine's 64)
+/// provides domain separation; including the full key binds the leaf to its
+/// trie position under the pass-through collapse.
+pub fn leafHash(key: *const [32]u8, value: *const [32]u8) Hash {
+    var buf: [65]u8 = undefined;
+    buf[0] = 0x00;
+    @memcpy(buf[1..33], key);
+    @memcpy(buf[33..65], value);
+    var out: Hash = undefined;
+    std.crypto.hash.Blake3.hash(&buf, &out, .{});
+    return out;
+}
+
+/// Canonical binary-trie node rule with pass-through collapse:
+/// empty subtrees are ZERO at every level, and a subtree containing a single
+/// key carries its leafHash unchanged up to the first non-empty sibling.
+pub fn combine(left: *const Hash, right: *const Hash) Hash {
+    const l_zero = std.mem.eql(u8, left, &ZERO_HASH);
+    const r_zero = std.mem.eql(u8, right, &ZERO_HASH);
+    if (l_zero and r_zero) return ZERO_HASH;
+    if (r_zero) return left.*;
+    if (l_zero) return right.*;
+    return pairHash(left, right);
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 test "ZERO_HASH sentinel" {

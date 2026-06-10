@@ -30,12 +30,16 @@ pub const MERGE_THRESHOLD = t.MERGE_THRESHOLD;
 pub const T_OPP = t.T_OPP;
 pub const Key = t.Key;
 pub const Value = t.Value;
+pub const TOMBSTONE = t.TOMBSTONE;
 pub const KvEntry = t.KvEntry;
 pub const NodePageId = t.NodePageId;
 pub const PayloadSlotId = t.PayloadSlotId;
 pub const PrefixData = t.PrefixData;
 pub const SstPage = t.SstPage;
 pub const NodePage = t.NodePage;
+pub const CommitmentPage = t.CommitmentPage;
+pub const CommitmentPageId = t.CommitmentPageId;
+pub const CMT_NONE = t.CMT_NONE;
 
 // ─── Optional instrumentation structs ─────────────────────────────────────────
 //
@@ -174,6 +178,8 @@ pub const Heap = struct {
     node_store: ?page_store.NodePageStore,
     // sst_store reserved for a future release when the on-disk format includes count.
     sst_store: ?page_store.SstPageStore,
+    // Disk store for commitment pages (CoW flush + lazy reload of deep pages).
+    cmt_store: ?page_store.CommitmentPageStore,
 
     allocator: std.mem.Allocator,
     heap_stats: HeapStats = .{},
@@ -191,6 +197,7 @@ pub const Heap = struct {
             .next_sst_id = 0,
             .node_store = if (store) |s| page_store.NodePageStore.init(s.dir, s.io) else null,
             .sst_store = if (store) |s| page_store.SstPageStore.init(s.dir, s.io) else null,
+            .cmt_store = if (store) |s| page_store.CommitmentPageStore.init(s.dir, s.io) else null,
             .allocator = allocator,
         };
     }
@@ -287,13 +294,6 @@ pub const PrefixDB = struct {
     routing: RoutingTable,
     heap: Heap,
     compaction_queue: std.ArrayList(NodeCoord),
-    /// Commitment-dirty bitmaps: set when SST data changes; cleared by commitBlock.
-    d1_dirty: u64,
-    d2_dirty: [64]u64,
-    deep_dirty: std.AutoHashMap(NodeCoord, void),
-    /// Commitment-dirty bitmaps for d3 (same role as d1_dirty/d2_dirty).
-    /// Heap-allocated (len = 4096) to keep PrefixDB small by value.
-    d3_dirty: []u64,
     /// Flush-dirty bitmaps: set on every write; cleared when the node is written to disk.
     d1_dirty_flush: u64,
     d2_dirty_flush: [64]u64,
@@ -302,6 +302,43 @@ pub const PrefixDB = struct {
     d1_node_ids: [64]?NodePageId,
     d2_node_ids: []?NodePageId,   // len = 4096, heap-allocated
     d3_node_ids: []?NodePageId,   // len = 262144, heap-allocated
+    /// Block number of the last modification per d1/d2/d3 node, used to
+    /// age-gate the amortised write-back (only cold dirty nodes are flushed).
+    d1_last_write: [64]u32 = [_]u32{0} ** 64,
+    d2_last_write: []u32,   // len = 4096, heap-allocated
+    d3_last_write: []u32,   // len = 262144, heap-allocated
+
+    // ─── Commitment tree (docs/commitment_redesign.md) ───────────────────────
+    //
+    // Canonical sparse binary trie over the key-value mapping, cached at 6-bit
+    // strides in CommitmentPages.  Fully decoupled from the storage tree:
+    // compaction never touches these, and values are invariant under data
+    // movement between node buffers.
+
+    /// Depth-0 page: 64 depth-1 commitments as leaves, state root at h[1].
+    /// Memory-only; rebuilt from depth-1 pages (or gathers) after open.
+    cmt_d0: CommitmentPage,
+    cmt_d1: []CommitmentPage,     // len = 64, heap-allocated; valid iff exists bit
+    cmt_d1_exists: u64,
+    cmt_d2: []CommitmentPage,     // len = 4096, heap-allocated
+    cmt_d2_exists: []u64,         // len = 64
+    /// Depth ≥ 3 commitment pages, created/loaded lazily.
+    cmt_deep: std.AutoHashMap(NodeCoord, *CommitmentPage),
+    /// Last persisted id per deep page (lazy reload + manifest routing).
+    cmt_deep_ids: std.AutoHashMap(NodeCoord, CommitmentPageId),
+    /// Deep pages with unflushed changes.
+    cmt_deep_flush: std.AutoHashMap(NodeCoord, void),
+    /// Flush-dirty bitmaps + ages + persisted ids for d1/d2 commitment pages.
+    cmt_d1_flush: u64,
+    cmt_d2_flush: []u64,          // len = 64
+    cmt_d1_ids: [64]?CommitmentPageId,
+    cmt_d2_ids: []?CommitmentPageId,   // len = 4096
+    cmt_d1_last: [64]u32 = [_]u32{0} ** 64,
+    cmt_d2_last: []u32,           // len = 4096
+    next_cmt_id: CommitmentPageId = 0,
+    /// Keys written (incl. tombstones) since the last commitBlock; the sole
+    /// source of commitment dirtiness (write-stream derived, §4.1).
+    block_keys: std.ArrayList(Key),
     /// Deepest depth at which any node currently exists. Always ≥ 2 (d1/d2 always present).
     max_depth_used: u32 = 2,
     /// Disk store for self-flushing; null for in-memory-only databases.
@@ -341,12 +378,32 @@ pub const PrefixDB = struct {
         const d3_node_ids = try allocator.alloc(?NodePageId, 262144);
         errdefer allocator.free(d3_node_ids);
         @memset(d3_node_ids, null);
-        const d3_dirty = try allocator.alloc(u64, 4096);
-        errdefer allocator.free(d3_dirty);
-        @memset(d3_dirty, 0);
         const d3_dirty_flush = try allocator.alloc(u64, 4096);
         errdefer allocator.free(d3_dirty_flush);
         @memset(d3_dirty_flush, 0);
+        const d2_last_write = try allocator.alloc(u32, 4096);
+        errdefer allocator.free(d2_last_write);
+        @memset(d2_last_write, 0);
+        const d3_last_write = try allocator.alloc(u32, 262144);
+        errdefer allocator.free(d3_last_write);
+        @memset(d3_last_write, 0);
+        // Commitment-tree storage (pages accessed only when their exists bit is set).
+        const cmt_d1 = try allocator.alloc(CommitmentPage, 64);
+        errdefer allocator.free(cmt_d1);
+        const cmt_d2 = try allocator.alloc(CommitmentPage, 4096);
+        errdefer allocator.free(cmt_d2);
+        const cmt_d2_exists = try allocator.alloc(u64, 64);
+        errdefer allocator.free(cmt_d2_exists);
+        @memset(cmt_d2_exists, 0);
+        const cmt_d2_flush = try allocator.alloc(u64, 64);
+        errdefer allocator.free(cmt_d2_flush);
+        @memset(cmt_d2_flush, 0);
+        const cmt_d2_ids = try allocator.alloc(?CommitmentPageId, 4096);
+        errdefer allocator.free(cmt_d2_ids);
+        @memset(cmt_d2_ids, null);
+        const cmt_d2_last = try allocator.alloc(u32, 4096);
+        errdefer allocator.free(cmt_d2_last);
+        @memset(cmt_d2_last, 0);
         var routing = RoutingTable.init(allocator);
         errdefer routing.deinit();
         return .{
@@ -355,16 +412,28 @@ pub const PrefixDB = struct {
             .routing = routing,
             .heap = heap,
             .compaction_queue = std.ArrayList(NodeCoord).empty,
-            .d1_dirty = 0,
-            .d2_dirty = [_]u64{0} ** 64,
-            .d3_dirty = d3_dirty,
-            .deep_dirty = std.AutoHashMap(NodeCoord, void).init(allocator),
             .d1_dirty_flush = 0,
             .d2_dirty_flush = [_]u64{0} ** 64,
             .d3_dirty_flush = d3_dirty_flush,
             .d1_node_ids = [_]?NodePageId{null} ** 64,
             .d2_node_ids = d2_node_ids,
             .d3_node_ids = d3_node_ids,
+            .d2_last_write = d2_last_write,
+            .d3_last_write = d3_last_write,
+            .cmt_d0 = CommitmentPage.EMPTY,
+            .cmt_d1 = cmt_d1,
+            .cmt_d1_exists = 0,
+            .cmt_d2 = cmt_d2,
+            .cmt_d2_exists = cmt_d2_exists,
+            .cmt_deep = std.AutoHashMap(NodeCoord, *CommitmentPage).init(allocator),
+            .cmt_deep_ids = std.AutoHashMap(NodeCoord, CommitmentPageId).init(allocator),
+            .cmt_deep_flush = std.AutoHashMap(NodeCoord, void).init(allocator),
+            .cmt_d1_flush = 0,
+            .cmt_d2_flush = cmt_d2_flush,
+            .cmt_d1_ids = [_]?CommitmentPageId{null} ** 64,
+            .cmt_d2_ids = cmt_d2_ids,
+            .cmt_d2_last = cmt_d2_last,
+            .block_keys = .empty,
             .kv_map = kv_map_mod.KvMap.init(allocator),
             .allocator = allocator,
             // WAL and store are attached by openWithConfig for disk-backed databases.
@@ -419,12 +488,35 @@ pub const PrefixDB = struct {
         const d3_node_ids = try allocator.alloc(?NodePageId, 262144);
         errdefer allocator.free(d3_node_ids);
         @memset(d3_node_ids, null);
-        const d3_dirty = try allocator.alloc(u64, 4096);
-        errdefer allocator.free(d3_dirty);
-        @memset(d3_dirty, 0);
         const d3_dirty_flush = try allocator.alloc(u64, 4096);
         errdefer allocator.free(d3_dirty_flush);
         @memset(d3_dirty_flush, 0);
+        const d2_last_write = try allocator.alloc(u32, 4096);
+        errdefer allocator.free(d2_last_write);
+        @memset(d2_last_write, 0);
+        const d3_last_write = try allocator.alloc(u32, 262144);
+        errdefer allocator.free(d3_last_write);
+        @memset(d3_last_write, 0);
+        const cmt_d1 = try allocator.alloc(CommitmentPage, 64);
+        errdefer allocator.free(cmt_d1);
+        const cmt_d2 = try allocator.alloc(CommitmentPage, 4096);
+        errdefer allocator.free(cmt_d2);
+        const cmt_d2_exists = try allocator.alloc(u64, 64);
+        errdefer allocator.free(cmt_d2_exists);
+        @memset(cmt_d2_exists, 0);
+        const cmt_d2_flush = try allocator.alloc(u64, 64);
+        errdefer allocator.free(cmt_d2_flush);
+        @memset(cmt_d2_flush, 0);
+        const cmt_d2_ids = try allocator.alloc(?CommitmentPageId, 4096);
+        errdefer allocator.free(cmt_d2_ids);
+        @memset(cmt_d2_ids, null);
+        const cmt_d2_last = try allocator.alloc(u32, 4096);
+        errdefer allocator.free(cmt_d2_last);
+        @memset(cmt_d2_last, 0);
+        var cmt_d1_exists: u64 = 0;
+        var cmt_d1_ids = [_]?CommitmentPageId{null} ** 64;
+        var cmt_deep_ids = std.AutoHashMap(NodeCoord, CommitmentPageId).init(allocator);
+        errdefer cmt_deep_ids.deinit();
         var d1_node_ids = [_]?NodePageId{null} ** 64;
         var max_depth_used: u32 = 2;
         for (manifest.routes) |r| {
@@ -433,16 +525,30 @@ pub const PrefixDB = struct {
                 arena.put(r.depth, r.prefix, page);
                 if (r.depth == 1) {
                     d1_node_ids[@intCast(r.prefix)] = r.node_id;
+                    if (r.cmt_page_id != CMT_NONE) {
+                        cmt_d1[@intCast(r.prefix)] = try heap.cmt_store.?.read(r.cmt_page_id);
+                        cmt_d1_exists |= @as(u64, 1) << @as(u6, @intCast(r.prefix));
+                        cmt_d1_ids[@intCast(r.prefix)] = r.cmt_page_id;
+                    }
                 } else {
                     d2_node_ids[@intCast(r.prefix)] = r.node_id;
+                    if (r.cmt_page_id != CMT_NONE) {
+                        cmt_d2[@intCast(r.prefix)] = try heap.cmt_store.?.read(r.cmt_page_id);
+                        cmt_d2_exists[@intCast(r.prefix >> 6)] |= @as(u64, 1) << @as(u6, @intCast(r.prefix & 63));
+                        cmt_d2_ids[@intCast(r.prefix)] = r.cmt_page_id;
+                    }
                 }
             } else if (r.depth == 3) {
                 const page = try heap.node_store.?.read(r.node_id);
                 arena.put(3, r.prefix, page);
                 d3_node_ids[@intCast(r.prefix)] = r.node_id;
+                if (r.cmt_page_id != CMT_NONE)
+                    try cmt_deep_ids.put(.{ .depth = 3, .prefix = r.prefix }, r.cmt_page_id);
                 if (max_depth_used < 3) max_depth_used = 3;
             } else {
                 try routing.put(r.depth, r.prefix, r.node_id);
+                if (r.cmt_page_id != CMT_NONE)
+                    try cmt_deep_ids.put(.{ .depth = r.depth, .prefix = r.prefix }, r.cmt_page_id);
                 if (r.depth > max_depth_used) max_depth_used = r.depth;
             }
         }
@@ -460,16 +566,29 @@ pub const PrefixDB = struct {
             .routing = routing,
             .heap = heap,
             .compaction_queue = std.ArrayList(NodeCoord).empty,
-            .d1_dirty = 0,
-            .d2_dirty = [_]u64{0} ** 64,
-            .d3_dirty = d3_dirty,
-            .deep_dirty = std.AutoHashMap(NodeCoord, void).init(allocator),
             .d1_dirty_flush = 0,
             .d2_dirty_flush = [_]u64{0} ** 64,
             .d3_dirty_flush = d3_dirty_flush,
             .d1_node_ids = d1_node_ids,
             .d2_node_ids = d2_node_ids,
             .d3_node_ids = d3_node_ids,
+            .d2_last_write = d2_last_write,
+            .d3_last_write = d3_last_write,
+            .cmt_d0 = CommitmentPage.EMPTY,
+            .cmt_d1 = cmt_d1,
+            .cmt_d1_exists = cmt_d1_exists,
+            .cmt_d2 = cmt_d2,
+            .cmt_d2_exists = cmt_d2_exists,
+            .cmt_deep = std.AutoHashMap(NodeCoord, *CommitmentPage).init(allocator),
+            .cmt_deep_ids = cmt_deep_ids,
+            .cmt_deep_flush = std.AutoHashMap(NodeCoord, void).init(allocator),
+            .cmt_d1_flush = 0,
+            .cmt_d2_flush = cmt_d2_flush,
+            .cmt_d1_ids = cmt_d1_ids,
+            .cmt_d2_ids = cmt_d2_ids,
+            .cmt_d2_last = cmt_d2_last,
+            .next_cmt_id = manifest.header.next_cmt_id,
+            .block_keys = .empty,
             .max_depth_used = max_depth_used,
             .kv_map = kv_map_mod.KvMap.init(allocator),
             .allocator = allocator,
@@ -541,63 +660,130 @@ pub const PrefixDB = struct {
         return replayed;
     }
 
-    /// Nodes flushed per commitBlock call to amortise the 64-block flush spike.
+    /// Nodes flushed per commitBlock call to amortise the FLUSH_INTERVAL spike.
     /// At most 64 + 4096 + 262144 = 266304 arena nodes can be dirty over 64 blocks;
     /// 4224 per block gives 2× headroom (4224 × 64 = 270336).
     const NODE_FLUSH_BUDGET: u32 = 4_224;
+    /// Minimum age (blocks since last modification) before the amortised
+    /// write-back persists a dirty node.  Hot pages keep their dirty bit and
+    /// stay in memory until they cool down or the FLUSH_INTERVAL checkpoint.
+    const NODE_FLUSH_MIN_AGE: u32 = 8;
 
-    /// Write at most `budget` dirty arena nodes to disk, d1 first, then d2, then d3.
-    /// Updates *_node_ids and clears the corresponding *_dirty_flush bits as it goes.
-    /// A no-op when no disk store is attached.
-    fn flushDirtyNodes(self: *PrefixDB, budget: u32) !void {
+    /// Write at most `budget` dirty arena nodes that have not been modified in
+    /// the last `min_age` blocks, d1 first, then d2, then d3.  Updates
+    /// *_node_ids and clears the flushed *_dirty_flush bits; younger nodes keep
+    /// their bits for a later pass.  A no-op when no disk store is attached.
+    fn flushDirtyNodes(self: *PrefixDB, budget: u32, min_age: u32) !void {
         const ns = if (self.heap.node_store) |*s| s else return;
         var rem = budget;
 
         // d1 (up to 64 nodes)
-        var w1 = self.d1_dirty_flush;
-        while (w1 != 0 and rem > 0) : (rem -= 1) {
-            const bit: u32 = @ctz(w1);
-            const new_id = self.heap.next_node_id;
-            self.heap.next_node_id += 1;
-            try ns.write(new_id, &self.arena.d1_pages[bit]);
-            if (comptime options.enable_metrics) self.heap.heap_stats.disk_node_writes += 1;
-            self.d1_node_ids[bit] = new_id;
-            w1 &= w1 - 1;
+        {
+            var w = self.d1_dirty_flush;
+            while (w != 0 and rem > 0) : (w &= w - 1) {
+                const bit: u32 = @ctz(w);
+                if (self.current_block_num -% self.d1_last_write[bit] < min_age) continue;
+                const new_id = self.heap.next_node_id;
+                self.heap.next_node_id += 1;
+                try ns.write(new_id, &self.arena.d1_pages[bit]);
+                if (comptime options.enable_metrics) self.heap.heap_stats.disk_node_writes += 1;
+                self.d1_node_ids[bit] = new_id;
+                self.d1_dirty_flush &= ~(@as(u64, 1) << @as(u6, @intCast(bit)));
+                rem -= 1;
+            }
         }
-        self.d1_dirty_flush = w1;
 
         // d2 (up to 4096 nodes)
         for (&self.d2_dirty_flush, 0..) |*word, wi| {
+            if (rem == 0) return;
             var w = word.*;
-            while (w != 0 and rem > 0) : (rem -= 1) {
+            while (w != 0 and rem > 0) : (w &= w - 1) {
                 const bit: u32 = @ctz(w);
                 const prefix: u32 = @intCast(wi * 64 + bit);
+                if (self.current_block_num -% self.d2_last_write[prefix] < min_age) continue;
                 const new_id = self.heap.next_node_id;
                 self.heap.next_node_id += 1;
                 try ns.write(new_id, &self.arena.d2_pages[prefix]);
                 if (comptime options.enable_metrics) self.heap.heap_stats.disk_node_writes += 1;
                 self.d2_node_ids[prefix] = new_id;
-                w &= w - 1;
+                word.* &= ~(@as(u64, 1) << @as(u6, @intCast(bit)));
+                rem -= 1;
             }
-            word.* = w;
-            if (rem == 0) return;
         }
 
         // d3 (up to 262144 nodes)
         for (self.d3_dirty_flush, 0..) |*word, wi| {
+            if (rem == 0) return;
             var w = word.*;
-            while (w != 0 and rem > 0) : (rem -= 1) {
+            while (w != 0 and rem > 0) : (w &= w - 1) {
                 const bit: u32 = @ctz(w);
                 const prefix: u32 = @intCast(wi * 64 + bit);
+                if (self.current_block_num -% self.d3_last_write[prefix] < min_age) continue;
                 const new_id = self.heap.next_node_id;
                 self.heap.next_node_id += 1;
                 try ns.write(new_id, &self.arena.d3_pages[prefix]);
                 if (comptime options.enable_metrics) self.heap.heap_stats.disk_node_writes += 1;
                 self.d3_node_ids[prefix] = new_id;
-                w &= w - 1;
+                word.* &= ~(@as(u64, 1) << @as(u6, @intCast(bit)));
+                rem -= 1;
             }
-            word.* = w;
+        }
+    }
+
+    /// Write at most `budget` dirty commitment pages older than `min_age`
+    /// blocks to disk, always copy-on-write under fresh page ids (the manifest
+    /// checkpoint repoints routing).  Deep pages (depth ≥ 3) are drained only
+    /// on a full flush (min_age == 0).  A no-op without a disk store.
+    fn flushDirtyCmt(self: *PrefixDB, budget: u32, min_age: u32) !void {
+        const cs = if (self.heap.cmt_store) |*s| s else return;
+        var rem = budget;
+
+        {
+            var w = self.cmt_d1_flush;
+            while (w != 0 and rem > 0) : (w &= w - 1) {
+                const i: u32 = @ctz(w);
+                if (self.current_block_num -% self.cmt_d1_last[i] < min_age) continue;
+                const id = self.next_cmt_id;
+                self.next_cmt_id += 1;
+                try cs.write(id, &self.cmt_d1[i]);
+                self.cmt_d1_ids[i] = id;
+                self.cmt_d1_flush &= ~(@as(u64, 1) << @as(u6, @intCast(i)));
+                rem -= 1;
+            }
+        }
+
+        for (self.cmt_d2_flush, 0..) |*word, wi| {
             if (rem == 0) return;
+            var w = word.*;
+            while (w != 0 and rem > 0) : (w &= w - 1) {
+                const bit: u32 = @ctz(w);
+                const prefix: u32 = @intCast(wi * 64 + bit);
+                if (self.current_block_num -% self.cmt_d2_last[prefix] < min_age) continue;
+                const id = self.next_cmt_id;
+                self.next_cmt_id += 1;
+                try cs.write(id, &self.cmt_d2[prefix]);
+                self.cmt_d2_ids[prefix] = id;
+                word.* &= ~(@as(u64, 1) << @as(u6, @intCast(bit)));
+                rem -= 1;
+            }
+        }
+
+        if (min_age == 0) {
+            var coords = std.ArrayList(NodeCoord).empty;
+            defer coords.deinit(self.allocator);
+            var it = self.cmt_deep_flush.iterator();
+            while (it.next()) |e| try coords.append(self.allocator, e.key_ptr.*);
+            for (coords.items) |coord| {
+                const page = self.cmt_deep.get(coord) orelse {
+                    _ = self.cmt_deep_flush.remove(coord);
+                    continue;
+                };
+                const id = self.next_cmt_id;
+                self.next_cmt_id += 1;
+                try cs.write(id, page);
+                try self.cmt_deep_ids.put(coord, id);
+                _ = self.cmt_deep_flush.remove(coord);
+            }
         }
     }
 
@@ -605,9 +791,11 @@ pub const PrefixDB = struct {
     /// Writes all live arena nodes to node_store, then writes manifest.bin.
     /// Must be called before process exit to preserve the database.
     pub fn flush(self: *PrefixDB, store: page_store.DiskStore) !void {
-        // Drain all remaining dirty arena nodes (safety net; incremental flushing
-        // in commitBlock should have already written most of them).
-        try self.flushDirtyNodes(std.math.maxInt(u32));
+        // Drain ALL remaining dirty arena nodes and commitment pages regardless
+        // of age — the manifest written below must reference fully-persisted
+        // pages.
+        try self.flushDirtyNodes(std.math.maxInt(u32), 0);
+        try self.flushDirtyCmt(std.math.maxInt(u32), 0);
 
         // Ensure all d4+ nodes and SST pages referenced by the manifest are on disk.
         // With write-back, they may still be in cache but not yet persisted.
@@ -657,6 +845,7 @@ pub const PrefixDB = struct {
             .version       = page_store.MANIFEST_VERSION,
             .next_node_id  = self.heap.next_node_id,
             .next_sst_id   = self.heap.next_sst_id,
+            .next_cmt_id   = self.next_cmt_id,
             .routing_count = route_count,
             .l0_count      = l0_count,
         };
@@ -670,7 +859,12 @@ pub const PrefixDB = struct {
             while (w != 0) : (w &= w - 1) {
                 const prefix: u32 = @ctz(w);
                 if (self.d1_node_ids[prefix]) |id| {
-                    routes.appendAssumeCapacity(.{ .depth = 1, .prefix = prefix, .node_id = id });
+                    routes.appendAssumeCapacity(.{
+                        .depth = 1,
+                        .prefix = prefix,
+                        .node_id = id,
+                        .cmt_page_id = self.cmt_d1_ids[prefix] orelse CMT_NONE,
+                    });
                 }
             }
         }
@@ -681,7 +875,12 @@ pub const PrefixDB = struct {
                 const bit: u32 = @ctz(w);
                 const prefix: u32 = @intCast(wi * 64 + bit);
                 if (self.d2_node_ids[prefix]) |id| {
-                    routes.appendAssumeCapacity(.{ .depth = 2, .prefix = prefix, .node_id = id });
+                    routes.appendAssumeCapacity(.{
+                        .depth = 2,
+                        .prefix = prefix,
+                        .node_id = id,
+                        .cmt_page_id = self.cmt_d2_ids[prefix] orelse CMT_NONE,
+                    });
                 }
             }
         }
@@ -692,7 +891,12 @@ pub const PrefixDB = struct {
                 const bit: u32 = @ctz(w);
                 const prefix: u32 = @intCast(wi * 64 + bit);
                 if (self.d3_node_ids[prefix]) |id| {
-                    routes.appendAssumeCapacity(.{ .depth = 3, .prefix = prefix, .node_id = id });
+                    routes.appendAssumeCapacity(.{
+                        .depth = 3,
+                        .prefix = prefix,
+                        .node_id = id,
+                        .cmt_page_id = self.cmt_deep_ids.get(.{ .depth = 3, .prefix = prefix }) orelse CMT_NONE,
+                    });
                 }
             }
         }
@@ -704,6 +908,7 @@ pub const PrefixDB = struct {
                     .depth   = kv.key_ptr.depth,
                     .prefix  = kv.key_ptr.prefix,
                     .node_id = kv.value_ptr.*,
+                    .cmt_page_id = self.cmt_deep_ids.get(kv.key_ptr.*) orelse CMT_NONE,
                 });
             }
         }
@@ -751,24 +956,32 @@ pub const PrefixDB = struct {
         self.routing.deinit();
         self.heap.deinit();
         self.compaction_queue.deinit(self.allocator);
-        self.deep_dirty.deinit();
         self.kv_map.deinit();
         self.allocator.free(self.d2_node_ids);
         self.allocator.free(self.d3_node_ids);
-        self.allocator.free(self.d3_dirty);
         self.allocator.free(self.d3_dirty_flush);
-    }
-
-    fn markDirty(self: *PrefixDB, depth: u32, prefix: PrefixData) void {
-        switch (depth) {
-            1 => self.d1_dirty |= @as(u64, 1) << @as(u6, @intCast(prefix)),
-            2 => self.d2_dirty[@intCast(prefix >> 6)] |= @as(u64, 1) << @as(u6, @intCast(prefix & 63)),
-            3 => self.d3_dirty[@intCast(prefix >> 6)] |= @as(u64, 1) << @as(u6, @intCast(prefix & 63)),
-            else => self.deep_dirty.put(.{ .depth = depth, .prefix = prefix }, {}) catch {},
-        }
+        self.allocator.free(self.d2_last_write);
+        self.allocator.free(self.d3_last_write);
+        self.allocator.free(self.cmt_d1);
+        self.allocator.free(self.cmt_d2);
+        self.allocator.free(self.cmt_d2_exists);
+        self.allocator.free(self.cmt_d2_flush);
+        self.allocator.free(self.cmt_d2_ids);
+        self.allocator.free(self.cmt_d2_last);
+        var dit = self.cmt_deep.valueIterator();
+        while (dit.next()) |p| self.allocator.destroy(p.*);
+        self.cmt_deep.deinit();
+        self.cmt_deep_ids.deinit();
+        self.cmt_deep_flush.deinit();
+        self.block_keys.deinit(self.allocator);
     }
 
     // ─── Node access helpers (dispatch arena for d1/d2, heap for d3-d5) ───────
+
+    fn nodeExists(self: *const PrefixDB, depth: u32, prefix: PrefixData) bool {
+        if (depth <= 3) return self.arena.exists(depth, prefix);
+        return self.routing.get(depth, prefix) != null;
+    }
 
     fn nodeGet(self: *PrefixDB, depth: u32, prefix: PrefixData) !?NodePage {
         if (depth <= 3) {
@@ -783,9 +996,18 @@ pub const PrefixDB = struct {
         if (depth <= 3) {
             self.arena.put(depth, prefix, node);
             switch (depth) {
-                1 => self.d1_dirty_flush |= @as(u64, 1) << @as(u6, @intCast(prefix)),
-                2 => self.d2_dirty_flush[@intCast(prefix >> 6)] |= @as(u64, 1) << @as(u6, @intCast(prefix & 63)),
-                3 => self.d3_dirty_flush[@intCast(prefix >> 6)] |= @as(u64, 1) << @as(u6, @intCast(prefix & 63)),
+                1 => {
+                    self.d1_dirty_flush |= @as(u64, 1) << @as(u6, @intCast(prefix));
+                    self.d1_last_write[@intCast(prefix)] = self.current_block_num;
+                },
+                2 => {
+                    self.d2_dirty_flush[@intCast(prefix >> 6)] |= @as(u64, 1) << @as(u6, @intCast(prefix & 63));
+                    self.d2_last_write[@intCast(prefix)] = self.current_block_num;
+                },
+                3 => {
+                    self.d3_dirty_flush[@intCast(prefix >> 6)] |= @as(u64, 1) << @as(u6, @intCast(prefix & 63));
+                    self.d3_last_write[@intCast(prefix)] = self.current_block_num;
+                },
                 else => unreachable,
             }
             if (depth > self.max_depth_used) self.max_depth_used = depth;
@@ -799,6 +1021,9 @@ pub const PrefixDB = struct {
     }
 
     fn nodeRemove(self: *PrefixDB, depth: u32, prefix: PrefixData) void {
+        // The node's commitment page goes with it; the parent's leaf retains
+        // the (canonical, placement-independent) subtree value.
+        self.cmtRemove(depth, prefix);
         if (depth <= 3) {
             self.arena.remove(depth, prefix);
             return;
@@ -814,6 +1039,7 @@ pub const PrefixDB = struct {
     pub fn write(self: *PrefixDB, key: Key, value: Value) !void {
         if (comptime options.enable_metrics) self.stats.write_ops += 1;
         if (self.wal) |*w| try w.append(wal_mod.WalEntry.kvWrite(self.current_block_num, key, value));
+        try self.block_keys.append(self.allocator, key);
         try self.l0.append(.{ .key = key, .value = value });
         self.kv_map.put(key, value);
         const p = prefixData(&key, 1);
@@ -852,7 +1078,6 @@ pub const PrefixDB = struct {
             if (comptime options.enable_metrics) self.stats.read_node_loads += 1;
 
             const q = prefix32(&key, d);
-            const f = prefix16(&key, d);
             var opp_count: u32 = 0;
 
             // Append zone (most recent): scan from newest page to oldest.
@@ -861,7 +1086,7 @@ pub const PrefixDB = struct {
             while (j > 0 and append_result == null) {
                 j -= 1;
                 if (comptime options.enable_metrics) self.stats.append_filter_probes += 1;
-                if (filterContains(&node.append_prefix16[j], node.append_page_counts[j], f)) {
+                if (filterContains(&node.append_prefix32[j], node.append_page_counts[j], q)) {
                     if (comptime options.enable_metrics) self.stats.append_filter_hits += 1;
                     opp_count += 1;
                     if (try self.heap.getSstPage(node.append_slot_ids[j])) |sst_raw| {
@@ -964,8 +1189,8 @@ pub const PrefixDB = struct {
         @memcpy(sst.entries[0..chunk.len], chunk);
         const sst_id = try self.heap.writeSstPage(sst);
 
-        var filter = [_]u16{std.math.maxInt(u16)} ** PAGE_ENTRIES;
-        for (chunk, 0..) |e, idx| filter[idx] = prefix16(&e.key, depth);
+        var filter = [_]u32{std.math.maxInt(u32)} ** PAGE_ENTRIES;
+        for (chunk, 0..) |e, idx| filter[idx] = prefix32(&e.key, depth);
 
         try self.appendSstToNode(depth, prefix, sst_id, @intCast(chunk.len), filter);
     }
@@ -977,7 +1202,7 @@ pub const PrefixDB = struct {
         prefix: PrefixData,
         sst_id: PayloadSlotId,
         count: u8,
-        filter: [PAGE_ENTRIES]u16,
+        filter: [PAGE_ENTRIES]u32,
     ) anyerror!void {
         var node = (try self.nodeGet(depth, prefix)) orelse std.mem.zeroes(NodePage);
 
@@ -997,11 +1222,10 @@ pub const PrefixDB = struct {
         const ac = node.append_count;
         node.append_slot_ids[ac] = sst_id;
         node.append_page_counts[ac] = count;
-        node.append_prefix16[ac] = filter;
+        node.append_prefix32[ac] = filter;
         node.append_count += 1;
 
         try self.nodePut(depth, prefix, node);
-        self.markDirty(depth, prefix);
 
         if (node.append_count == A_MAX) {
             self.compaction_queue.append(
@@ -1027,45 +1251,221 @@ pub const PrefixDB = struct {
         for (list.items) |p| try self.flushL0Prefix(p);
     }
 
-    /// Hash the logical key-value content of a single node (deduplicated, sorted).
-    /// Append zone entries override sorted zone entries for the same key.
-    fn nodeDataHash(self: *PrefixDB, node: NodePage) !Hash {
-        var dedup = std.AutoHashMap(Key, Value).init(self.allocator);
-        defer dedup.deinit();
-        for (0..node.sorted_count) |si| {
-            if (try self.heap.getSstPage(node.sorted_slot_ids[si])) |sst| {
-                const cnt = node.sorted_page_counts[si];
-                for (sst.entries[0..cnt]) |e| try dedup.put(e.key, e.value);
+    // ─── Commitment tree internals (docs/commitment_redesign.md §4) ──────────
+
+    /// Return the commitment page for (depth, prefix), creating an empty
+    /// (all-leaves-invalid) page — or lazily loading the persisted one for
+    /// deep coordinates — if absent.  depth 0 is the memory-only root page.
+    fn cmtGetOrCreate(self: *PrefixDB, depth: u32, prefix: PrefixData) anyerror!*CommitmentPage {
+        if (depth == 0) return &self.cmt_d0;
+        if (depth == 1) {
+            const i: usize = @intCast(prefix);
+            const bit = @as(u64, 1) << @as(u6, @intCast(prefix));
+            if (self.cmt_d1_exists & bit == 0) {
+                self.cmt_d1[i] = CommitmentPage.EMPTY;
+                self.cmt_d1_exists |= bit;
+            }
+            return &self.cmt_d1[i];
+        }
+        if (depth == 2) {
+            const i: usize = @intCast(prefix);
+            const w: usize = @intCast(prefix >> 6);
+            const bit = @as(u64, 1) << @as(u6, @intCast(prefix & 63));
+            if (self.cmt_d2_exists[w] & bit == 0) {
+                self.cmt_d2[i] = CommitmentPage.EMPTY;
+                self.cmt_d2_exists[w] |= bit;
+            }
+            return &self.cmt_d2[i];
+        }
+        const coord = NodeCoord{ .depth = depth, .prefix = prefix };
+        if (self.cmt_deep.get(coord)) |p| return p;
+        const page = try self.allocator.create(CommitmentPage);
+        errdefer self.allocator.destroy(page);
+        if (self.cmt_deep_ids.get(coord)) |id| {
+            if (self.heap.cmt_store) |*cs| {
+                page.* = try cs.read(id);
+                try self.cmt_deep.put(coord, page);
+                return page;
             }
         }
-        for (0..node.append_count) |ai| {
-            if (try self.heap.getSstPage(node.append_slot_ids[ai])) |sst| {
-                const cnt = node.append_page_counts[ai];
-                for (sst.entries[0..cnt]) |e| try dedup.put(e.key, e.value);
-            }
-        }
-        if (dedup.count() == 0) return ZERO_HASH;
-        var entries = std.ArrayList(KvEntry).empty;
-        defer entries.deinit(self.allocator);
-        var eit = dedup.iterator();
-        while (eit.next()) |kv| {
-            try entries.append(self.allocator, .{ .key = kv.key_ptr.*, .value = kv.value_ptr.* });
-        }
-        std.mem.sort(KvEntry, entries.items, {}, kvLessThan);
-        var hasher = std.crypto.hash.Blake3.init(.{});
-        for (entries.items) |e| {
-            hasher.update(&e.key);
-            hasher.update(&e.value);
-        }
-        var out: Hash = undefined;
-        hasher.final(&out);
-        return out;
+        page.* = CommitmentPage.EMPTY;
+        try self.cmt_deep.put(coord, page);
+        return page;
     }
 
-    /// Compute the Merkle root of a node's commitment by walking up dirty nodes
-    /// deepest-first, propagating each child's hash into its parent's
-    /// child_commitments slot (CoW rewrite), then returning a Merkle root over
-    /// all depth-1 commitments.
+    /// Drop the commitment page at (depth, prefix), e.g. when its node is
+    /// absorbed by a downwardMerge.  The parent's leaf keeps the canonical
+    /// subtree value, which is placement-independent.
+    fn cmtRemove(self: *PrefixDB, depth: u32, prefix: PrefixData) void {
+        switch (depth) {
+            0 => {},
+            1 => {
+                const bit = @as(u64, 1) << @as(u6, @intCast(prefix));
+                self.cmt_d1_exists &= ~bit;
+                self.cmt_d1_flush &= ~bit;
+                self.cmt_d1_ids[@intCast(prefix)] = null;
+            },
+            2 => {
+                const bit = @as(u64, 1) << @as(u6, @intCast(prefix & 63));
+                self.cmt_d2_exists[@intCast(prefix >> 6)] &= ~bit;
+                self.cmt_d2_flush[@intCast(prefix >> 6)] &= ~bit;
+                self.cmt_d2_ids[@intCast(prefix)] = null;
+            },
+            else => {
+                const coord = NodeCoord{ .depth = depth, .prefix = prefix };
+                if (self.cmt_deep.fetchRemove(coord)) |kv| self.allocator.destroy(kv.value);
+                _ = self.cmt_deep_ids.remove(coord);
+                _ = self.cmt_deep_flush.remove(coord);
+            },
+        }
+    }
+
+    /// Mark a commitment page as needing a (CoW) flush, recording its age.
+    fn cmtMarkFlush(self: *PrefixDB, depth: u32, prefix: PrefixData) void {
+        switch (depth) {
+            0 => {}, // memory-only
+            1 => {
+                self.cmt_d1_flush |= @as(u64, 1) << @as(u6, @intCast(prefix));
+                self.cmt_d1_last[@intCast(prefix)] = self.current_block_num;
+            },
+            2 => {
+                self.cmt_d2_flush[@intCast(prefix >> 6)] |= @as(u64, 1) << @as(u6, @intCast(prefix & 63));
+                self.cmt_d2_last[@intCast(prefix)] = self.current_block_num;
+            },
+            else => self.cmt_deep_flush.put(.{ .depth = depth, .prefix = prefix }, {}) catch {},
+        }
+    }
+
+    /// Recompute the 63 internal heap values from the 64 leaves using the
+    /// canonical pass-through `combine` rule.  h[1] becomes the page root.
+    fn rebuildInternals(page: *CommitmentPage) void {
+        var i: usize = 63;
+        while (i >= 1) : (i -= 1) {
+            page.h[i] = merkle.combine(&page.h[2 * i], &page.h[2 * i + 1]);
+        }
+    }
+
+    /// Fill all invalid leaves of `page` (child page roots where a child node
+    /// exists, bottom-slot gathers otherwise) and rebuild the internals.
+    /// Recursive: a child page may itself need materialising first.
+    fn cmtMaterialize(self: *PrefixDB, depth: u32, prefix: PrefixData, page: *CommitmentPage) anyerror!void {
+        if (page.leaf_valid == ~@as(u64, 0)) return;
+        var missing = ~page.leaf_valid;
+        while (missing != 0) : (missing &= missing - 1) {
+            const c: u32 = @ctz(missing);
+            const child_prefix = (prefix << STRIDE) | c;
+            const child_depth = depth + 1;
+            if (self.nodeExists(child_depth, child_prefix)) {
+                const child = try self.cmtGetOrCreate(child_depth, child_prefix);
+                try self.cmtMaterialize(child_depth, child_prefix, child);
+                page.h[64 + c] = child.h[1];
+            } else {
+                page.h[64 + c] = try self.gatherSlotValue(child_depth, child_prefix);
+            }
+            page.leaf_valid |= @as(u64, 1) << @as(u6, @intCast(c));
+        }
+        rebuildInternals(page);
+    }
+
+    /// Deepest depth (in strides) at which a node exists on `key`'s path;
+    /// 0 when not even the depth-1 node exists.
+    fn deepestNodeOnPath(self: *const PrefixDB, key: *const Key) u32 {
+        var best: u32 = 0;
+        var d: u32 = 1;
+        while (d <= self.max_depth_used) : (d += 1) {
+            if (self.nodeExists(d, prefixData(key, d))) best = d;
+        }
+        return best;
+    }
+
+    /// Canonical value of the bottom slot at (level, p): the §2 trie value over
+    /// every live key with that 6·level-bit prefix.
+    ///
+    /// Precondition: no node exists at (level, p).  Path-connectivity (enforced
+    /// by the downwardMerge child guard) then guarantees no node exists below
+    /// it either, so all matching keys live in ancestor buffers at depths
+    /// 1..level-1.  L0 is empty here: commitBlock flushes it before gathering.
+    fn gatherSlotValue(self: *PrefixDB, level: u32, p: PrefixData) anyerror!Hash {
+        const alloc = self.allocator;
+        var found = std.AutoHashMap(Key, Value).init(alloc);
+        defer found.deinit();
+
+        // Shallow depths first: read() precedence is shallowest-depth wins,
+        // and within a node append (newest first) beats sorted.
+        var d: u32 = 1;
+        while (d < level) : (d += 1) {
+            const np = p >> @intCast(STRIDE * (level - d));
+            const node = (try self.nodeGet(d, np)) orelse continue;
+            const rel_bits: u32 = STRIDE * (level - d); // bits of p below this node's prefix
+            const rel: u64 = p & ((@as(u64, 1) << @intCast(rel_bits)) - 1);
+
+            // Append zone, newest → oldest; prefix32 filters narrow the scan.
+            const fbits: u32 = @min(rel_bits, 32);
+            const fwant: u32 = @intCast(if (rel_bits <= 32) rel else rel >> @intCast(rel_bits - 32));
+            var j: usize = node.append_count;
+            while (j > 0) {
+                j -= 1;
+                var any = false;
+                for (node.append_prefix32[j][0..node.append_page_counts[j]]) |fv| {
+                    if ((fv >> @intCast(32 - fbits)) == fwant) {
+                        any = true;
+                        break;
+                    }
+                }
+                if (!any) continue;
+                if (try self.heap.getSstPage(node.append_slot_ids[j])) |sst| {
+                    for (sst.entries[0..node.append_page_counts[j]]) |e| {
+                        if (prefixData(&e.key, level) != p) continue;
+                        const gop = try found.getOrPut(e.key);
+                        if (!gop.found_existing) gop.value_ptr.* = e.value;
+                    }
+                }
+            }
+
+            // Sorted zone: keys under the slot span a contiguous page range.
+            if (node.sorted_count > 0) {
+                const lo: u64 = if (rel_bits <= 32) rel << @intCast(32 - rel_bits) else rel >> @intCast(rel_bits - 32);
+                const hi: u64 = if (rel_bits <= 32) (rel + 1) << @intCast(32 - rel_bits) else lo + 1;
+                var plo: usize = 0;
+                var phi: usize = node.sorted_count;
+                while (plo < phi) {
+                    const mid = plo + (phi - plo) / 2;
+                    if (node.sorted_min4[mid] <= lo) plo = mid + 1 else phi = mid;
+                }
+                var pg: usize = if (plo > 0) plo - 1 else 0;
+                while (pg < node.sorted_count) : (pg += 1) {
+                    if (@as(u64, node.sorted_min4[pg]) >= hi) break;
+                    if (try self.heap.getSstPage(node.sorted_slot_ids[pg])) |sst| {
+                        for (sst.entries[0..node.sorted_page_counts[pg]]) |e| {
+                            if (prefixData(&e.key, level) != p) continue;
+                            const gop = try found.getOrPut(e.key);
+                            if (!gop.found_existing) gop.value_ptr.* = e.value;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Tombstones shadow older values during precedence resolution above;
+        // only now do deleted keys drop out of the trie.
+        var list = std.ArrayList(KvEntry).empty;
+        defer list.deinit(alloc);
+        var it = found.iterator();
+        while (it.next()) |kv| {
+            if (std.mem.eql(u8, kv.value_ptr, &TOMBSTONE)) continue;
+            try list.append(alloc, .{ .key = kv.key_ptr.*, .value = kv.value_ptr.* });
+        }
+        std.mem.sort(KvEntry, list.items, {}, kvLessThan);
+        return subtreeValue(list.items, STRIDE * level);
+    }
+
+    /// Recompute the Merkle state root after a block of writes.
+    ///
+    /// Dirtiness is derived from the block's write stream (block_keys): each
+    /// written key dirties one bottom slot; changed pages propagate their h[1]
+    /// into the parent's leaf up to the depth-0 page, whose h[1] is the root.
+    /// Commitment values never depend on which buffer holds an entry, so
+    /// compaction and splits cannot change the root.
     ///
     /// Call once per block after all writes are done.  Flushes L0 internally so
     /// callers do not need a separate flushL0All call.
@@ -1075,106 +1475,94 @@ pub const PrefixDB = struct {
 
         try self.flushL0All();
 
-        // Seed worklist from dirty bitmaps (d1, d2) and deep_dirty hashmap (d3-d5).
-        var worklist = std.AutoHashMap(NodeCoord, void).init(self.allocator);
-        defer worklist.deinit();
-        {
-            // depth 1: 64-bit bitmap, one bit per prefix
-            var w1 = self.d1_dirty;
-            self.d1_dirty = 0;
-            while (w1 != 0) : (w1 &= w1 - 1) {
-                const prefix: PrefixData = @ctz(w1);
-                try worklist.put(.{ .depth = 1, .prefix = prefix }, {});
-            }
-            // depth 2: 64 × 64-bit words → 4096 bits total
-            for (&self.d2_dirty, 0..) |*word, wi| {
-                var w = word.*;
-                word.* = 0;
-                while (w != 0) : (w &= w - 1) {
-                    const bit: u32 = @ctz(w);
-                    try worklist.put(.{ .depth = 2, .prefix = @intCast(wi * 64 + bit) }, {});
-                }
-            }
-            // depth 3: 4096 × 64-bit words → 262144 bits
-            for (self.d3_dirty, 0..) |*word, wi| {
-                var w = word.*;
-                word.* = 0;
-                while (w != 0) : (w &= w - 1) {
-                    const bit: u32 = @ctz(w);
-                    try worklist.put(.{ .depth = 3, .prefix = @intCast(wi * 64 + bit) }, {});
-                }
-            }
-            // depths 4+: sparse hashmap
-            var it = self.deep_dirty.iterator();
-            while (it.next()) |entry| try worklist.put(entry.key_ptr.*, {});
-            self.deep_dirty.clearRetainingCapacity();
+        // Dirty slot masks per page, derived from the block's written keys.
+        var dirty = std.AutoHashMap(NodeCoord, u64).init(self.allocator);
+        defer dirty.deinit();
+        var max_depth: u32 = 0;
+        for (self.block_keys.items) |key| {
+            const bottom = self.deepestNodeOnPath(&key);
+            const coord = NodeCoord{
+                .depth = bottom,
+                .prefix = if (bottom == 0) 0 else prefixData(&key, bottom),
+            };
+            const slot: u6 = @intCast(prefixData(&key, bottom + 1) & (CHILD_COUNT - 1));
+            const gop = try dirty.getOrPut(coord);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* |= @as(u64, 1) << slot;
+            if (bottom > max_depth) max_depth = bottom;
         }
+        self.block_keys.clearRetainingCapacity();
 
-        // Process deepest nodes first so children are committed before parents.
-        // Find the maximum depth in the worklist to start from.
-        var depth: u32 = 1;
-        {
-            var wit = worklist.iterator();
-            while (wit.next()) |e| if (e.key_ptr.depth > depth) { depth = e.key_ptr.depth; };
-        }
+        // Process deepest-first; each page pushes its new h[1] into its parent.
+        var depth: u32 = max_depth;
         while (true) {
-            var at_depth = std.ArrayList(PrefixData).empty;
+            var at_depth = std.ArrayList(NodeCoord).empty;
             defer at_depth.deinit(self.allocator);
             {
-                var wit = worklist.iterator();
-                while (wit.next()) |entry| {
-                    if (entry.key_ptr.depth == depth) {
-                        try at_depth.append(self.allocator, entry.key_ptr.prefix);
-                    }
+                var dit = dirty.iterator();
+                while (dit.next()) |e| {
+                    if (e.key_ptr.depth == depth) try at_depth.append(self.allocator, e.key_ptr.*);
                 }
             }
 
-            for (at_depth.items) |prefix| {
-                _ = worklist.remove(.{ .depth = depth, .prefix = prefix });
+            for (at_depth.items) |coord| {
+                const mask = (dirty.fetchRemove(coord) orelse continue).value;
                 if (comptime options.enable_metrics) self.stats.commit_nodes_processed += 1;
 
-                const node = (try self.nodeGet(depth, prefix)) orelse continue;
+                const page = try self.cmtGetOrCreate(coord.depth, coord.prefix);
 
-                const data_hash = try self.nodeDataHash(node);
-                const child_root = childMerkleRoot(node.child_commitments);
-                const commitment = merkle.pairHash(&data_hash, &child_root);
-
-                if (depth > 1) {
-                    const parent_depth = depth - 1;
-                    const parent_prefix = prefix >> STRIDE;
-                    const child_idx = prefix & (CHILD_COUNT - 1);
-
-                    if (try self.nodeGet(parent_depth, parent_prefix)) |parent_old| {
-                        var parent = parent_old;
-                        parent.child_commitments[child_idx] = commitment;
-                        try self.nodePut(parent_depth, parent_prefix, parent);
-                        // Ensure the parent is (re)processed to propagate further.
-                        try worklist.put(.{ .depth = parent_depth, .prefix = parent_prefix }, {});
+                // Refresh lazily-invalid leaves plus the dirty bottom slots.
+                var need = ~page.leaf_valid | mask;
+                while (need != 0) : (need &= need - 1) {
+                    const c: u32 = @ctz(need);
+                    const cbit = @as(u64, 1) << @as(u6, @intCast(c));
+                    const child_prefix = (coord.prefix << STRIDE) | c;
+                    const child_depth = coord.depth + 1;
+                    if (self.nodeExists(child_depth, child_prefix)) {
+                        if (page.leaf_valid & cbit == 0) {
+                            const child = try self.cmtGetOrCreate(child_depth, child_prefix);
+                            try self.cmtMaterialize(child_depth, child_prefix, child);
+                            page.h[64 + c] = child.h[1];
+                        }
+                        // else: a deeper dirty page already pushed the fresh value.
+                    } else {
+                        page.h[64 + c] = try self.gatherSlotValue(child_depth, child_prefix);
                     }
+                    page.leaf_valid |= cbit;
+                }
+                rebuildInternals(page);
+                self.cmtMarkFlush(coord.depth, coord.prefix);
+
+                if (coord.depth > 0) {
+                    const slot: usize = @intCast(coord.prefix & (CHILD_COUNT - 1));
+                    const parent_coord = NodeCoord{ .depth = coord.depth - 1, .prefix = coord.prefix >> STRIDE };
+                    const parent = try self.cmtGetOrCreate(parent_coord.depth, parent_coord.prefix);
+                    parent.h[64 + slot] = page.h[1];
+                    parent.leaf_valid |= @as(u64, 1) << @as(u6, @intCast(slot));
+                    const gop = try dirty.getOrPut(parent_coord);
+                    if (!gop.found_existing) gop.value_ptr.* = 0;
+                    gop.value_ptr.* |= @as(u64, 1) << @as(u6, @intCast(slot));
                 }
             }
 
-            if (depth == 1) break;
+            if (depth == 0) break;
             depth -= 1;
         }
 
-        // Build the root commitment: a Merkle tree over the 64 depth-1 slots.
-        var root_children: [CHILD_COUNT]Hash = [_]Hash{ZERO_HASH} ** CHILD_COUNT;
-        for (0..CHILD_COUNT) |p| {
-            const pp: PrefixData = @intCast(p);
-            const node = (try self.nodeGet(1, pp)) orelse continue;
-            const data_hash = try self.nodeDataHash(node);
-            const child_root = childMerkleRoot(node.child_commitments);
-            root_children[p] = merkle.pairHash(&data_hash, &child_root);
-        }
-        const root = childMerkleRoot(root_children);
+        // First commit after open (or a write-free block): make sure the root
+        // page is fully materialised before reading the root.
+        try self.cmtMaterialize(0, 0, &self.cmt_d0);
+        const root = self.cmt_d0.h[1];
         if (comptime options.enable_metrics) {
             self.stats.commit_block_ns += monoNs() - t0;
         }
         if (self.wal) |*w| try w.append(wal_mod.WalEntry.blockCommit(self.current_block_num, root));
         self.current_block_num += 1;
-        // Incrementally drain dirty arena nodes to smooth the 64-block flush spike.
-        try self.flushDirtyNodes(NODE_FLUSH_BUDGET);
+        // Amortised write-back of OLD data only: dirty pages untouched for
+        // NODE_FLUSH_MIN_AGE blocks are persisted; hot pages stay in memory
+        // until they cool down or the FLUSH_INTERVAL checkpoint drains them.
+        try self.flushDirtyNodes(NODE_FLUSH_BUDGET, NODE_FLUSH_MIN_AGE);
+        try self.flushDirtyCmt(NODE_FLUSH_BUDGET, NODE_FLUSH_MIN_AGE);
         self.flush_counter += 1;
         if (self.flush_counter >= FLUSH_INTERVAL) {
             if (self.store) |s| {
@@ -1301,9 +1689,9 @@ pub const PrefixDB = struct {
             const chunk = survivors.items[offset..end];
 
             if (chunk.len == PAGE_ENTRIES) {
-                const f0 = prefix16(&chunk[0].key, depth);
-                const f63 = prefix16(&chunk[PAGE_ENTRIES - 1].key, depth);
-                if (f0 >> 10 == f63 >> 10) {
+                const f0 = prefix32(&chunk[0].key, depth);
+                const f63 = prefix32(&chunk[PAGE_ENTRIES - 1].key, depth);
+                if (f0 >> 26 == f63 >> 26) {
                     try self.promoteSstPage(depth, chunk);
                     if (comptime options.enable_metrics) self.stats.compaction_sst_writes += 1;
                     offset = end;
@@ -1325,7 +1713,6 @@ pub const PrefixDB = struct {
         var new_node = std.mem.zeroes(NodePage);
         new_node.sorted_count = @intCast(new_ids.items.len);
         new_node.append_count = 0;
-        new_node.child_commitments = old_node.child_commitments;
         @memcpy(new_node.sorted_slot_ids[0..new_ids.items.len], new_ids.items);
         @memcpy(new_node.sorted_min4[0..new_min4.items.len], new_min4.items);
         @memcpy(new_node.sorted_page_counts[0..new_counts.items.len], new_counts.items);
@@ -1333,7 +1720,6 @@ pub const PrefixDB = struct {
         try self.nodePut(depth, prefix, new_node);
         for (old_node.sorted_slot_ids[0..old_node.sorted_count]) |id| self.heap.freeSstPage(id);
         for (old_node.append_slot_ids[0..old_node.append_count]) |id| self.heap.freeSstPage(id);
-        self.markDirty(depth, prefix);
 
         if (new_node.sorted_count >= S_MAX)
             self.compaction_queue.append(alloc, .{ .depth = depth, .prefix = prefix }) catch {};
@@ -1354,9 +1740,9 @@ pub const PrefixDB = struct {
         @memcpy(sst.entries[0..chunk.len], chunk);
         const sst_id = try self.heap.writeSstPage(sst);
 
-        // Build a sorted prefix16 filter over the chunk entries at child_depth.
-        var filter = [_]u16{std.math.maxInt(u16)} ** PAGE_ENTRIES;
-        for (chunk, 0..) |e, idx| filter[idx] = prefix16(&e.key, child_depth);
+        // Build a sorted prefix32 filter over the chunk entries at child_depth.
+        var filter = [_]u32{std.math.maxInt(u32)} ** PAGE_ENTRIES;
+        for (chunk, 0..) |e, idx| filter[idx] = prefix32(&e.key, child_depth);
 
         try self.appendSstToNode(child_depth, child_prefix, sst_id, sst.count, filter);
     }
@@ -1414,7 +1800,6 @@ pub const PrefixDB = struct {
                         cn.sorted_page_counts[sc] = sst.count;
                         cn.sorted_count += 1;
                         try self.nodePut(child_depth, cp, cn);
-                        self.markDirty(child_depth, cp);
                         if (cn.sorted_count >= S_MAX)
                             self.compaction_queue.append(alloc, .{ .depth = child_depth, .prefix = cp }) catch {};
                     } else {
@@ -1450,19 +1835,17 @@ pub const PrefixDB = struct {
         var new_node = std.mem.zeroes(NodePage);
         new_node.sorted_count = @intCast(new_ids.items.len);
         new_node.append_count = old_node.append_count;
-        new_node.child_commitments = old_node.child_commitments;
         @memcpy(new_node.sorted_slot_ids[0..new_ids.items.len], new_ids.items);
         @memcpy(new_node.sorted_min4[0..new_min4.items.len], new_min4.items);
         @memcpy(new_node.sorted_page_counts[0..new_counts.items.len], new_counts.items);
         for (0..old_node.append_count) |ai| {
             new_node.append_slot_ids[ai] = old_node.append_slot_ids[ai];
             new_node.append_page_counts[ai] = old_node.append_page_counts[ai];
-            new_node.append_prefix16[ai] = old_node.append_prefix16[ai];
+            new_node.append_prefix32[ai] = old_node.append_prefix32[ai];
         }
 
         try self.nodePut(depth, prefix, new_node);
         for (old_node.sorted_slot_ids[0..old_node.sorted_count]) |id| self.heap.freeSstPage(id);
-        self.markDirty(depth, prefix);
     }
 
     /// §6.3: Merge a sparse child node back into its parent's sorted zone.
@@ -1471,6 +1854,16 @@ pub const PrefixDB = struct {
         const alloc = self.allocator;
         const parent_depth = depth - 1;
         const parent_prefix: PrefixData = prefix >> STRIDE;
+
+        // Never orphan grandchildren: removing this node while deeper nodes
+        // exist under it would break path-connectivity, which the commitment
+        // gather relies on (a missing node implies an empty subtree of nodes).
+        {
+            var c: PrefixData = 0;
+            while (c < CHILD_COUNT) : (c += 1) {
+                if (self.nodeExists(depth + 1, (prefix << STRIDE) | c)) return;
+            }
+        }
 
         const old_child = (try self.nodeGet(depth, prefix)) orelse return;
         const old_parent = (try self.nodeGet(parent_depth, parent_prefix)) orelse return;
@@ -1533,20 +1926,16 @@ pub const PrefixDB = struct {
         var new_parent = std.mem.zeroes(NodePage);
         new_parent.sorted_count = @intCast(new_ids.items.len);
         new_parent.append_count = old_parent.append_count;
-        new_parent.child_commitments = old_parent.child_commitments;
-        // Child is absorbed: clear its commitment slot so the parent's Merkle path is clean.
-        new_parent.child_commitments[prefix & (CHILD_COUNT - 1)] = ZERO_HASH;
         @memcpy(new_parent.sorted_slot_ids[0..new_ids.items.len], new_ids.items);
         @memcpy(new_parent.sorted_min4[0..new_min4.items.len], new_min4.items);
         @memcpy(new_parent.sorted_page_counts[0..new_counts.items.len], new_counts.items);
         for (0..old_parent.append_count) |ai| {
             new_parent.append_slot_ids[ai] = old_parent.append_slot_ids[ai];
             new_parent.append_page_counts[ai] = old_parent.append_page_counts[ai];
-            new_parent.append_prefix16[ai] = old_parent.append_prefix16[ai];
+            new_parent.append_prefix32[ai] = old_parent.append_prefix32[ai];
         }
         try self.nodePut(parent_depth, parent_prefix, new_parent);
         for (old_parent.sorted_slot_ids[0..old_parent.sorted_count]) |id| self.heap.freeSstPage(id);
-        self.markDirty(parent_depth, parent_prefix);
 
         self.nodeRemove(depth, prefix);
         for (old_child.sorted_slot_ids[0..old_child.sorted_count]) |id| self.heap.freeSstPage(id);
@@ -1568,19 +1957,28 @@ fn monoNs() u64 {
 
 // ─── Commitment helpers ───────────────────────────────────────────────────────
 
-/// Binary Merkle root over exactly CHILD_COUNT (64) hashes.
-/// Six rounds of pairHash reduce 64 leaves to one root.
-pub fn childMerkleRoot(commitments: [CHILD_COUNT]Hash) Hash {
-    var level = commitments;
-    var size: usize = CHILD_COUNT;
-    while (size > 1) {
-        var i: usize = 0;
-        while (i < size / 2) : (i += 1) {
-            level[i] = merkle.pairHash(&level[2 * i], &level[2 * i + 1]);
-        }
-        size /= 2;
+/// Bit `bit` of a 256-bit key, MSB-first (bit 0 = top bit of key[0]).
+pub fn keyBit(key: *const Key, bit: u32) u1 {
+    return @intCast((key[bit >> 3] >> @intCast(7 - (bit & 7))) & 1);
+}
+
+/// Canonical trie value (docs/commitment_redesign.md §2) of the subtree at
+/// bit-depth `bit` over `entries`, which must be sorted by key, unique, and
+/// tombstone-free.  Pass-through collapse: a single entry IS the subtree value.
+pub fn subtreeValue(entries: []const KvEntry, bit: u32) Hash {
+    if (entries.len == 0) return ZERO_HASH;
+    if (entries.len == 1) return merkle.leafHash(&entries[0].key, &entries[0].value);
+    std.debug.assert(bit < 256); // >1 distinct keys must diverge within 256 bits
+    // Sorted input: all bit=0 entries precede bit=1 entries; binary-search the split.
+    var lo: usize = 0;
+    var hi: usize = entries.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (keyBit(&entries[mid].key, bit) == 0) lo = mid + 1 else hi = mid;
     }
-    return level[0];
+    const left = subtreeValue(entries[0..lo], bit + 1);
+    const right = subtreeValue(entries[lo..], bit + 1);
+    return merkle.combine(&left, &right);
 }
 
 // ─── Prefix helpers (§4.2.1, §7.1) ───────────────────────────────────────────
@@ -1639,7 +2037,7 @@ fn binarySearchSst(sst: *const SstPage, key: *const Key) ?Value {
     return null;
 }
 
-fn filterContains(filter: *const [PAGE_ENTRIES]u16, count: u8, target: u16) bool {
+fn filterContains(filter: *const [PAGE_ENTRIES]u32, count: u8, target: u32) bool {
     var lo: usize = 0;
     var hi: usize = count;
     while (lo < hi) {
@@ -2216,4 +2614,180 @@ test "downwardMerge: sparse child node is absorbed into parent" {
         total += (try db.heap.getSstPage(id)).?.count;
     }
     try std.testing.expectEqual(@as(u32, 8), total);
+}
+
+// ─── Commitment redesign tests (docs/commitment_redesign.md) ──────────────────
+
+/// Hash-distributed key, optionally pinned under one depth-1 prefix so a
+/// modest key count forces upwardSplit/promotion to depth 2+.
+fn cmtTestKey(i: u64, pin_first_byte: ?u8) Key {
+    var seed: [8]u8 = undefined;
+    std.mem.writeInt(u64, &seed, i, .big);
+    var k: Key = undefined;
+    std.crypto.hash.Blake3.hash(&seed, &k, .{});
+    if (pin_first_byte) |b| k[0] = b;
+    return k;
+}
+
+fn cmtTestVal(i: u64) Value {
+    var seed: [8]u8 = undefined;
+    std.mem.writeInt(u64, &seed, i ^ 0xDEAD_BEEF, .big);
+    var v: Value = undefined;
+    std.crypto.hash.Blake3.hash(&seed, &v, .{});
+    return v;
+}
+
+/// Reference implementation: §2 canonical trie value over a plain model map.
+fn naiveRootFromModel(allocator: std.mem.Allocator, model: *const std.AutoHashMap(Key, Value)) !Hash {
+    var list = std.ArrayList(KvEntry).empty;
+    defer list.deinit(allocator);
+    var it = model.iterator();
+    while (it.next()) |kv| {
+        if (std.mem.eql(u8, kv.value_ptr, &TOMBSTONE)) continue;
+        try list.append(allocator, .{ .key = kv.key_ptr.*, .value = kv.value_ptr.* });
+    }
+    std.mem.sort(KvEntry, list.items, {}, kvLessThan);
+    return subtreeValue(list.items, 0);
+}
+
+test "commitBlock: root equals naive canonical trie evaluation (with splits)" {
+    const alloc = std.testing.allocator;
+    var db = try PrefixDB.init(alloc);
+    defer db.deinit();
+    var model = std.AutoHashMap(Key, Value).init(alloc);
+    defer model.deinit();
+
+    // 8000 keys pinned under one depth-1 prefix overflow that node's sorted
+    // zone (104 × 64 = 6656) and force splits/promotions to depth 2+.
+    var i: u64 = 0;
+    while (i < 8000) : (i += 1) {
+        const k = cmtTestKey(i, 0x00);
+        const v = cmtTestVal(i);
+        try db.write(k, v);
+        try model.put(k, v);
+        if (i % 2000 == 1999) {
+            const got = try db.commitBlock();
+            try std.testing.expectEqual(try naiveRootFromModel(alloc, &model), got);
+            try db.runCompaction();
+        }
+    }
+    // Overwrites after compaction reshuffled placement.
+    i = 0;
+    while (i < 500) : (i += 1) {
+        const k = cmtTestKey(i * 3, 0x00);
+        const v = cmtTestVal(i + 1_000_000);
+        try db.write(k, v);
+        try model.put(k, v);
+    }
+    const got = try db.commitBlock();
+    try std.testing.expectEqual(try naiveRootFromModel(alloc, &model), got);
+}
+
+test "commitBlock: root is independent of write order and compaction history" {
+    const alloc = std.testing.allocator;
+    const N: u64 = 8000;
+
+    // History A: ascending order, one commit at the end.
+    var db_a = try PrefixDB.init(alloc);
+    defer db_a.deinit();
+    var i: u64 = 0;
+    while (i < N) : (i += 1) {
+        try db_a.write(cmtTestKey(i, 0x00), cmtTestVal(i));
+    }
+    const root_a = try db_a.commitBlock();
+
+    // History B: descending order, stale values corrected later, intermediate
+    // commits and compaction runs.
+    var db_b = try PrefixDB.init(alloc);
+    defer db_b.deinit();
+    i = N;
+    while (i > 0) {
+        i -= 1;
+        if (i % 10 == 0) try db_b.write(cmtTestKey(i, 0x00), cmtTestVal(999_999));
+        try db_b.write(cmtTestKey(i, 0x00), cmtTestVal(i));
+        if (i % 1500 == 0) {
+            _ = try db_b.commitBlock();
+            try db_b.runCompaction();
+        }
+    }
+    const root_b = try db_b.commitBlock();
+
+    try std.testing.expectEqual(root_a, root_b);
+}
+
+test "commitBlock: deleted keys drop out of the root" {
+    const alloc = std.testing.allocator;
+
+    var db1 = try PrefixDB.init(alloc);
+    defer db1.deinit();
+    var i: u64 = 0;
+    while (i < 100) : (i += 1) try db1.write(cmtTestKey(i, null), cmtTestVal(i));
+    try db1.write(cmtTestKey(7777, null), cmtTestVal(7777));
+    _ = try db1.commitBlock();
+    try db1.write(cmtTestKey(7777, null), TOMBSTONE);
+    const root_deleted = try db1.commitBlock();
+
+    var db2 = try PrefixDB.init(alloc);
+    defer db2.deinit();
+    i = 0;
+    while (i < 100) : (i += 1) try db2.write(cmtTestKey(i, null), cmtTestVal(i));
+    const root_never = try db2.commitBlock();
+
+    try std.testing.expectEqual(root_never, root_deleted);
+}
+
+test "commitBlock: empty block leaves the root unchanged" {
+    const alloc = std.testing.allocator;
+    var db = try PrefixDB.init(alloc);
+    defer db.deinit();
+    var i: u64 = 0;
+    while (i < 200) : (i += 1) try db.write(cmtTestKey(i, null), cmtTestVal(i));
+    const r1 = try db.commitBlock();
+    const r2 = try db.commitBlock();
+    try std.testing.expectEqual(r1, r2);
+}
+
+test "commitment pages survive flush + reopen (root stable across restart)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = page_store.DiskStore{ .dir = tmp.dir, .io = std.testing.io };
+
+    var root_before: Hash = undefined;
+    {
+        var db = try PrefixDB.openWithConfig(std.testing.allocator, .{}, store);
+        var i: u64 = 0;
+        while (i < 3000) : (i += 1) try db.write(cmtTestKey(i, 0x00), cmtTestVal(i));
+        root_before = try db.commitBlock();
+        try db.flush(store);
+        db.deinit();
+    }
+    {
+        var db = try PrefixDB.openWithConfig(std.testing.allocator, .{}, store);
+        defer db.deinit();
+        // A write-free commit after reopen must reproduce the same root.
+        const root_after = try db.commitBlock();
+        try std.testing.expectEqual(root_before, root_after);
+    }
+}
+
+test "WAL recovery reproduces the committed root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = page_store.DiskStore{ .dir = tmp.dir, .io = std.testing.io };
+
+    var root_before: Hash = undefined;
+    {
+        var db = try PrefixDB.openWithConfig(std.testing.allocator, .{}, store);
+        var i: u64 = 0;
+        while (i < 300) : (i += 1) try db.write(cmtTestKey(i, null), cmtTestVal(i));
+        root_before = try db.commitBlock();
+        // Crash: no flush.
+        db.deinit();
+    }
+    {
+        var db = try PrefixDB.openWithConfig(std.testing.allocator, .{}, store);
+        defer db.deinit();
+        const root_after = try db.commitBlock();
+        try std.testing.expectEqual(root_before, root_after);
+    }
 }
