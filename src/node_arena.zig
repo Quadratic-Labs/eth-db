@@ -8,15 +8,17 @@
 //! Existence is tracked with compact bitmaps so scanning all live nodes costs
 //! O(n/64) with @ctz-based loops.
 //!
-//! `d2_pages` (~16 MB) and `d3_pages` (~1 GB) are heap-allocated to keep the
-//! struct from ballooning the caller's stack frame.
+//! All page arrays and the d3 bitmap are heap-allocated to keep the struct
+//! small by value: Debug builds materialise temporary copies of aggregates on
+//! the stack, and an inline `[64]NodePage` (~256 KB) multiplied across the
+//! init call chain overflows an 8 MB stack (e.g. when loaded via Python ctypes).
 
 const std = @import("std");
 const t = @import("types.zig");
 
 pub const NodeArena = struct {
-    // ─── Depth-1 (64 nodes, inline) ───────────────────────────────────────────
-    d1_pages:  [64]t.NodePage,
+    // ─── Depth-1 (64 nodes, heap-allocated ~256 KB) ───────────────────────────
+    d1_pages:  []t.NodePage,  // len = 64
     d1_exists: u64,           // bit i set ↔ d1_pages[i] is live
 
     // ─── Depth-2 (4096 nodes, heap-allocated ~16 MB) ──────────────────────────
@@ -25,28 +27,35 @@ pub const NodeArena = struct {
 
     // ─── Depth-3 (262144 nodes, heap-allocated ~1 GB) ─────────────────────────
     d3_pages:  []t.NodePage,  // len = 262144
-    d3_exists: [4096]u64,     // bit (w*64+b) set ↔ d3_pages[w*64+b] is live
+    d3_exists: []u64,         // len = 4096; bit (w*64+b) set ↔ d3_pages[w*64+b] is live
 
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) !NodeArena {
+        const d1_pages = try allocator.alloc(t.NodePage, 64);
+        errdefer allocator.free(d1_pages);
         const d2_pages = try allocator.alloc(t.NodePage, 4096);
         errdefer allocator.free(d2_pages);
         const d3_pages = try allocator.alloc(t.NodePage, 262144);
+        errdefer allocator.free(d3_pages);
+        const d3_exists = try allocator.alloc(u64, 4096);
+        @memset(d3_exists, 0);
         return .{
-            .d1_pages  = undefined,   // only accessed when d1_exists bit is set
+            .d1_pages  = d1_pages,    // contents only accessed when d1_exists bit is set
             .d1_exists = 0,
             .d2_pages  = d2_pages,
             .d2_exists = [_]u64{0} ** 64,
             .d3_pages  = d3_pages,
-            .d3_exists = [_]u64{0} ** 4096,
+            .d3_exists = d3_exists,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *NodeArena) void {
+        self.allocator.free(self.d1_pages);
         self.allocator.free(self.d2_pages);
         self.allocator.free(self.d3_pages);
+        self.allocator.free(self.d3_exists);
     }
 
     pub fn exists(self: *const NodeArena, depth: u32, prefix: t.PrefixData) bool {

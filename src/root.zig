@@ -292,11 +292,12 @@ pub const PrefixDB = struct {
     d2_dirty: [64]u64,
     deep_dirty: std.AutoHashMap(NodeCoord, void),
     /// Commitment-dirty bitmaps for d3 (same role as d1_dirty/d2_dirty).
-    d3_dirty: [4096]u64,
+    /// Heap-allocated (len = 4096) to keep PrefixDB small by value.
+    d3_dirty: []u64,
     /// Flush-dirty bitmaps: set on every write; cleared when the node is written to disk.
     d1_dirty_flush: u64,
     d2_dirty_flush: [64]u64,
-    d3_dirty_flush: [4096]u64,
+    d3_dirty_flush: []u64,   // len = 4096, heap-allocated
     /// Last disk-persisted NodePageId for each d1/d2/d3 prefix (for manifest routing entries).
     d1_node_ids: [64]?NodePageId,
     d2_node_ids: []?NodePageId,   // len = 4096, heap-allocated
@@ -340,6 +341,12 @@ pub const PrefixDB = struct {
         const d3_node_ids = try allocator.alloc(?NodePageId, 262144);
         errdefer allocator.free(d3_node_ids);
         @memset(d3_node_ids, null);
+        const d3_dirty = try allocator.alloc(u64, 4096);
+        errdefer allocator.free(d3_dirty);
+        @memset(d3_dirty, 0);
+        const d3_dirty_flush = try allocator.alloc(u64, 4096);
+        errdefer allocator.free(d3_dirty_flush);
+        @memset(d3_dirty_flush, 0);
         var routing = RoutingTable.init(allocator);
         errdefer routing.deinit();
         return .{
@@ -350,11 +357,11 @@ pub const PrefixDB = struct {
             .compaction_queue = std.ArrayList(NodeCoord).empty,
             .d1_dirty = 0,
             .d2_dirty = [_]u64{0} ** 64,
-            .d3_dirty = [_]u64{0} ** 4096,
+            .d3_dirty = d3_dirty,
             .deep_dirty = std.AutoHashMap(NodeCoord, void).init(allocator),
             .d1_dirty_flush = 0,
             .d2_dirty_flush = [_]u64{0} ** 64,
-            .d3_dirty_flush = [_]u64{0} ** 4096,
+            .d3_dirty_flush = d3_dirty_flush,
             .d1_node_ids = [_]?NodePageId{null} ** 64,
             .d2_node_ids = d2_node_ids,
             .d3_node_ids = d3_node_ids,
@@ -407,9 +414,17 @@ pub const PrefixDB = struct {
         var routing = RoutingTable.init(allocator);
         errdefer routing.deinit();
         const d2_node_ids = try allocator.alloc(?NodePageId, 4096);
+        errdefer allocator.free(d2_node_ids);
         @memset(d2_node_ids, null);
         const d3_node_ids = try allocator.alloc(?NodePageId, 262144);
+        errdefer allocator.free(d3_node_ids);
         @memset(d3_node_ids, null);
+        const d3_dirty = try allocator.alloc(u64, 4096);
+        errdefer allocator.free(d3_dirty);
+        @memset(d3_dirty, 0);
+        const d3_dirty_flush = try allocator.alloc(u64, 4096);
+        errdefer allocator.free(d3_dirty_flush);
+        @memset(d3_dirty_flush, 0);
         var d1_node_ids = [_]?NodePageId{null} ** 64;
         var max_depth_used: u32 = 2;
         for (manifest.routes) |r| {
@@ -447,11 +462,11 @@ pub const PrefixDB = struct {
             .compaction_queue = std.ArrayList(NodeCoord).empty,
             .d1_dirty = 0,
             .d2_dirty = [_]u64{0} ** 64,
-            .d3_dirty = [_]u64{0} ** 4096,
+            .d3_dirty = d3_dirty,
             .deep_dirty = std.AutoHashMap(NodeCoord, void).init(allocator),
             .d1_dirty_flush = 0,
             .d2_dirty_flush = [_]u64{0} ** 64,
-            .d3_dirty_flush = [_]u64{0} ** 4096,
+            .d3_dirty_flush = d3_dirty_flush,
             .d1_node_ids = d1_node_ids,
             .d2_node_ids = d2_node_ids,
             .d3_node_ids = d3_node_ids,
@@ -569,7 +584,7 @@ pub const PrefixDB = struct {
         }
 
         // d3 (up to 262144 nodes)
-        for (&self.d3_dirty_flush, 0..) |*word, wi| {
+        for (self.d3_dirty_flush, 0..) |*word, wi| {
             var w = word.*;
             while (w != 0 and rem > 0) : (rem -= 1) {
                 const bit: u32 = @ctz(w);
@@ -740,6 +755,8 @@ pub const PrefixDB = struct {
         self.kv_map.deinit();
         self.allocator.free(self.d2_node_ids);
         self.allocator.free(self.d3_node_ids);
+        self.allocator.free(self.d3_dirty);
+        self.allocator.free(self.d3_dirty_flush);
     }
 
     fn markDirty(self: *PrefixDB, depth: u32, prefix: PrefixData) void {
@@ -1079,7 +1096,7 @@ pub const PrefixDB = struct {
                 }
             }
             // depth 3: 4096 × 64-bit words → 262144 bits
-            for (&self.d3_dirty, 0..) |*word, wi| {
+            for (self.d3_dirty, 0..) |*word, wi| {
                 var w = word.*;
                 word.* = 0;
                 while (w != 0) : (w &= w - 1) {
