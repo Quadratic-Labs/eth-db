@@ -12,6 +12,10 @@ const options = @import("options");
 pub const merkle = @import("merkle.zig");
 pub const page_store = @import("page_store.zig");
 const cache_mod = @import("cache.zig");
+pub const node_arena_mod = @import("node_arena.zig");
+pub const NodeArena = node_arena_mod.NodeArena;
+const wal_mod = @import("wal.zig");
+const kv_map_mod = @import("kv_map.zig");
 
 // ─── Re-export shared types from types.zig ─────────────────────────────────────
 const t = @import("types.zig");
@@ -22,7 +26,6 @@ pub const PAGE_ENTRIES = t.PAGE_ENTRIES;
 pub const CHILD_COUNT = t.CHILD_COUNT;
 pub const S_MAX = t.S_MAX;
 pub const A_MAX = t.A_MAX;
-pub const MAX_DEPTH = t.MAX_DEPTH;
 pub const MERGE_THRESHOLD = t.MERGE_THRESHOLD;
 pub const T_OPP = t.T_OPP;
 pub const Key = t.Key;
@@ -44,6 +47,7 @@ pub const DbStats = if (options.enable_metrics) struct {
     read_ops: u64 = 0,
     write_ops: u64 = 0,
     l0_hits: u64 = 0,
+    kv_map_hits: u64 = 0,
     read_sst_loads: u64 = 0,
     read_node_loads: u64 = 0,
     append_filter_probes: u64 = 0,
@@ -73,32 +77,32 @@ pub const HeapStats = if (options.enable_metrics) struct {
 } else struct {};
 
 // ─── Routing table (§4.2.1) ───────────────────────────────────────────────────
-
-pub const RoutingMap = std.AutoHashMap(PrefixData, NodePageId);
+//
+// Depths 1 and 2 are stored in NodeArena (flat arrays, always in memory).
+// Depths 3+ are stored in a flat AutoHashMap(NodeCoord, NodePageId) with no
+// upper-depth limit — the tree can grow as deep as the key distribution demands.
 
 pub const RoutingTable = struct {
-    maps: [MAX_DEPTH]RoutingMap,
+    deep: std.AutoHashMap(NodeCoord, NodePageId),
 
     pub fn init(allocator: std.mem.Allocator) RoutingTable {
-        var rt: RoutingTable = undefined;
-        for (&rt.maps) |*m| m.* = RoutingMap.init(allocator);
-        return rt;
+        return .{ .deep = std.AutoHashMap(NodeCoord, NodePageId).init(allocator) };
     }
 
     pub fn deinit(self: *RoutingTable) void {
-        for (&self.maps) |*m| m.deinit();
+        self.deep.deinit();
     }
 
     pub fn get(self: *const RoutingTable, depth: u32, prefix: PrefixData) ?NodePageId {
-        return self.maps[depth - 1].get(prefix);
+        return self.deep.get(.{ .depth = depth, .prefix = prefix });
     }
 
     pub fn put(self: *RoutingTable, depth: u32, prefix: PrefixData, id: NodePageId) !void {
-        try self.maps[depth - 1].put(prefix, id);
+        try self.deep.put(.{ .depth = depth, .prefix = prefix }, id);
     }
 
     pub fn remove(self: *RoutingTable, depth: u32, prefix: PrefixData) bool {
-        return self.maps[depth - 1].remove(prefix);
+        return self.deep.remove(.{ .depth = depth, .prefix = prefix });
     }
 };
 
@@ -131,8 +135,8 @@ pub const L0Buffer = struct {
 
 // ─── Cache configuration (§4.3) ───────────────────────────────────────────────
 
-pub const DEFAULT_NODE_CACHE_CAP: u32 = 16384;
-pub const DEFAULT_SST_CACHE_CAP: u32 = 4096;
+pub const DEFAULT_NODE_CACHE_CAP: u32 = 262_144;
+pub const DEFAULT_SST_CACHE_CAP: u32 = 262_144;
 
 /// Controls the size of the two configurable caches for depths ≥ 3.
 pub const CacheConfig = struct {
@@ -197,6 +201,7 @@ pub const Heap = struct {
     }
 
     /// Write a node page.  Refuse without a disk store if the cache would need to evict.
+    /// Write-back: the page reaches disk when the LRU evicts it via nodeEvictCallback.
     pub fn writeNodePage(self: *Heap, depth: u32, page: NodePage) !NodePageId {
         _ = depth;
         if (self.node_cache.len >= self.node_cache.cap and self.node_store == null) {
@@ -204,27 +209,17 @@ pub const Heap = struct {
         }
         const id = self.next_node_id;
         self.next_node_id += 1;
-        // Write-through: persist before inserting so an evicted entry is recoverable.
-        if (self.node_store) |*store| {
-            try store.write(id, &page);
-            if (comptime options.enable_metrics) self.heap_stats.disk_node_writes += 1;
-        }
         try self.node_cache.put(id, page);
         return id;
     }
 
-    /// Write an SST page (write-through to disk when a store is configured).
-    /// Without a disk store the cache acts as a bounded pool; SstCacheFull is
-    /// returned rather than silently evicting data that cannot be recovered.
+    /// Write an SST page.  Without a disk store the cache acts as a bounded pool.
+    /// Write-back: the page reaches disk when the LRU evicts it via sstLruEvictCallback.
     pub fn writeSstPage(self: *Heap, page: SstPage) !PayloadSlotId {
         if (self.sst_store == null and self.sst_cache.len >= self.sst_cache.cap)
             return error.SstCacheFull;
         const id = self.next_sst_id;
         self.next_sst_id += 1;
-        if (self.sst_store) |*store| {
-            try store.write(id, &page);
-            if (comptime options.enable_metrics) self.heap_stats.disk_sst_writes += 1;
-        }
         try self.sst_cache.put(id, page);
         return id;
     }
@@ -275,6 +270,9 @@ pub const Heap = struct {
     }
 };
 
+/// How many commitBlock calls trigger an automatic flush to disk.
+const FLUSH_INTERVAL: u32 = 64;
+
 // ─── PrefixDB top-level engine (§1) ───────────────────────────────────────────
 
 /// Identifies a node (depth, prefix) for the compaction queue.
@@ -285,11 +283,36 @@ pub const NodeCoord = struct {
 
 pub const PrefixDB = struct {
     l0: L0Buffer,
+    arena: NodeArena,
     routing: RoutingTable,
     heap: Heap,
     compaction_queue: std.ArrayList(NodeCoord),
-    /// Nodes whose SST data changed since the last commitBlock call.
-    dirty_nodes: std.AutoHashMap(NodeCoord, void),
+    /// Commitment-dirty bitmaps: set when SST data changes; cleared by commitBlock.
+    d1_dirty: u64,
+    d2_dirty: [64]u64,
+    deep_dirty: std.AutoHashMap(NodeCoord, void),
+    /// Commitment-dirty bitmaps for d3 (same role as d1_dirty/d2_dirty).
+    d3_dirty: [4096]u64,
+    /// Flush-dirty bitmaps: set on every write; cleared when the node is written to disk.
+    d1_dirty_flush: u64,
+    d2_dirty_flush: [64]u64,
+    d3_dirty_flush: [4096]u64,
+    /// Last disk-persisted NodePageId for each d1/d2/d3 prefix (for manifest routing entries).
+    d1_node_ids: [64]?NodePageId,
+    d2_node_ids: []?NodePageId,   // len = 4096, heap-allocated
+    d3_node_ids: []?NodePageId,   // len = 262144, heap-allocated
+    /// Deepest depth at which any node currently exists. Always ≥ 2 (d1/d2 always present).
+    max_depth_used: u32 = 2,
+    /// Disk store for self-flushing; null for in-memory-only databases.
+    store: ?page_store.DiskStore = null,
+    /// Write-ahead log; non-null when a disk store is configured.
+    wal: ?wal_mod.Wal = null,
+    /// Block number for WAL entry grouping; incremented on each commitBlock.
+    current_block_num: u32 = 0,
+    /// Committed blocks since last flush; triggers flush at FLUSH_INTERVAL.
+    flush_counter: u32 = 0,
+    /// O(1) cache for recently-written keys; checked between L0 and SST walk.
+    kv_map: kv_map_mod.KvMap,
     allocator: std.mem.Allocator,
     stats: DbStats = .{},
 
@@ -309,13 +332,35 @@ pub const PrefixDB = struct {
     ) !PrefixDB {
         var heap = try Heap.init(allocator, config, store);
         errdefer heap.deinit();
+        var arena = try NodeArena.init(allocator);
+        errdefer arena.deinit();
+        const d2_node_ids = try allocator.alloc(?NodePageId, 4096);
+        errdefer allocator.free(d2_node_ids);
+        @memset(d2_node_ids, null);
+        const d3_node_ids = try allocator.alloc(?NodePageId, 262144);
+        errdefer allocator.free(d3_node_ids);
+        @memset(d3_node_ids, null);
+        var routing = RoutingTable.init(allocator);
+        errdefer routing.deinit();
         return .{
             .l0 = L0Buffer.init(allocator),
-            .routing = RoutingTable.init(allocator),
+            .arena = arena,
+            .routing = routing,
             .heap = heap,
             .compaction_queue = std.ArrayList(NodeCoord).empty,
-            .dirty_nodes = std.AutoHashMap(NodeCoord, void).init(allocator),
+            .d1_dirty = 0,
+            .d2_dirty = [_]u64{0} ** 64,
+            .d3_dirty = [_]u64{0} ** 4096,
+            .deep_dirty = std.AutoHashMap(NodeCoord, void).init(allocator),
+            .d1_dirty_flush = 0,
+            .d2_dirty_flush = [_]u64{0} ** 64,
+            .d3_dirty_flush = [_]u64{0} ** 4096,
+            .d1_node_ids = [_]?NodePageId{null} ** 64,
+            .d2_node_ids = d2_node_ids,
+            .d3_node_ids = d3_node_ids,
+            .kv_map = kv_map_mod.KvMap.init(allocator),
             .allocator = allocator,
+            // WAL and store are attached by openWithConfig for disk-backed databases.
         };
     }
 
@@ -330,8 +375,17 @@ pub const PrefixDB = struct {
         // Try to read an existing manifest.
         var manifest = page_store.readManifest(store, allocator) catch |err| switch (err) {
             error.FileNotFound => {
-                // Fresh database — no recovery needed.
-                return initWithConfig(allocator, config, store);
+                // No manifest: either a truly fresh database or the first session
+                // crashed before its initial flush.  Check for a WAL either way.
+                var db = try initWithConfig(allocator, config, store);
+                errdefer db.deinit();
+                const replayed = try replayWal(store, &db, allocator);
+                if (replayed) try db.flush(store);
+                db.flush_counter = 0;
+                db.current_block_num = 0;
+                db.store = store;
+                db.wal = try wal_mod.Wal.create(store);
+                return db;
             },
             else => return err,
         };
@@ -347,11 +401,35 @@ pub const PrefixDB = struct {
         heap.next_node_id = manifest.header.next_node_id;
         heap.next_sst_id  = manifest.header.next_sst_id;
 
-        // Restore routing table.
+        // Restore d1/d2 nodes into arena, d3+ into routing table.
+        var arena = try NodeArena.init(allocator);
+        errdefer arena.deinit();
         var routing = RoutingTable.init(allocator);
         errdefer routing.deinit();
+        const d2_node_ids = try allocator.alloc(?NodePageId, 4096);
+        @memset(d2_node_ids, null);
+        const d3_node_ids = try allocator.alloc(?NodePageId, 262144);
+        @memset(d3_node_ids, null);
+        var d1_node_ids = [_]?NodePageId{null} ** 64;
+        var max_depth_used: u32 = 2;
         for (manifest.routes) |r| {
-            try routing.put(r.depth, r.prefix, r.node_id);
+            if (r.depth <= 2) {
+                const page = try heap.node_store.?.read(r.node_id);
+                arena.put(r.depth, r.prefix, page);
+                if (r.depth == 1) {
+                    d1_node_ids[@intCast(r.prefix)] = r.node_id;
+                } else {
+                    d2_node_ids[@intCast(r.prefix)] = r.node_id;
+                }
+            } else if (r.depth == 3) {
+                const page = try heap.node_store.?.read(r.node_id);
+                arena.put(3, r.prefix, page);
+                d3_node_ids[@intCast(r.prefix)] = r.node_id;
+                if (max_depth_used < 3) max_depth_used = 3;
+            } else {
+                try routing.put(r.depth, r.prefix, r.node_id);
+                if (r.depth > max_depth_used) max_depth_used = r.depth;
+            }
         }
 
         // Restore L0 buffer.
@@ -361,23 +439,200 @@ pub const PrefixDB = struct {
             try l0.append(entry);
         }
 
-        return .{
+        var db = PrefixDB{
             .l0 = l0,
+            .arena = arena,
             .routing = routing,
             .heap = heap,
             .compaction_queue = std.ArrayList(NodeCoord).empty,
-            .dirty_nodes = std.AutoHashMap(NodeCoord, void).init(allocator),
+            .d1_dirty = 0,
+            .d2_dirty = [_]u64{0} ** 64,
+            .d3_dirty = [_]u64{0} ** 4096,
+            .deep_dirty = std.AutoHashMap(NodeCoord, void).init(allocator),
+            .d1_dirty_flush = 0,
+            .d2_dirty_flush = [_]u64{0} ** 64,
+            .d3_dirty_flush = [_]u64{0} ** 4096,
+            .d1_node_ids = d1_node_ids,
+            .d2_node_ids = d2_node_ids,
+            .d3_node_ids = d3_node_ids,
+            .max_depth_used = max_depth_used,
+            .kv_map = kv_map_mod.KvMap.init(allocator),
             .allocator = allocator,
+            // store and wal remain null during replay so write/commitBlock skip WAL
         };
+
+        // Replay WAL entries accumulated after the last checkpoint, then
+        // write a consistent manifest so the next open needs no replay.
+        const replayed = try replayWal(store, &db, allocator);
+        if (replayed) try db.flush(store);
+
+        // Attach persistent state for normal (post-recovery) operation.
+        db.flush_counter = 0;
+        db.current_block_num = 0;
+        db.store = store;
+        db.wal = try wal_mod.Wal.create(store);
+        return db;
+    }
+
+    /// Replay WAL entries recorded after the last CHECKPOINT into `db`.
+    /// `db` must have store=null and wal=null (called during recovery before
+    /// the WAL is attached).  Returns true if any block was replayed.
+    fn replayWal(store: page_store.DiskStore, db: *PrefixDB, allocator: std.mem.Allocator) !bool {
+        const entries = try wal_mod.readAllEntries(store, allocator);
+        defer allocator.free(entries);
+        if (entries.len == 0) return false;
+
+        // Locate the last CHECKPOINT; replay everything after it.
+        var replay_start: usize = 0;
+        for (entries, 0..) |e, i| {
+            if (@as(wal_mod.WalEntryType, @enumFromInt(e.entry_type)) == .checkpoint) {
+                replay_start = i + 1;
+            }
+        }
+        if (replay_start >= entries.len) return false;
+
+        // Accumulate kv_writes per block_num; commit when block_commit is seen.
+        var block_writes = std.AutoHashMap(u32, std.ArrayList(KvEntry)).init(allocator);
+        defer {
+            var vit = block_writes.valueIterator();
+            while (vit.next()) |v| v.deinit(allocator);
+            block_writes.deinit();
+        }
+
+        var replayed = false;
+        for (entries[replay_start..]) |entry| {
+            switch (@as(wal_mod.WalEntryType, @enumFromInt(entry.entry_type))) {
+                .kv_write => {
+                    const gop = try block_writes.getOrPut(entry.block_num);
+                    if (!gop.found_existing) gop.value_ptr.* = .empty;
+                    try gop.value_ptr.append(allocator, .{
+                        .key = entry.data[0..32].*,
+                        .value = entry.data[32..64].*,
+                    });
+                },
+                .block_commit => {
+                    if (block_writes.fetchRemove(entry.block_num)) |kv| {
+                        var writes = kv.value;
+                        defer writes.deinit(allocator);
+                        for (writes.items) |pair| try db.write(pair.key, pair.value);
+                        _ = try db.commitBlock();
+                        replayed = true;
+                    }
+                },
+                .checkpoint => {},
+                _ => {},
+            }
+        }
+        return replayed;
+    }
+
+    /// Nodes flushed per commitBlock call to amortise the 64-block flush spike.
+    /// At most 64 + 4096 + 262144 = 266304 arena nodes can be dirty over 64 blocks;
+    /// 4224 per block gives 2× headroom (4224 × 64 = 270336).
+    const NODE_FLUSH_BUDGET: u32 = 4_224;
+
+    /// Write at most `budget` dirty arena nodes to disk, d1 first, then d2, then d3.
+    /// Updates *_node_ids and clears the corresponding *_dirty_flush bits as it goes.
+    /// A no-op when no disk store is attached.
+    fn flushDirtyNodes(self: *PrefixDB, budget: u32) !void {
+        const ns = if (self.heap.node_store) |*s| s else return;
+        var rem = budget;
+
+        // d1 (up to 64 nodes)
+        var w1 = self.d1_dirty_flush;
+        while (w1 != 0 and rem > 0) : (rem -= 1) {
+            const bit: u32 = @ctz(w1);
+            const new_id = self.heap.next_node_id;
+            self.heap.next_node_id += 1;
+            try ns.write(new_id, &self.arena.d1_pages[bit]);
+            if (comptime options.enable_metrics) self.heap.heap_stats.disk_node_writes += 1;
+            self.d1_node_ids[bit] = new_id;
+            w1 &= w1 - 1;
+        }
+        self.d1_dirty_flush = w1;
+
+        // d2 (up to 4096 nodes)
+        for (&self.d2_dirty_flush, 0..) |*word, wi| {
+            var w = word.*;
+            while (w != 0 and rem > 0) : (rem -= 1) {
+                const bit: u32 = @ctz(w);
+                const prefix: u32 = @intCast(wi * 64 + bit);
+                const new_id = self.heap.next_node_id;
+                self.heap.next_node_id += 1;
+                try ns.write(new_id, &self.arena.d2_pages[prefix]);
+                if (comptime options.enable_metrics) self.heap.heap_stats.disk_node_writes += 1;
+                self.d2_node_ids[prefix] = new_id;
+                w &= w - 1;
+            }
+            word.* = w;
+            if (rem == 0) return;
+        }
+
+        // d3 (up to 262144 nodes)
+        for (&self.d3_dirty_flush, 0..) |*word, wi| {
+            var w = word.*;
+            while (w != 0 and rem > 0) : (rem -= 1) {
+                const bit: u32 = @ctz(w);
+                const prefix: u32 = @intCast(wi * 64 + bit);
+                const new_id = self.heap.next_node_id;
+                self.heap.next_node_id += 1;
+                try ns.write(new_id, &self.arena.d3_pages[prefix]);
+                if (comptime options.enable_metrics) self.heap.heap_stats.disk_node_writes += 1;
+                self.d3_node_ids[prefix] = new_id;
+                w &= w - 1;
+            }
+            word.* = w;
+            if (rem == 0) return;
+        }
     }
 
     /// Persist the current state to `store`.
-    /// Writes all live pin_nodes to node_store, then writes manifest.bin.
+    /// Writes all live arena nodes to node_store, then writes manifest.bin.
     /// Must be called before process exit to preserve the database.
     pub fn flush(self: *PrefixDB, store: page_store.DiskStore) !void {
-        // Count routing entries.
+        // Drain all remaining dirty arena nodes (safety net; incremental flushing
+        // in commitBlock should have already written most of them).
+        try self.flushDirtyNodes(std.math.maxInt(u32));
+
+        // Ensure all d4+ nodes and SST pages referenced by the manifest are on disk.
+        // With write-back, they may still be in cache but not yet persisted.
+        if (self.heap.node_store != null) {
+            var it = self.routing.deep.iterator();
+            while (it.next()) |kv| {
+                const node_id = kv.value_ptr.*;
+                if (self.heap.node_cache.get(node_id)) |page| {
+                    try self.heap.node_store.?.write(node_id, &page);
+                    if (comptime options.enable_metrics) self.heap.heap_stats.disk_node_writes += 1;
+                }
+            }
+        }
+        if (self.heap.sst_store != null) {
+            const SstFlushCtx = struct { db: *PrefixDB };
+            var sst_ctx = SstFlushCtx{ .db = self };
+            try self.heap.sst_cache.forEachLive(@ptrCast(&sst_ctx), struct {
+                fn f(raw: *anyopaque, id: u32, page: *const SstPage) !void {
+                    const c: *SstFlushCtx = @ptrCast(@alignCast(raw));
+                    try c.db.heap.sst_store.?.write(id, page);
+                    if (comptime options.enable_metrics) c.db.heap.heap_stats.disk_sst_writes += 1;
+                }
+            }.f);
+        }
+
+        // Count routing entries across all tiers.
         var route_count: u32 = 0;
-        for (&self.routing.maps) |*m| route_count += @as(u32, @intCast(m.count()));
+        {
+            var w = self.arena.d1_exists;
+            while (w != 0) : (w &= w - 1) route_count += 1;
+        }
+        for (self.arena.d2_exists) |word| {
+            var w = word;
+            while (w != 0) : (w &= w - 1) route_count += 1;
+        }
+        for (self.arena.d3_exists) |word| {
+            var w = word;
+            while (w != 0) : (w &= w - 1) route_count += 1;
+        }
+        route_count += @as(u32, @intCast(self.routing.deep.count()));
 
         // Count L0 entries.
         const l0_count: u32 = @intCast(self.l0.entries.items.len);
@@ -394,12 +649,45 @@ pub const PrefixDB = struct {
         // Build routing entries slice.
         var routes = try std.ArrayList(page_store.ManifestRouteEntry).initCapacity(self.allocator, route_count);
         defer routes.deinit(self.allocator);
-        for (&self.routing.maps, 0..) |*m, di| {
-            var it = m.iterator();
+        // d1 live nodes (only those with a persisted ID)
+        {
+            var w = self.arena.d1_exists;
+            while (w != 0) : (w &= w - 1) {
+                const prefix: u32 = @ctz(w);
+                if (self.d1_node_ids[prefix]) |id| {
+                    routes.appendAssumeCapacity(.{ .depth = 1, .prefix = prefix, .node_id = id });
+                }
+            }
+        }
+        // d2 live nodes
+        for (self.arena.d2_exists, 0..) |word, wi| {
+            var w = word;
+            while (w != 0) : (w &= w - 1) {
+                const bit: u32 = @ctz(w);
+                const prefix: u32 = @intCast(wi * 64 + bit);
+                if (self.d2_node_ids[prefix]) |id| {
+                    routes.appendAssumeCapacity(.{ .depth = 2, .prefix = prefix, .node_id = id });
+                }
+            }
+        }
+        // d3 live nodes (arena)
+        for (self.arena.d3_exists, 0..) |word, wi| {
+            var w = word;
+            while (w != 0) : (w &= w - 1) {
+                const bit: u32 = @ctz(w);
+                const prefix: u32 = @intCast(wi * 64 + bit);
+                if (self.d3_node_ids[prefix]) |id| {
+                    routes.appendAssumeCapacity(.{ .depth = 3, .prefix = prefix, .node_id = id });
+                }
+            }
+        }
+        // deep nodes (depths 4+)
+        {
+            var it = self.routing.deep.iterator();
             while (it.next()) |kv| {
                 routes.appendAssumeCapacity(.{
-                    .depth   = @intCast(di + 1),
-                    .prefix  = kv.key_ptr.*,
+                    .depth   = kv.key_ptr.depth,
+                    .prefix  = kv.key_ptr.prefix,
                     .node_id = kv.value_ptr.*,
                 });
             }
@@ -411,18 +699,96 @@ pub const PrefixDB = struct {
             routes.items,
             self.l0.entries.items,
         );
+        if (self.wal) |*w| try w.append(wal_mod.WalEntry.checkpoint());
+    }
+
+    /// Wire write-back callbacks for both node and SST caches.
+    /// Must be called after the PrefixDB is at its final memory address.
+    pub fn enableWriteBack(self: *PrefixDB) void {
+        const ctx: *anyopaque = @ptrCast(self);
+        self.heap.node_cache.evict_ctx    = ctx;
+        self.heap.node_cache.lru_evict_fn = &nodeEvictCallback;
+        self.heap.sst_cache.evict_ctx     = ctx;
+        self.heap.sst_cache.lru_evict_fn  = &sstLruEvictCallback;
+        self.heap.sst_cache.remove_fn     = &sstRemoveCallback;
+    }
+
+    fn nodeEvictCallback(ctx: *anyopaque, id: u32, page: *const NodePage) void {
+        const db: *PrefixDB = @ptrCast(@alignCast(ctx));
+        if (db.heap.node_store) |*ns| ns.write(id, page) catch {};
+    }
+
+    fn sstLruEvictCallback(ctx: *anyopaque, id: u32, page: *const SstPage) void {
+        const db: *PrefixDB = @ptrCast(@alignCast(ctx));
+        if (db.heap.sst_store) |*ss| ss.write(id, page) catch {};
+        for (&page.entries) |*e| db.kv_map.removeIfFromSst(e.key, id);
+    }
+
+    fn sstRemoveCallback(ctx: *anyopaque, id: u32, page: *const SstPage) void {
+        const db: *PrefixDB = @ptrCast(@alignCast(ctx));
+        for (&page.entries) |*e| db.kv_map.removeIfFromSst(e.key, id);
     }
 
     pub fn deinit(self: *PrefixDB) void {
+        if (self.wal) |*w| w.close();
         self.l0.deinit();
+        self.arena.deinit();
         self.routing.deinit();
         self.heap.deinit();
         self.compaction_queue.deinit(self.allocator);
-        self.dirty_nodes.deinit();
+        self.deep_dirty.deinit();
+        self.kv_map.deinit();
+        self.allocator.free(self.d2_node_ids);
+        self.allocator.free(self.d3_node_ids);
     }
 
     fn markDirty(self: *PrefixDB, depth: u32, prefix: PrefixData) void {
-        self.dirty_nodes.put(.{ .depth = depth, .prefix = prefix }, {}) catch {};
+        switch (depth) {
+            1 => self.d1_dirty |= @as(u64, 1) << @as(u6, @intCast(prefix)),
+            2 => self.d2_dirty[@intCast(prefix >> 6)] |= @as(u64, 1) << @as(u6, @intCast(prefix & 63)),
+            3 => self.d3_dirty[@intCast(prefix >> 6)] |= @as(u64, 1) << @as(u6, @intCast(prefix & 63)),
+            else => self.deep_dirty.put(.{ .depth = depth, .prefix = prefix }, {}) catch {},
+        }
+    }
+
+    // ─── Node access helpers (dispatch arena for d1/d2, heap for d3-d5) ───────
+
+    fn nodeGet(self: *PrefixDB, depth: u32, prefix: PrefixData) !?NodePage {
+        if (depth <= 3) {
+            const ptr = self.arena.get(depth, prefix) orelse return null;
+            return ptr.*;
+        }
+        const id = self.routing.get(depth, prefix) orelse return null;
+        return try self.heap.getNodePage(id);
+    }
+
+    fn nodePut(self: *PrefixDB, depth: u32, prefix: PrefixData, node: NodePage) !void {
+        if (depth <= 3) {
+            self.arena.put(depth, prefix, node);
+            switch (depth) {
+                1 => self.d1_dirty_flush |= @as(u64, 1) << @as(u6, @intCast(prefix)),
+                2 => self.d2_dirty_flush[@intCast(prefix >> 6)] |= @as(u64, 1) << @as(u6, @intCast(prefix & 63)),
+                3 => self.d3_dirty_flush[@intCast(prefix >> 6)] |= @as(u64, 1) << @as(u6, @intCast(prefix & 63)),
+                else => unreachable,
+            }
+            if (depth > self.max_depth_used) self.max_depth_used = depth;
+            return;
+        }
+        if (depth > self.max_depth_used) self.max_depth_used = depth;
+        const old_id = self.routing.get(depth, prefix);
+        const new_id = try self.heap.writeNodePage(depth, node);
+        try self.routing.put(depth, prefix, new_id);
+        if (old_id) |id| self.heap.freeNodePage(id);
+    }
+
+    fn nodeRemove(self: *PrefixDB, depth: u32, prefix: PrefixData) void {
+        if (depth <= 3) {
+            self.arena.remove(depth, prefix);
+            return;
+        }
+        const id = self.routing.get(depth, prefix) orelse return;
+        _ = self.routing.remove(depth, prefix);
+        self.heap.freeNodePage(id);
     }
 
     // ─── Write (§5.2) ─────────────────────────────────────────────────────────
@@ -430,7 +796,9 @@ pub const PrefixDB = struct {
     /// Append (K, V) to L0; flush to L1 when the prefix group reaches PAGE_ENTRIES.
     pub fn write(self: *PrefixDB, key: Key, value: Value) !void {
         if (comptime options.enable_metrics) self.stats.write_ops += 1;
+        if (self.wal) |*w| try w.append(wal_mod.WalEntry.kvWrite(self.current_block_num, key, value));
         try self.l0.append(.{ .key = key, .value = value });
+        self.kv_map.put(key, value);
         const p = prefixData(&key, 1);
         if (self.l0.prefixCount(@intCast(p)) >= PAGE_ENTRIES) {
             try self.flushL0Prefix(p);
@@ -453,12 +821,17 @@ pub const PrefixDB = struct {
             }
         }
 
-        // Steps 2–9: search levels depth 1..MAX_DEPTH; shallowest hit wins.
-        for (1..MAX_DEPTH + 1) |d_usize| {
+        // Step 2: kv_map — O(1) lookup for recently-written keys.
+        if (self.kv_map.get(key)) |val| {
+            if (comptime options.enable_metrics) self.stats.kv_map_hits += 1;
+            return val;
+        }
+
+        // Steps 3–N: search levels depth 1..max_depth_used; shallowest hit wins.
+        for (1..self.max_depth_used + 1) |d_usize| {
             const d: u32 = @intCast(d_usize);
             const p = prefixData(&key, d);
-            const node_id = self.routing.get(d, p) orelse continue;
-            const node = (try self.heap.getNodePage(node_id)) orelse continue;
+            const node = (try self.nodeGet(d, p)) orelse continue;
             if (comptime options.enable_metrics) self.stats.read_node_loads += 1;
 
             const q = prefix32(&key, d);
@@ -479,6 +852,7 @@ pub const PrefixDB = struct {
                         var sst = sst_raw;
                         sst.count = node.append_page_counts[j];
                         append_result = binarySearchSst(&sst, &key);
+                        if (append_result) |val| self.kv_map.putFromSst(key, val, node.append_slot_ids[j]);
                     }
                 }
             }
@@ -499,6 +873,7 @@ pub const PrefixDB = struct {
                         var sst = sst_raw;
                         sst.count = node.sorted_page_counts[pg_idx];
                         sorted_result = binarySearchSst(&sst, &key);
+                        if (sorted_result) |val| self.kv_map.putFromSst(key, val, node.sorted_slot_ids[pg_idx]);
                     }
                 }
             }
@@ -578,7 +953,7 @@ pub const PrefixDB = struct {
         try self.appendSstToNode(depth, prefix, sst_id, @intCast(chunk.len), filter);
     }
 
-    /// Attach an SST page to a node's append zone (CoW node page update).
+    /// Attach an SST page to a node's append zone.
     fn appendSstToNode(
         self: *PrefixDB,
         depth: u32,
@@ -587,12 +962,7 @@ pub const PrefixDB = struct {
         count: u8,
         filter: [PAGE_ENTRIES]u16,
     ) anyerror!void {
-        const old_id = self.routing.get(depth, prefix);
-
-        var node = std.mem.zeroes(NodePage);
-        if (old_id) |id| {
-            if (try self.heap.getNodePage(id)) |existing| node = existing;
-        }
+        var node = (try self.nodeGet(depth, prefix)) orelse std.mem.zeroes(NodePage);
 
         // Append zone full: compact inline so we always have room.
         if (node.append_count >= A_MAX) {
@@ -601,16 +971,10 @@ pub const PrefixDB = struct {
             // sorted zone before it overflows S_MAX.
             if (@as(u32, node.sorted_count) + @as(u32, node.append_count) > S_MAX) {
                 try self.upwardSplit(depth, prefix);
-                node = std.mem.zeroes(NodePage);
-                if (self.routing.get(depth, prefix)) |id| {
-                    if (try self.heap.getNodePage(id)) |split| node = split;
-                }
+                node = (try self.nodeGet(depth, prefix)) orelse std.mem.zeroes(NodePage);
             }
             try self.appendToSortedMerge(depth, prefix);
-            node = std.mem.zeroes(NodePage);
-            if (self.routing.get(depth, prefix)) |id| {
-                if (try self.heap.getNodePage(id)) |compacted| node = compacted;
-            }
+            node = (try self.nodeGet(depth, prefix)) orelse std.mem.zeroes(NodePage);
         }
 
         const ac = node.append_count;
@@ -619,9 +983,7 @@ pub const PrefixDB = struct {
         node.append_prefix16[ac] = filter;
         node.append_count += 1;
 
-        const new_id = try self.heap.writeNodePage(depth, node);
-        try self.routing.put(depth, prefix, new_id);
-        if (old_id) |id| self.heap.freeNodePage(id);
+        try self.nodePut(depth, prefix, node);
         self.markDirty(depth, prefix);
 
         if (node.append_count == A_MAX) {
@@ -696,17 +1058,48 @@ pub const PrefixDB = struct {
 
         try self.flushL0All();
 
-        // Seed worklist from dirty set and clear it for future writes.
+        // Seed worklist from dirty bitmaps (d1, d2) and deep_dirty hashmap (d3-d5).
         var worklist = std.AutoHashMap(NodeCoord, void).init(self.allocator);
         defer worklist.deinit();
         {
-            var it = self.dirty_nodes.iterator();
+            // depth 1: 64-bit bitmap, one bit per prefix
+            var w1 = self.d1_dirty;
+            self.d1_dirty = 0;
+            while (w1 != 0) : (w1 &= w1 - 1) {
+                const prefix: PrefixData = @ctz(w1);
+                try worklist.put(.{ .depth = 1, .prefix = prefix }, {});
+            }
+            // depth 2: 64 × 64-bit words → 4096 bits total
+            for (&self.d2_dirty, 0..) |*word, wi| {
+                var w = word.*;
+                word.* = 0;
+                while (w != 0) : (w &= w - 1) {
+                    const bit: u32 = @ctz(w);
+                    try worklist.put(.{ .depth = 2, .prefix = @intCast(wi * 64 + bit) }, {});
+                }
+            }
+            // depth 3: 4096 × 64-bit words → 262144 bits
+            for (&self.d3_dirty, 0..) |*word, wi| {
+                var w = word.*;
+                word.* = 0;
+                while (w != 0) : (w &= w - 1) {
+                    const bit: u32 = @ctz(w);
+                    try worklist.put(.{ .depth = 3, .prefix = @intCast(wi * 64 + bit) }, {});
+                }
+            }
+            // depths 4+: sparse hashmap
+            var it = self.deep_dirty.iterator();
             while (it.next()) |entry| try worklist.put(entry.key_ptr.*, {});
-            self.dirty_nodes.clearRetainingCapacity();
+            self.deep_dirty.clearRetainingCapacity();
         }
 
         // Process deepest nodes first so children are committed before parents.
-        var depth: u32 = MAX_DEPTH;
+        // Find the maximum depth in the worklist to start from.
+        var depth: u32 = 1;
+        {
+            var wit = worklist.iterator();
+            while (wit.next()) |e| if (e.key_ptr.depth > depth) { depth = e.key_ptr.depth; };
+        }
         while (true) {
             var at_depth = std.ArrayList(PrefixData).empty;
             defer at_depth.deinit(self.allocator);
@@ -723,8 +1116,7 @@ pub const PrefixDB = struct {
                 _ = worklist.remove(.{ .depth = depth, .prefix = prefix });
                 if (comptime options.enable_metrics) self.stats.commit_nodes_processed += 1;
 
-                const node_id = self.routing.get(depth, prefix) orelse continue;
-                const node = (try self.heap.getNodePage(node_id)) orelse continue;
+                const node = (try self.nodeGet(depth, prefix)) orelse continue;
 
                 const data_hash = try self.nodeDataHash(node);
                 const child_root = childMerkleRoot(node.child_commitments);
@@ -735,16 +1127,12 @@ pub const PrefixDB = struct {
                     const parent_prefix = prefix >> STRIDE;
                     const child_idx = prefix & (CHILD_COUNT - 1);
 
-                    if (self.routing.get(parent_depth, parent_prefix)) |parent_id| {
-                        if (try self.heap.getNodePage(parent_id)) |parent_old| {
-                            var parent = parent_old;
-                            parent.child_commitments[child_idx] = commitment;
-                            const new_pid = try self.heap.writeNodePage(parent_depth, parent);
-                            try self.routing.put(parent_depth, parent_prefix, new_pid);
-                            self.heap.freeNodePage(parent_id);
-                            // Ensure the parent is (re)processed to propagate further.
-                            try worklist.put(.{ .depth = parent_depth, .prefix = parent_prefix }, {});
-                        }
+                    if (try self.nodeGet(parent_depth, parent_prefix)) |parent_old| {
+                        var parent = parent_old;
+                        parent.child_commitments[child_idx] = commitment;
+                        try self.nodePut(parent_depth, parent_prefix, parent);
+                        // Ensure the parent is (re)processed to propagate further.
+                        try worklist.put(.{ .depth = parent_depth, .prefix = parent_prefix }, {});
                     }
                 }
             }
@@ -757,8 +1145,7 @@ pub const PrefixDB = struct {
         var root_children: [CHILD_COUNT]Hash = [_]Hash{ZERO_HASH} ** CHILD_COUNT;
         for (0..CHILD_COUNT) |p| {
             const pp: PrefixData = @intCast(p);
-            const node_id = self.routing.get(1, pp) orelse continue;
-            const node = (try self.heap.getNodePage(node_id)) orelse continue;
+            const node = (try self.nodeGet(1, pp)) orelse continue;
             const data_hash = try self.nodeDataHash(node);
             const child_root = childMerkleRoot(node.child_commitments);
             root_children[p] = merkle.pairHash(&data_hash, &child_root);
@@ -766,6 +1153,17 @@ pub const PrefixDB = struct {
         const root = childMerkleRoot(root_children);
         if (comptime options.enable_metrics) {
             self.stats.commit_block_ns += monoNs() - t0;
+        }
+        if (self.wal) |*w| try w.append(wal_mod.WalEntry.blockCommit(self.current_block_num, root));
+        self.current_block_num += 1;
+        // Incrementally drain dirty arena nodes to smooth the 64-block flush spike.
+        try self.flushDirtyNodes(NODE_FLUSH_BUDGET);
+        self.flush_counter += 1;
+        if (self.flush_counter >= FLUSH_INTERVAL) {
+            if (self.store) |s| {
+                try self.flush(s);
+                self.flush_counter = 0;
+            }
         }
         return root;
     }
@@ -776,8 +1174,7 @@ pub const PrefixDB = struct {
     pub fn runCompaction(self: *PrefixDB) !void {
         if (comptime options.enable_metrics) self.stats.compaction_calls += 1;
         while (self.compaction_queue.pop()) |coord| {
-            const node_id = self.routing.get(coord.depth, coord.prefix) orelse continue;
-            const node = (try self.heap.getNodePage(node_id)) orelse continue;
+            const node = (try self.nodeGet(coord.depth, coord.prefix)) orelse continue;
             if (coord.depth > 1 and (try self.countNodeEntries(coord.depth, coord.prefix)) < MERGE_THRESHOLD) {
                 if (comptime options.enable_metrics) self.stats.compaction_ops += 1;
                 try self.downwardMerge(coord.depth, coord.prefix);
@@ -794,8 +1191,7 @@ pub const PrefixDB = struct {
     /// Count total live KV entries across all SST pages of a node.
     /// Reads counts from node metadata — no SST page loads needed.
     fn countNodeEntries(self: *PrefixDB, depth: u32, prefix: PrefixData) !u32 {
-        const node_id = self.routing.get(depth, prefix) orelse return 0;
-        const node = (try self.heap.getNodePage(node_id)) orelse return 0;
+        const node = (try self.nodeGet(depth, prefix)) orelse return 0;
         var count: u32 = 0;
         for (node.sorted_page_counts[0..node.sorted_count]) |c| count += c;
         for (node.append_page_counts[0..node.append_count]) |c| count += c;
@@ -808,8 +1204,30 @@ pub const PrefixDB = struct {
     /// Run `compact()` first for a tighter estimate.
     pub fn estimateKeyCount(self: *PrefixDB) !u64 {
         var total: u64 = self.l0.entries.items.len;
-        for (&self.routing.maps) |*map| {
-            var it = map.iterator();
+        // d1 arena
+        {
+            var w = self.arena.d1_exists;
+            while (w != 0) : (w &= w - 1) {
+                const p: u32 = @ctz(w);
+                const node = self.arena.d1_pages[p];
+                for (node.sorted_page_counts[0..node.sorted_count]) |c| total += c;
+                for (node.append_page_counts[0..node.append_count]) |c| total += c;
+            }
+        }
+        // d2 arena
+        for (self.arena.d2_exists, 0..) |word, wi| {
+            var w = word;
+            while (w != 0) : (w &= w - 1) {
+                const bit: u32 = @ctz(w);
+                const prefix: u32 = @intCast(wi * 64 + bit);
+                const node = self.arena.d2_pages[prefix];
+                for (node.sorted_page_counts[0..node.sorted_count]) |c| total += c;
+                for (node.append_page_counts[0..node.append_count]) |c| total += c;
+            }
+        }
+        // deep nodes (depths 3+)
+        {
+            var it = self.routing.deep.iterator();
             while (it.next()) |entry| {
                 const node_id = entry.value_ptr.*;
                 const node = (try self.heap.getNodePage(node_id)) orelse continue;
@@ -823,8 +1241,7 @@ pub const PrefixDB = struct {
     /// §6.1: Merge the append zone into the sorted zone; promote homogeneous pages up.
     fn appendToSortedMerge(self: *PrefixDB, depth: u32, prefix: PrefixData) !void {
         const alloc = self.allocator;
-        const node_id = self.routing.get(depth, prefix) orelse return;
-        const old_node = (try self.heap.getNodePage(node_id)) orelse return;
+        const old_node = (try self.nodeGet(depth, prefix)) orelse return;
         if (old_node.append_count == 0) return;
 
         var all_entries = std.ArrayList(KvEntry).empty;
@@ -866,7 +1283,7 @@ pub const PrefixDB = struct {
             const end = @min(offset + PAGE_ENTRIES, survivors.items.len);
             const chunk = survivors.items[offset..end];
 
-            if (chunk.len == PAGE_ENTRIES and depth < MAX_DEPTH) {
+            if (chunk.len == PAGE_ENTRIES) {
                 const f0 = prefix16(&chunk[0].key, depth);
                 const f63 = prefix16(&chunk[PAGE_ENTRIES - 1].key, depth);
                 if (f0 >> 10 == f63 >> 10) {
@@ -896,9 +1313,7 @@ pub const PrefixDB = struct {
         @memcpy(new_node.sorted_min4[0..new_min4.items.len], new_min4.items);
         @memcpy(new_node.sorted_page_counts[0..new_counts.items.len], new_counts.items);
 
-        const new_node_id = try self.heap.writeNodePage(depth, new_node);
-        try self.routing.put(depth, prefix, new_node_id);
-        self.heap.freeNodePage(node_id);
+        try self.nodePut(depth, prefix, new_node);
         for (old_node.sorted_slot_ids[0..old_node.sorted_count]) |id| self.heap.freeSstPage(id);
         for (old_node.append_slot_ids[0..old_node.append_count]) |id| self.heap.freeSstPage(id);
         self.markDirty(depth, prefix);
@@ -931,10 +1346,8 @@ pub const PrefixDB = struct {
 
     /// §6.2: Merge all sorted pages; promote groups with ≥64 entries to L(k+1).
     fn upwardSplit(self: *PrefixDB, depth: u32, prefix: PrefixData) !void {
-        if (depth >= MAX_DEPTH) return;
         const alloc = self.allocator;
-        const node_id = self.routing.get(depth, prefix) orelse return;
-        const old_node = (try self.heap.getNodePage(node_id)) orelse return;
+        const old_node = (try self.nodeGet(depth, prefix)) orelse return;
         const child_depth = depth + 1;
 
         var all_entries = std.ArrayList(KvEntry).empty;
@@ -971,11 +1384,7 @@ pub const PrefixDB = struct {
                 while (off < group.len) {
                     const end = @min(off + PAGE_ENTRIES, group.len);
                     const chunk = group[off..end];
-                    const cur_id = self.routing.get(child_depth, cp);
-                    var cn = std.mem.zeroes(NodePage);
-                    if (cur_id) |id| {
-                        if (try self.heap.getNodePage(id)) |existing| cn = existing;
-                    }
+                    var cn = (try self.nodeGet(child_depth, cp)) orelse std.mem.zeroes(NodePage);
                     var sst = std.mem.zeroes(SstPage);
                     sst.count = @intCast(chunk.len);
                     @memcpy(sst.entries[0..chunk.len], chunk);
@@ -987,9 +1396,7 @@ pub const PrefixDB = struct {
                         cn.sorted_min4[sc] = prefix32(&chunk[0].key, child_depth);
                         cn.sorted_page_counts[sc] = sst.count;
                         cn.sorted_count += 1;
-                        const ncid = try self.heap.writeNodePage(child_depth, cn);
-                        try self.routing.put(child_depth, cp, ncid);
-                        if (cur_id) |id| self.heap.freeNodePage(id);
+                        try self.nodePut(child_depth, cp, cn);
                         self.markDirty(child_depth, cp);
                         if (cn.sorted_count >= S_MAX)
                             self.compaction_queue.append(alloc, .{ .depth = child_depth, .prefix = cp }) catch {};
@@ -1036,9 +1443,7 @@ pub const PrefixDB = struct {
             new_node.append_prefix16[ai] = old_node.append_prefix16[ai];
         }
 
-        const new_node_id = try self.heap.writeNodePage(depth, new_node);
-        try self.routing.put(depth, prefix, new_node_id);
-        self.heap.freeNodePage(node_id);
+        try self.nodePut(depth, prefix, new_node);
         for (old_node.sorted_slot_ids[0..old_node.sorted_count]) |id| self.heap.freeSstPage(id);
         self.markDirty(depth, prefix);
     }
@@ -1050,10 +1455,8 @@ pub const PrefixDB = struct {
         const parent_depth = depth - 1;
         const parent_prefix: PrefixData = prefix >> STRIDE;
 
-        const child_id = self.routing.get(depth, prefix) orelse return;
-        const old_child = (try self.heap.getNodePage(child_id)) orelse return;
-        const parent_id = self.routing.get(parent_depth, parent_prefix) orelse return;
-        const old_parent = (try self.heap.getNodePage(parent_id)) orelse return;
+        const old_child = (try self.nodeGet(depth, prefix)) orelse return;
+        const old_parent = (try self.nodeGet(parent_depth, parent_prefix)) orelse return;
 
         var merged = std.AutoHashMap(Key, Value).init(alloc);
         defer merged.deinit();
@@ -1124,14 +1527,11 @@ pub const PrefixDB = struct {
             new_parent.append_page_counts[ai] = old_parent.append_page_counts[ai];
             new_parent.append_prefix16[ai] = old_parent.append_prefix16[ai];
         }
-        const new_parent_id = try self.heap.writeNodePage(parent_depth, new_parent);
-        try self.routing.put(parent_depth, parent_prefix, new_parent_id);
-        self.heap.freeNodePage(parent_id);
+        try self.nodePut(parent_depth, parent_prefix, new_parent);
         for (old_parent.sorted_slot_ids[0..old_parent.sorted_count]) |id| self.heap.freeSstPage(id);
         self.markDirty(parent_depth, parent_prefix);
 
-        _ = self.routing.remove(depth, prefix);
-        self.heap.freeNodePage(child_id);
+        self.nodeRemove(depth, prefix);
         for (old_child.sorted_slot_ids[0..old_child.sorted_count]) |id| self.heap.freeSstPage(id);
         for (old_child.append_slot_ids[0..old_child.append_count]) |id| self.heap.freeSstPage(id);
 
@@ -1168,12 +1568,14 @@ pub fn childMerkleRoot(commitments: [CHILD_COUNT]Hash) Hash {
 
 // ─── Prefix helpers (§4.2.1, §7.1) ───────────────────────────────────────────
 
-/// prefixData(K, d) = top 6d bits of K, zero-padded into a u32.
+/// prefixData(K, d) = top 6d bits of K, zero-padded into a u64.
+/// Handles depths up to 10 (60 bits); at STRIDE=6 with a 256-bit key, depth 42 is the physical max.
 pub fn prefixData(key: *const Key, depth: u32) PrefixData {
-    const top4: u32 = (@as(u32, key[0]) << 24) | (@as(u32, key[1]) << 16) |
-        (@as(u32, key[2]) << 8) | @as(u32, key[3]);
-    const shift: u5 = @intCast(32 - STRIDE * depth);
-    return top4 >> shift;
+    const top8: u64 = (@as(u64, key[0]) << 56) | (@as(u64, key[1]) << 48) |
+        (@as(u64, key[2]) << 40) | (@as(u64, key[3]) << 32) |
+        (@as(u64, key[4]) << 24) | (@as(u64, key[5]) << 16) |
+        (@as(u64, key[6]) << 8)  |  @as(u64, key[7]);
+    return top8 >> @intCast(64 - STRIDE * depth);
 }
 
 /// prefix32(K, k): the 32 bits of K immediately following the node's 6k-bit prefix.
@@ -1236,6 +1638,125 @@ fn filterContains(filter: *const [PAGE_ENTRIES]u16, count: u8, target: u16) bool
 test {
     _ = @import("page_store.zig");
     _ = @import("cache.zig");
+    _ = @import("wal.zig");
+    _ = @import("block_journal.zig");
+    _ = @import("kv_map.zig");
+}
+
+test "kv_map: write + flush + read returns correct value without SST walk" {
+    var db = try PrefixDB.init(std.testing.allocator);
+    defer db.deinit();
+
+    const k = testKey(42);
+    const v = testVal(0xDE);
+
+    // Write and commit (flushes L0 to SST, clears L0).
+    try db.write(k, v);
+    _ = try db.commitBlock();
+
+    // kv_map retains the value after L0 flush; read must return it.
+    const result = try db.read(k);
+    try std.testing.expectEqual(@as(?Value, v), result);
+    try std.testing.expectEqual(@as(usize, 1), db.kv_map.count());
+}
+
+test "kv_map: overwrite reflected immediately" {
+    var db = try PrefixDB.init(std.testing.allocator);
+    defer db.deinit();
+
+    const k = testKey(7);
+    const v1 = testVal(0xAA);
+    const v2 = testVal(0xBB);
+
+    try db.write(k, v1);
+    _ = try db.commitBlock();
+    try db.write(k, v2);
+
+    // Before second commit, kv_map has v2 and L0 also has v2.
+    try std.testing.expectEqual(@as(?Value, v2), try db.read(k));
+
+    _ = try db.commitBlock();
+    // After second commit, L0 is flushed; kv_map still has v2.
+    try std.testing.expectEqual(@as(?Value, v2), try db.read(k));
+}
+
+test "kv_map: SST read warms kv_map; eviction clears it" {
+    // Use a disk-backed db so sst_cap=1 can evict (not SstCacheFull).
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = page_store.DiskStore{ .dir = tmp.dir, .io = std.testing.io };
+
+    var db = try PrefixDB.openWithConfig(
+        std.testing.allocator,
+        .{ .node_cap = DEFAULT_NODE_CACHE_CAP, .sst_cap = 1 },
+        store,
+    );
+    defer db.deinit();
+    // Wire up the write-back callbacks (must be after db is in final location).
+    db.enableWriteBack();
+
+    // Keys with different byte[0] so they land in different d1 nodes and SST pages.
+    // prefixData(key, 1) reads top 6 bits of byte[0]: k1→prefix 1, k2→prefix 2.
+    var k1 = std.mem.zeroes(Key);
+    k1[0] = 0x04; // top 6 bits = 1
+    var k2 = std.mem.zeroes(Key);
+    k2[0] = 0x08; // top 6 bits = 2
+    const v1 = testVal(0x11);
+    const v2 = testVal(0x22);
+
+    // Write both keys and commit so they land in separate SST pages.
+    try db.write(k1, v1);
+    try db.write(k2, v2);
+    _ = try db.commitBlock();
+
+    // After commit, write()-sourced entries are in kv_map with WRITE_SST_ID.
+    try std.testing.expectEqual(@as(?Value, v1), try db.read(k1));
+    try std.testing.expectEqual(@as(?Value, v2), try db.read(k2));
+
+    // Clear kv_map so that the next reads go cold to SST and warm the cache.
+    db.kv_map.remove(k1);
+    db.kv_map.remove(k2);
+    try std.testing.expectEqual(@as(?Value, null), db.kv_map.get(k1));
+
+    // Cold read for k1: SST hit → kv_map.putFromSst(k1, v1, page_id_A).
+    try std.testing.expectEqual(@as(?Value, v1), try db.read(k1));
+    try std.testing.expectEqual(@as(?Value, v1), db.kv_map.get(k1));
+
+    // Cold read for k2: loads page B, evicts page A → kv_map entry for k1 removed.
+    try std.testing.expectEqual(@as(?Value, v2), try db.read(k2));
+    try std.testing.expectEqual(@as(?Value, null), db.kv_map.get(k1));
+    // k2 is now warmed.
+    try std.testing.expectEqual(@as(?Value, v2), db.kv_map.get(k2));
+}
+
+test "WAL: crash recovery restores committed blocks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = page_store.DiskStore{ .dir = tmp.dir, .io = std.testing.io };
+
+    const k1 = testKey(1);
+    const v1 = testVal(0xAA);
+    const k2 = testKey(2);
+    const v2 = testVal(0xBB);
+
+    // Session 1: write two blocks but do NOT flush (simulate crash).
+    {
+        var db = try PrefixDB.openWithConfig(std.testing.allocator, .{}, store);
+        try db.write(k1, v1);
+        _ = try db.commitBlock();
+        try db.write(k2, v2);
+        _ = try db.commitBlock();
+        // Crash: deinit without calling flush.
+        db.deinit();
+    }
+
+    // Session 2: reopen — WAL replay must restore both committed blocks.
+    {
+        var db = try PrefixDB.openWithConfig(std.testing.allocator, .{}, store);
+        defer db.deinit();
+        try std.testing.expectEqual(@as(?Value, v1), try db.read(k1));
+        try std.testing.expectEqual(@as(?Value, v2), try db.read(k2));
+    }
 }
 
 test "prefixData depth 1 extracts top 6 bits" {
@@ -1246,6 +1767,12 @@ test "prefixData depth 1 extracts top 6 bits" {
 test "prefixData depth 5 extracts top 30 bits" {
     const key = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF } ++ [_]u8{0} ** 28;
     try std.testing.expectEqual(@as(PrefixData, 0x3FFF_FFFF), prefixData(&key, 5));
+}
+
+test "prefixData depth 6 extracts top 36 bits" {
+    const key = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF } ++ [_]u8{0} ** 27;
+    // top 36 bits all-ones = 2^36 - 1 = 0xF_FFFF_FFFF
+    try std.testing.expectEqual(@as(PrefixData, 0xF_FFFF_FFFF), prefixData(&key, 6));
 }
 
 test "prefix32 depth 1 — bits [6,38) of key" {
@@ -1279,9 +1806,9 @@ test "prefix16 sub-prefix promotion check — top 6 bits" {
 test "RoutingTable put and get" {
     var rt = RoutingTable.init(std.testing.allocator);
     defer rt.deinit();
-    try rt.put(1, 0b101101, 42);
-    try std.testing.expectEqual(@as(?NodePageId, 42), rt.get(1, 0b101101));
-    try std.testing.expectEqual(@as(?NodePageId, null), rt.get(1, 0b000000));
+    try rt.put(3, 0b101101, 42);
+    try std.testing.expectEqual(@as(?NodePageId, 42), rt.get(3, 0b101101));
+    try std.testing.expectEqual(@as(?NodePageId, null), rt.get(3, 0b000000));
 }
 
 test "L0Buffer append and prefixCount" {
@@ -1354,10 +1881,9 @@ test "write 64 keys triggers L0 flush to L1 append zone" {
     }
 
     try std.testing.expectEqual(@as(usize, 0), db.l0.entries.items.len);
-    try std.testing.expect(db.routing.get(1, 0) != null);
+    try std.testing.expect(db.arena.exists(1, 0));
 
-    const node_id = db.routing.get(1, 0).?;
-    const node = (try db.heap.getNodePage(node_id)).?;
+    const node = db.arena.get(1, 0).?.*;
     try std.testing.expectEqual(@as(u8, 0), node.sorted_count);
     try std.testing.expectEqual(@as(u8, 1), node.append_count);
 }
@@ -1424,8 +1950,7 @@ test "two flushes: 128 distinct keys across two SST pages in append zone" {
         try db.write(k, testVal(@intCast(i)));
     }
 
-    const node_id = db.routing.get(1, 0).?;
-    const node = (try db.heap.getNodePage(node_id)).?;
+    const node = db.arena.get(1, 0).?.*;
     try std.testing.expectEqual(@as(u8, 2), node.append_count);
 
     for (0..PAGE_ENTRIES) |i| {
@@ -1472,15 +1997,13 @@ test "appendToSortedMerge: clears append zone and keeps all keys readable" {
         }
     }
 
-    const before_id = db.routing.get(1, 0).?;
-    const before = (try db.heap.getNodePage(before_id)).?;
+    const before = db.arena.get(1, 0).?.*;
     try std.testing.expectEqual(@as(u8, A_MAX), before.append_count);
     try std.testing.expect(db.compaction_queue.items.len > 0);
 
     try db.runCompaction();
 
-    const after_id = db.routing.get(1, 0).?;
-    const after = (try db.heap.getNodePage(after_id)).?;
+    const after = db.arena.get(1, 0).?.*;
     try std.testing.expectEqual(@as(u8, 0), after.append_count);
 
     for (0..A_MAX) |batch| {
@@ -1529,10 +2052,15 @@ test "sub-prefix promotion: uniform sub-prefix page moves to depth-2 node" {
     // With promoteSstPage routing to append zone, pages may propagate past
     // depth-2 all the way to depth-3 before settling. Check any depth > 1.
     var found_deeper = false;
-    outer: for (2..MAX_DEPTH + 1) |d| {
+    outer: for (2..db.max_depth_used + 1) |d| {
         const dd: u32 = @intCast(d);
         for (0..64) |p| {
-            if (db.routing.get(dd, @intCast(p)) != null) {
+            const has = switch (dd) {
+                2 => db.arena.exists(2, @intCast(p)),
+                3 => db.arena.exists(3, @intCast(p)),
+                else => db.routing.get(dd, @intCast(p)) != null,
+            };
+            if (has) {
                 found_deeper = true;
                 break :outer;
             }
@@ -1564,19 +2092,16 @@ test "upwardSplit: promoted depth-2 node triggers split when sorted zone fills" 
         node2.sorted_page_counts[si] = 1;
         node2.sorted_count += 1;
     }
-    // depth=2 → pinned pool
-    const nid2 = try db.heap.writeNodePage(2, node2);
-    try db.routing.put(2, 0, nid2);
+    db.arena.put(2, 0, node2);
 
     try db.compaction_queue.append(db.allocator, .{ .depth = 2, .prefix = 0 });
     try db.runCompaction();
 
-    if (db.routing.get(2, 0)) |id| {
-        const n = (try db.heap.getNodePage(id)).?;
+    if (db.arena.get(2, 0)) |p| {
+        const n = p.*;
         try std.testing.expectEqual(@as(u8, 0), n.sorted_count);
     }
-    const d3id = db.routing.get(3, 0).?;
-    const d3n = (try db.heap.getNodePage(d3id)).?;
+    const d3n = db.arena.get(3, 0).?.*;
     try std.testing.expectEqual(@as(u8, 2), d3n.sorted_count);
 }
 
@@ -1647,9 +2172,7 @@ test "downwardMerge: sparse child node is absorbed into parent" {
     child_node.sorted_min4[0] = prefix32(&sst.entries[0].key, 2);
     child_node.sorted_page_counts[0] = 5;
     child_node.sorted_count = 1;
-    // depth=2 → pinned pool
-    const cid = try db.heap.writeNodePage(2, child_node);
-    try db.routing.put(2, child_prefix, cid);
+    db.arena.put(2, child_prefix, child_node);
 
     var parent_node = std.mem.zeroes(NodePage);
     var psst = std.mem.zeroes(SstPage);
@@ -1663,17 +2186,14 @@ test "downwardMerge: sparse child node is absorbed into parent" {
     parent_node.sorted_min4[0] = prefix32(&psst.entries[0].key, 1);
     parent_node.sorted_page_counts[0] = 3;
     parent_node.sorted_count = 1;
-    // depth=1 → pinned pool
-    const pid = try db.heap.writeNodePage(1, parent_node);
-    try db.routing.put(1, 0, pid);
+    db.arena.put(1, 0, parent_node);
 
     try db.compaction_queue.append(db.allocator, .{ .depth = 2, .prefix = child_prefix });
     try db.runCompaction();
 
-    try std.testing.expectEqual(@as(?NodePageId, null), db.routing.get(2, child_prefix));
+    try std.testing.expect(!db.arena.exists(2, child_prefix));
 
-    const new_pid = db.routing.get(1, 0).?;
-    const new_parent = (try db.heap.getNodePage(new_pid)).?;
+    const new_parent = db.arena.get(1, 0).?.*;
     var total: u32 = 0;
     for (new_parent.sorted_slot_ids[0..new_parent.sorted_count]) |id| {
         total += (try db.heap.getSstPage(id)).?.count;

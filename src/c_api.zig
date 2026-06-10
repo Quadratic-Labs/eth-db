@@ -10,17 +10,20 @@ const std = @import("std");
 const options = @import("options");
 const root = @import("root.zig");
 const page_store = @import("page_store.zig");
+const journal_mod = @import("block_journal.zig");
+const t = @import("types.zig");
 
 const PrefixDB = root.PrefixDB;
 const Key = root.Key;
 const Value = root.Value;
 
-const TOMBSTONE: Value = [_]u8{0xFF} ** 32;
+const TOMBSTONE = t.TOMBSTONE;
 
 const State = struct {
     gpa: std.heap.DebugAllocator(.{}),
     db: PrefixDB,
     store: ?page_store.DiskStore = null,
+    journal: journal_mod.BlockJournal,
 };
 
 fn globalIo() std.Io {
@@ -29,23 +32,27 @@ fn globalIo() std.Io {
 
 export fn prefixdb_init() ?*State {
     const state = std.heap.page_allocator.create(State) catch return null;
-    state.* = .{ .gpa = .{}, .db = undefined, .store = null };
+    state.* = .{ .gpa = .{}, .db = undefined, .store = null, .journal = undefined };
     state.db = PrefixDB.init(state.gpa.allocator()) catch {
         _ = state.gpa.deinit();
         std.heap.page_allocator.destroy(state);
         return null;
     };
+    state.db.enableWriteBack();
+    state.journal = journal_mod.BlockJournal.init(state.gpa.allocator());
     return state;
 }
 
 export fn prefixdb_init_capacity(node_cap: u32, sst_cap: u32) ?*State {
     const state = std.heap.page_allocator.create(State) catch return null;
-    state.* = .{ .gpa = .{}, .db = undefined, .store = null };
+    state.* = .{ .gpa = .{}, .db = undefined, .store = null, .journal = undefined };
     state.db = PrefixDB.initCapacity(state.gpa.allocator(), node_cap, sst_cap) catch {
         _ = state.gpa.deinit();
         std.heap.page_allocator.destroy(state);
         return null;
     };
+    state.db.enableWriteBack();
+    state.journal = journal_mod.BlockJournal.init(state.gpa.allocator());
     return state;
 }
 
@@ -56,6 +63,7 @@ export fn prefixdb_deinit(state: *State) void {
         };
         store.dir.close(store.io);
     }
+    state.journal.deinit();
     state.db.deinit();
     _ = state.gpa.deinit();
     std.heap.page_allocator.destroy(state);
@@ -66,7 +74,7 @@ export fn prefixdb_deinit(state: *State) void {
 /// node_cap and sst_cap are the LRU cache sizes (pass 0 to use engine defaults).
 export fn prefixdb_open(path: [*:0]const u8, node_cap: u32, sst_cap: u32) ?*State {
     const state = std.heap.page_allocator.create(State) catch return null;
-    state.* = .{ .gpa = .{}, .db = undefined, .store = null };
+    state.* = .{ .gpa = .{}, .db = undefined, .store = null, .journal = undefined };
     const io = globalIo();
     const dir = std.Io.Dir.cwd().createDirPathOpen(io, std.mem.span(path), .{}) catch {
         _ = state.gpa.deinit();
@@ -84,6 +92,8 @@ export fn prefixdb_open(path: [*:0]const u8, node_cap: u32, sst_cap: u32) ?*Stat
         std.heap.page_allocator.destroy(state);
         return null;
     };
+    state.db.enableWriteBack();
+    state.journal = journal_mod.BlockJournal.init(state.gpa.allocator());
     return state;
 }
 
@@ -135,6 +145,45 @@ export fn prefixdb_commit_block(state: *State, hash_out: *[32]u8) i32 {
     return 0;
 }
 
+// ─── Reorg journal ────────────────────────────────────────────────────────────
+
+/// Begin recording writes for block_num.  Call once per block, before any
+/// prefixdb_record_write / prefixdb_put / prefixdb_del calls for that block.
+export fn prefixdb_begin_block(state: *State, block_num: u32) void {
+    state.journal.beginBlock(block_num);
+}
+
+/// Record the pre-write value of a key before calling prefixdb_put or prefixdb_del.
+/// old_value must point to exactly 32 bytes, or be NULL if the key is currently absent.
+/// Returns 0 on success, -1 on allocation failure.
+export fn prefixdb_record_write(state: *State, key: *const [32]u8, old_value: ?[*]const u8) i32 {
+    const ov: ?Value = if (old_value) |p| @as(*const [32]u8, @ptrCast(p)).* else null;
+    state.journal.recordWrite(key.*, ov) catch return -1;
+    return 0;
+}
+
+/// Finalize the journal entry for block_num.  Call after prefixdb_commit_block succeeds.
+export fn prefixdb_end_block(state: *State, block_num: u32) void {
+    state.journal.endBlock(block_num);
+}
+
+/// Undo all blocks after target_block by writing their pre-write values back.
+/// Returns 0 on success, 1 if target_block is older than the journal window
+/// (caller must resync from the last manifest flush), -1 on internal error.
+export fn prefixdb_reorg(state: *State, target_block: u32) i32 {
+    state.journal.reorgTo(target_block, &state.db) catch |err| switch (err) {
+        error.ReorgWindowExceeded => return 1,
+        else => return -1,
+    };
+    return 0;
+}
+
+/// Release journal entries for blocks <= flushed_block_num.
+/// Call after each successful prefixdb_flush to reclaim memory.
+export fn prefixdb_evict_journal(state: *State, flushed_block_num: u32) void {
+    state.journal.evictOldBlocks(flushed_block_num);
+}
+
 // ─── Metrics ──────────────────────────────────────────────────────────────────
 
 /// C-compatible metrics snapshot.  Fields are always present; all are zero
@@ -163,6 +212,7 @@ pub const PrefixDBMetrics = extern struct {
     commit_block_calls: u64,
     commit_nodes_processed: u64,
     commit_block_ns: u64,
+    kv_map_hits: u64,
 };
 
 /// Fill *out with a snapshot of all internal counters.
@@ -195,6 +245,7 @@ export fn prefixdb_get_metrics(state: *State, out: *PrefixDBMetrics) i32 {
             .commit_block_calls     = s.commit_block_calls,
             .commit_nodes_processed = s.commit_nodes_processed,
             .commit_block_ns        = s.commit_block_ns,
+            .kv_map_hits            = s.kv_map_hits,
         };
     } else {
         out.* = std.mem.zeroes(PrefixDBMetrics);

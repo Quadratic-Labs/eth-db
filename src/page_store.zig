@@ -29,7 +29,7 @@ pub const PAGE_SIZE: u32 = 4096;
 pub const DiskStore = struct { dir: Io.Dir, io: Io };
 
 pub const MANIFEST_MAGIC: u32 = 0x01_42_44_50;
-pub const MANIFEST_VERSION: u32 = 2;
+pub const MANIFEST_VERSION: u32 = 3;
 
 /// Fixed-size header written at offset 0 of manifest.bin.
 pub const ManifestHeader = extern struct {
@@ -46,8 +46,8 @@ pub const ManifestHeader = extern struct {
 /// One routing-table entry (depth + prefix → node_id).
 pub const ManifestRouteEntry = extern struct {
     depth: u32,
-    prefix: u32,
     node_id: u32,
+    prefix: u64,
 };
 
 /// Deserialized manifest data (caller owns the slices).

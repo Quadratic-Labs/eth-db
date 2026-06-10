@@ -16,7 +16,6 @@ pub const PAGE_ENTRIES: u32 = 64;
 pub const CHILD_COUNT: u32 = 64;
 pub const S_MAX: u32 = 108; // sorted zone capacity per node
 pub const A_MAX: u32 = 8; // append zone capacity per node
-pub const MAX_DEPTH: u32 = 5;
 pub const MERGE_THRESHOLD: u32 = 16;
 pub const T_OPP: u32 = 2;
 
@@ -24,6 +23,8 @@ pub const T_OPP: u32 = 2;
 
 pub const Key = [32]u8;
 pub const Value = [32]u8;
+/// Sentinel value written by the delete operation; reads return "not found".
+pub const TOMBSTONE: Value = [_]u8{0xFF} ** 32;
 
 pub const KvEntry = struct {
     key: Key,
@@ -34,7 +35,7 @@ pub const KvEntry = struct {
 
 pub const NodePageId = u32;
 pub const PayloadSlotId = u32;
-pub const PrefixData = u32;
+pub const PrefixData = u64;
 
 // ─── SST payload page (§4.1) ──────────────────────────────────────────────────
 

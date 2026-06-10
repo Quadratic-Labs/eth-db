@@ -7,6 +7,14 @@
 //! The backing array is pre-allocated at `init` time; no further heap
 //! allocation is performed by `get` or `remove`.  `put` may grow the
 //! internal hash-map (OOM possible).
+//!
+//! Two optional callbacks allow callers to react to entries leaving the cache:
+//!   lru_evict_fn — fired when LRU eviction occurs inside `put()` (cache full).
+//!                  The last in-memory copy is about to be lost; callers should
+//!                  persist the page to disk here.
+//!   remove_fn    — fired when `remove()` is called explicitly (logical deletion).
+//!                  The page is being superseded; callers should NOT write to disk
+//!                  but may need to clean up secondary structures (e.g. kv_map).
 
 const std = @import("std");
 
@@ -31,6 +39,11 @@ pub fn LruCache(comptime V: type) type {
         lru_tail: u32, // least-recently-used end (eviction target)
         len: u32,
         cap: u32,
+        evict_ctx: ?*anyopaque = null,
+        /// Fired on LRU eviction in `put()` — last in-memory copy is about to be lost.
+        lru_evict_fn: ?*const fn (*anyopaque, u32, *const V) void = null,
+        /// Fired on explicit `remove()` — page is superseded; do NOT write to disk.
+        remove_fn: ?*const fn (*anyopaque, u32, *const V) void = null,
 
         pub fn init(allocator: std.mem.Allocator, cap: u32) !Self {
             const entries = try allocator.alloc(Entry, cap);
@@ -67,7 +80,7 @@ pub fn LruCache(comptime V: type) type {
         }
 
         /// Insert or update `key → value`.
-        /// When the cache is full, the LRU entry is evicted silently.
+        /// When the cache is full, the LRU entry is evicted and `lru_evict_fn` is called.
         /// May return `error.OutOfMemory` from the internal hash map.
         pub fn put(self: *Self, key: u32, value: V) !void {
             if (self.map.get(key)) |idx| {
@@ -87,6 +100,7 @@ pub fn LruCache(comptime V: type) type {
             } else blk: {
                 // Evict LRU tail; len stays the same.
                 const s = self.lru_tail;
+                if (self.lru_evict_fn) |f| f(self.evict_ctx.?, self.entries[s].key, &self.entries[s].value);
                 _ = self.map.remove(self.entries[s].key);
                 self.detach(s);
                 break :blk s;
@@ -97,14 +111,30 @@ pub fn LruCache(comptime V: type) type {
             self.attachHead(slot);
         }
 
-        /// Remove `key` from the cache. No-op if not present.
+        /// Remove `key` from the cache, calling `remove_fn` if set. No-op if not present.
         pub fn remove(self: *Self, key: u32) void {
             const kv = self.map.fetchRemove(key) orelse return;
             const idx = kv.value;
+            if (self.remove_fn) |f| f(self.evict_ctx.?, key, &self.entries[idx].value);
             self.detach(idx);
             self.entries[idx].next = self.free_head;
             self.free_head = idx;
             self.len -= 1;
+        }
+
+        /// Call `f(ctx, key, &value)` for every live entry, MRU→LRU order.
+        /// Used at flush time to write all in-cache pages to disk.
+        pub fn forEachLive(
+            self: *const Self,
+            ctx: *anyopaque,
+            f: *const fn (*anyopaque, u32, *const V) anyerror!void,
+        ) !void {
+            var idx = self.lru_head;
+            while (idx != NONE) {
+                const e = &self.entries[idx];
+                try f(ctx, e.key, &e.value);
+                idx = e.next;
+            }
         }
 
         fn promoteToHead(self: *Self, idx: u32) void {
