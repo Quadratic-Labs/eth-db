@@ -89,6 +89,14 @@ pub const Wal = struct {
         try self.file.writePositionalAll(self.store.io, std.mem.asBytes(&entry), self.write_offset);
         self.write_offset += @sizeOf(WalEntry);
     }
+
+    /// Discard all logged entries.  Called once the manifest checkpoint is
+    /// durable: everything logged so far is captured by the manifest, and an
+    /// empty WAL replays as a no-op.  Keeps wal.bin from growing forever.
+    pub fn reset(self: *Wal) !void {
+        try self.file.setLength(self.store.io, @sizeOf(WalHeader));
+        self.write_offset = @sizeOf(WalHeader);
+    }
 };
 
 /// Read all entries from wal.bin.  Returns an empty slice when the file does

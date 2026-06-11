@@ -132,8 +132,17 @@ export fn prefixdb_del(state: *State, key: *const [32]u8) i32 {
     return 0;
 }
 
+/// Drain the compaction queue completely (idle periods, shutdown).
 export fn prefixdb_compact(state: *State) i32 {
     state.db.runCompaction() catch return -1;
+    return 0;
+}
+
+/// Run at most `budget` compaction procedures; the rest stays queued for
+/// later calls.  budget = 0 selects the engine default.
+export fn prefixdb_compact_budget(state: *State, budget: u32) i32 {
+    const b = if (budget == 0) root.PrefixDB.COMPACTION_BUDGET_DEFAULT else budget;
+    state.db.runCompactionBudget(b) catch return -1;
     return 0;
 }
 
@@ -213,11 +222,25 @@ pub const PrefixDBMetrics = extern struct {
     commit_nodes_processed: u64,
     commit_block_ns: u64,
     kv_map_hits: u64,
+    // ── Page reuse (GC) ──
+    node_pages_reused: u64,
+    sst_pages_reused: u64,
+    cmt_pages_reused: u64,
+    // ── Gauges (current state, not counters; unaffected by reset) ──
+    free_node_ids: u64,
+    free_sst_ids: u64,
+    free_cmt_ids: u64,
+    compaction_backlog: u64,
 };
 
 /// Fill *out with a snapshot of all internal counters.
 /// Returns 0 always.  All fields are zero when built without enable_metrics.
 export fn prefixdb_get_metrics(state: *State, out: *PrefixDBMetrics) i32 {
+    // Gauges are available regardless of enable_metrics.
+    const gauge_free_node = state.db.heap.node_free.totalLen();
+    const gauge_free_sst = state.db.heap.sst_free.totalLen();
+    const gauge_free_cmt = state.db.cmt_free.totalLen();
+    const gauge_backlog = state.db.compactionBacklog();
     if (comptime options.enable_metrics) {
         const s = state.db.stats;
         const h = state.db.heap.heap_stats;
@@ -246,9 +269,20 @@ export fn prefixdb_get_metrics(state: *State, out: *PrefixDBMetrics) i32 {
             .commit_nodes_processed = s.commit_nodes_processed,
             .commit_block_ns        = s.commit_block_ns,
             .kv_map_hits            = s.kv_map_hits,
+            .node_pages_reused      = h.node_pages_reused,
+            .sst_pages_reused       = h.sst_pages_reused,
+            .cmt_pages_reused       = s.cmt_pages_reused,
+            .free_node_ids          = gauge_free_node,
+            .free_sst_ids           = gauge_free_sst,
+            .free_cmt_ids           = gauge_free_cmt,
+            .compaction_backlog     = gauge_backlog,
         };
     } else {
         out.* = std.mem.zeroes(PrefixDBMetrics);
+        out.free_node_ids = gauge_free_node;
+        out.free_sst_ids = gauge_free_sst;
+        out.free_cmt_ids = gauge_free_cmt;
+        out.compaction_backlog = gauge_backlog;
     }
     return 0;
 }

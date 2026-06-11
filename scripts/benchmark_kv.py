@@ -70,8 +70,8 @@ class Account:
 
 
 class WorkloadGenerator:
-    HOT_PROB  = 0.70
-    WARM_PROB = 0.95
+    HOT_PROB  = 0.00
+    WARM_PROB = 0.05
 
     def __init__(
         self,
@@ -210,6 +210,7 @@ def _run_block(
     block_no: int,
     ops: list[tuple],
     live_keys: set[bytes],
+    compaction_budget: int | None = 0,
 ) -> dict:
     """Execute one block's ops on `db`, compute state root and compact."""
     read_lats: list[float] = []
@@ -237,7 +238,7 @@ def _run_block(
     state_root = db.commit_block()
 
     t_cmp0 = time.perf_counter()
-    db.compact()
+    db.compact(budget=compaction_budget)
     compaction_lat = time.perf_counter() - t_cmp0
 
     raw_metrics = db.get_metrics()
@@ -324,6 +325,7 @@ def run_benchmark(
     node_cap: int | None = None,
     sst_cap: int | None = None,
     db_dir: str | None = None,
+    compaction_budget: int | None = 0,
 ) -> tuple[list[dict], dict]:
     """Drive the workload against a single PrefixDB instance, collect metrics."""
     block_metrics: list[dict] = []
@@ -339,7 +341,7 @@ def run_benchmark(
         for record in gen.generate_blocks(num_blocks):
             block_no = record[0]
             if block_no != current_block_no:
-                bm = _run_block(db, current_block_no, current_block_ops, live_keys)
+                bm = _run_block(db, current_block_no, current_block_ops, live_keys, compaction_budget)
                 block_metrics.append(bm)
                 if print_every > 0 and (current_block_no % print_every == 0 or current_block_no == 1):
                     _print_progress(bm, num_blocks, time.perf_counter() - bench_start)
@@ -349,7 +351,7 @@ def run_benchmark(
 
         # Flush the last block.
         if current_block_ops:
-            bm = _run_block(db, current_block_no, current_block_ops, live_keys)
+            bm = _run_block(db, current_block_no, current_block_ops, live_keys, compaction_budget)
             block_metrics.append(bm)
             if print_every > 0:
                 _print_progress(bm, num_blocks, time.perf_counter() - bench_start)
@@ -467,6 +469,8 @@ def parse_args() -> argparse.Namespace:
                    help="LRU capacity for SST (KV) pages (default: engine default = 4096)")
     p.add_argument("--db-dir", default=None, metavar="PATH",
                    help="Directory for persistent database (enables disk I/O; auto-recovers on restart)")
+    p.add_argument("--compaction-budget", type=int, default=0, metavar="N",
+                   help="Max compaction procedures per block; 0 = engine default, -1 = unbounded drain (old behaviour)")
     return p.parse_args()
 
 
@@ -488,6 +492,7 @@ def main() -> None:
         "node_cache_cap":  args.node_cache,
         "sst_cache_cap":   args.sst_cache,
         "db_dir":          args.db_dir,
+        "compaction_budget": args.compaction_budget,
     }
 
     cache_info = ""
@@ -519,6 +524,7 @@ def main() -> None:
         node_cap=args.node_cache,
         sst_cap=args.sst_cache,
         db_dir=args.db_dir,
+        compaction_budget=None if args.compaction_budget < 0 else args.compaction_budget,
     )
 
     with open(args.output, "w") as f:

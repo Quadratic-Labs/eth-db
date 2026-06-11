@@ -54,6 +54,9 @@ _lib.prefixdb_del.argtypes = [ctypes.c_void_p, _Buf32]
 _lib.prefixdb_compact.restype = ctypes.c_int
 _lib.prefixdb_compact.argtypes = [ctypes.c_void_p]
 
+_lib.prefixdb_compact_budget.restype = ctypes.c_int
+_lib.prefixdb_compact_budget.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+
 _lib.prefixdb_open.restype = ctypes.c_void_p
 _lib.prefixdb_open.argtypes = [ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32]
 
@@ -99,6 +102,16 @@ class Metrics(ctypes.Structure):
         ("commit_block_calls",      ctypes.c_uint64),
         ("commit_nodes_processed",  ctypes.c_uint64),
         ("commit_block_ns",         ctypes.c_uint64),
+        ("kv_map_hits",             ctypes.c_uint64),
+        # Page reuse (GC).
+        ("node_pages_reused",       ctypes.c_uint64),
+        ("sst_pages_reused",        ctypes.c_uint64),
+        ("cmt_pages_reused",        ctypes.c_uint64),
+        # Gauges (current state, not counters; unaffected by reset_metrics).
+        ("free_node_ids",           ctypes.c_uint64),
+        ("free_sst_ids",            ctypes.c_uint64),
+        ("free_cmt_ids",            ctypes.c_uint64),
+        ("compaction_backlog",      ctypes.c_uint64),
     ]
 
     def as_dict(self) -> dict:
@@ -189,9 +202,18 @@ class PrefixDB:
         if rc != 0:
             raise RuntimeError(f"delete failed (rc={rc})")
 
-    def compact(self) -> None:
-        """Drain the compaction queue (merge append→sorted zones, split/merge nodes)."""
-        rc = _lib.prefixdb_compact(self._handle)
+    def compact(self, budget: int | None = None) -> None:
+        """Run compaction (merge append→sorted zones, split/merge nodes).
+
+        budget=None drains the whole queue (idle periods, shutdown).
+        budget=N runs at most N compaction procedures, leaving the rest queued —
+        use this on the block path so fill waves spread across blocks.
+        budget=0 uses the engine default budget.
+        """
+        if budget is None:
+            rc = _lib.prefixdb_compact(self._handle)
+        else:
+            rc = _lib.prefixdb_compact_budget(self._handle, budget)
         if rc != 0:
             raise RuntimeError(f"compaction failed (rc={rc})")
 

@@ -29,9 +29,11 @@ pub const PAGE_SIZE: u32 = 4096;
 pub const DiskStore = struct { dir: Io.Dir, io: Io };
 
 pub const MANIFEST_MAGIC: u32 = 0x01_42_44_50;
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 2;
 
 /// Fixed-size header written at offset 0 of manifest.bin.
+/// The first 32 bytes are layout-identical to version 1; the free-list counts
+/// were appended in version 2 (v1 manifests are read with empty free lists).
 pub const ManifestHeader = extern struct {
     magic: u32,
     version: u32,
@@ -41,7 +43,19 @@ pub const ManifestHeader = extern struct {
     routing_count: u32,
     l0_count: u32,
     _pad: u32 = 0,
+    // ── Version 2 ──
+    free_node_count: u32 = 0,
+    free_sst_count: u32 = 0,
+    free_cmt_count: u32 = 0,
+    _pad2: u32 = 0,
 };
+
+/// Byte size of the version-1 header (prefix of the current layout).
+pub const MANIFEST_HEADER_V1_SIZE: usize = 32;
+
+comptime {
+    if (@sizeOf(ManifestHeader) != 48) @compileError("ManifestHeader layout drifted");
+}
 
 /// One routing-table entry (depth + prefix → node_id [+ commitment page id]).
 /// cmt_page_id is CMT_NONE (0xFFFFFFFF) when the node has no persisted
@@ -59,27 +73,53 @@ pub const ManifestData = struct {
     header: ManifestHeader,
     routes: []ManifestRouteEntry,
     l0: []root.KvEntry,
+    /// Reusable page ids per store (empty for version-1 manifests).
+    free_node: []u32,
+    free_sst: []u32,
+    free_cmt: []u32,
 
     pub fn deinit(self: *ManifestData, allocator: std.mem.Allocator) void {
         allocator.free(self.routes);
         allocator.free(self.l0);
+        allocator.free(self.free_node);
+        allocator.free(self.free_sst);
+        allocator.free(self.free_cmt);
     }
 };
 
+/// Write the manifest atomically: serialise to manifest.tmp, fsync, then
+/// rename over manifest.bin so a crash mid-write never corrupts the previous
+/// checkpoint (recovery depends on the last manifest being intact).
 pub fn writeManifest(
     store: DiskStore,
     header: ManifestHeader,
     routes: []const ManifestRouteEntry,
     l0: []const root.KvEntry,
+    free_node: []const u32,
+    free_sst: []const u32,
+    free_cmt: []const u32,
 ) !void {
-    const f = try store.dir.createFile(store.io, "manifest.bin", .{ .truncate = true });
-    defer f.close(store.io);
-    var off: u64 = 0;
-    try f.writePositionalAll(store.io, std.mem.asBytes(&header), off);
-    off += @sizeOf(ManifestHeader);
-    try f.writePositionalAll(store.io, std.mem.sliceAsBytes(routes), off);
-    off += routes.len * @sizeOf(ManifestRouteEntry);
-    try f.writePositionalAll(store.io, std.mem.sliceAsBytes(l0), off);
+    std.debug.assert(header.free_node_count == free_node.len);
+    std.debug.assert(header.free_sst_count == free_sst.len);
+    std.debug.assert(header.free_cmt_count == free_cmt.len);
+    {
+        const f = try store.dir.createFile(store.io, "manifest.tmp", .{ .truncate = true });
+        defer f.close(store.io);
+        var off: u64 = 0;
+        try f.writePositionalAll(store.io, std.mem.asBytes(&header), off);
+        off += @sizeOf(ManifestHeader);
+        try f.writePositionalAll(store.io, std.mem.sliceAsBytes(routes), off);
+        off += routes.len * @sizeOf(ManifestRouteEntry);
+        try f.writePositionalAll(store.io, std.mem.sliceAsBytes(l0), off);
+        off += l0.len * @sizeOf(root.KvEntry);
+        try f.writePositionalAll(store.io, std.mem.sliceAsBytes(free_node), off);
+        off += free_node.len * @sizeOf(u32);
+        try f.writePositionalAll(store.io, std.mem.sliceAsBytes(free_sst), off);
+        off += free_sst.len * @sizeOf(u32);
+        try f.writePositionalAll(store.io, std.mem.sliceAsBytes(free_cmt), off);
+        try f.sync(store.io);
+    }
+    try store.dir.rename("manifest.tmp", store.dir, "manifest.bin", store.io);
 }
 
 pub fn readManifest(store: DiskStore, allocator: std.mem.Allocator) !ManifestData {
@@ -87,12 +127,31 @@ pub fn readManifest(store: DiskStore, allocator: std.mem.Allocator) !ManifestDat
     defer f.close(store.io);
     var off: u64 = 0;
 
-    var header: ManifestHeader = undefined;
-    const hn = try f.readPositionalAll(store.io, std.mem.asBytes(&header), off);
-    if (hn != @sizeOf(ManifestHeader)) return error.ManifestTruncated;
-    off += @sizeOf(ManifestHeader);
+    // Read the version-1 header prefix first; the v2 tail only exists on disk
+    // when the version field says so.
+    var header: ManifestHeader = .{
+        .magic = 0,
+        .version = 0,
+        .next_node_id = 0,
+        .next_sst_id = 0,
+        .routing_count = 0,
+        .l0_count = 0,
+    };
+    const head_bytes = std.mem.asBytes(&header);
+    const hn = try f.readPositionalAll(store.io, head_bytes[0..MANIFEST_HEADER_V1_SIZE], off);
+    if (hn != MANIFEST_HEADER_V1_SIZE) return error.ManifestTruncated;
+    off += MANIFEST_HEADER_V1_SIZE;
     if (header.magic != MANIFEST_MAGIC) return error.ManifestBadMagic;
-    if (header.version != MANIFEST_VERSION) return error.ManifestVersionMismatch;
+    switch (header.version) {
+        1 => {},
+        2 => {
+            const tail = head_bytes[MANIFEST_HEADER_V1_SIZE..@sizeOf(ManifestHeader)];
+            const tn = try f.readPositionalAll(store.io, tail, off);
+            if (tn != tail.len) return error.ManifestTruncated;
+            off += tail.len;
+        },
+        else => return error.ManifestVersionMismatch,
+    }
 
     const routes = try allocator.alloc(ManifestRouteEntry, header.routing_count);
     errdefer allocator.free(routes);
@@ -107,12 +166,29 @@ pub fn readManifest(store: DiskStore, allocator: std.mem.Allocator) !ManifestDat
     if (l0.len > 0) {
         const ln = try f.readPositionalAll(store.io, std.mem.sliceAsBytes(l0), off);
         if (ln != l0.len * @sizeOf(root.KvEntry)) return error.ManifestTruncated;
+        off += l0.len * @sizeOf(root.KvEntry);
+    }
+
+    const free_node = try allocator.alloc(u32, header.free_node_count);
+    errdefer allocator.free(free_node);
+    const free_sst = try allocator.alloc(u32, header.free_sst_count);
+    errdefer allocator.free(free_sst);
+    const free_cmt = try allocator.alloc(u32, header.free_cmt_count);
+    errdefer allocator.free(free_cmt);
+    for ([_][]u32{ free_node, free_sst, free_cmt }) |list| {
+        if (list.len == 0) continue;
+        const n = try f.readPositionalAll(store.io, std.mem.sliceAsBytes(list), off);
+        if (n != list.len * @sizeOf(u32)) return error.ManifestTruncated;
+        off += list.len * @sizeOf(u32);
     }
 
     return .{
         .header = header,
         .routes = routes,
         .l0 = l0,
+        .free_node = free_node,
+        .free_sst = free_sst,
+        .free_cmt = free_cmt,
     };
 }
 
