@@ -231,6 +231,13 @@ pub const PrefixDBMetrics = extern struct {
     free_sst_ids: u64,
     free_cmt_ids: u64,
     compaction_backlog: u64,
+    // ── Commit-phase breakdown (subsets of commit_block_ns) ──
+    commit_flushl0_ns: u64,
+    commit_dirty_ns: u64,
+    commit_gather_ns: u64,
+    commit_gather_calls: u64,
+    commit_gather_entries: u64,
+    commit_rehash_ns: u64,
 };
 
 /// Fill *out with a snapshot of all internal counters.
@@ -276,6 +283,12 @@ export fn prefixdb_get_metrics(state: *State, out: *PrefixDBMetrics) i32 {
             .free_sst_ids           = gauge_free_sst,
             .free_cmt_ids           = gauge_free_cmt,
             .compaction_backlog     = gauge_backlog,
+            .commit_flushl0_ns      = s.commit_flushl0_ns,
+            .commit_dirty_ns        = s.commit_dirty_ns,
+            .commit_gather_ns       = s.commit_gather_ns,
+            .commit_gather_calls    = s.commit_gather_calls,
+            .commit_gather_entries  = s.commit_gather_entries,
+            .commit_rehash_ns       = s.commit_rehash_ns,
         };
     } else {
         out.* = std.mem.zeroes(PrefixDBMetrics);

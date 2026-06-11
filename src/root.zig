@@ -66,6 +66,13 @@ pub const DbStats = if (options.enable_metrics) struct {
     commit_nodes_processed: u64 = 0,
     /// Cumulative wall-clock nanoseconds spent inside commitBlock.
     commit_block_ns: u64 = 0,
+    /// Commit-phase breakdown (all subsets of commit_block_ns).
+    commit_flushl0_ns: u64 = 0,
+    commit_dirty_ns: u64 = 0,
+    commit_gather_ns: u64 = 0,
+    commit_gather_calls: u64 = 0,
+    commit_gather_entries: u64 = 0,
+    commit_rehash_ns: u64 = 0,
     /// Commitment page ids served from the free list instead of fresh allocation.
     cmt_pages_reused: u64 = 0,
 } else struct {};
@@ -439,6 +446,17 @@ pub const PrefixDB = struct {
     next_cmt_id: CommitmentPageId = 0,
     /// Reusable commitment-page ids (deferred across one manifest checkpoint).
     cmt_free: FreeList = .{},
+    /// Reusable scratch buffers for the hot per-block paths.  None of their
+    /// users is reentrant: gatherSlotValue never nests (cmtMaterialize calls
+    /// it sequentially), flushL0Prefix never recurses, and commitBlock is the
+    /// sole user of the dirty map / at-depth list.
+    gather_found: std.AutoHashMap(Key, Value),
+    gather_list: std.ArrayList(KvEntry) = .empty,
+    l0_flush_map: std.AutoHashMap(Key, Value),
+    l0_flush_sorted: std.ArrayList(KvEntry) = .empty,
+    l0_flush_all: std.ArrayList(IndexedKv) = .empty,
+    commit_dirty: std.AutoHashMap(NodeCoord, u64),
+    commit_at_depth: std.ArrayList(NodeCoord) = .empty,
     /// Keys written (incl. tombstones) since the last commitBlock; the sole
     /// source of commitment dirtiness (write-stream derived, §4.1).
     block_keys: std.ArrayList(Key),
@@ -538,6 +556,9 @@ pub const PrefixDB = struct {
             .cmt_d2_ids = cmt_d2_ids,
             .cmt_d2_last = cmt_d2_last,
             .block_keys = .empty,
+            .gather_found = std.AutoHashMap(Key, Value).init(allocator),
+            .l0_flush_map = std.AutoHashMap(Key, Value).init(allocator),
+            .commit_dirty = std.AutoHashMap(NodeCoord, u64).init(allocator),
             .kv_map = kv_map_mod.KvMap.init(allocator),
             .allocator = allocator,
             // WAL and store are attached by openWithConfig for disk-backed databases.
@@ -695,6 +716,9 @@ pub const PrefixDB = struct {
             .next_cmt_id = manifest.header.next_cmt_id,
             .block_keys = .empty,
             .max_depth_used = max_depth_used,
+            .gather_found = std.AutoHashMap(Key, Value).init(allocator),
+            .l0_flush_map = std.AutoHashMap(Key, Value).init(allocator),
+            .commit_dirty = std.AutoHashMap(NodeCoord, u64).init(allocator),
             .kv_map = kv_map_mod.KvMap.init(allocator),
             .allocator = allocator,
             // store and wal remain null during replay so write/commitBlock skip WAL
@@ -1115,6 +1139,13 @@ pub const PrefixDB = struct {
         self.cmt_deep_flush.deinit();
         self.cmt_free.deinit(self.allocator);
         self.block_keys.deinit(self.allocator);
+        self.gather_found.deinit();
+        self.gather_list.deinit(self.allocator);
+        self.l0_flush_map.deinit();
+        self.l0_flush_sorted.deinit(self.allocator);
+        self.l0_flush_all.deinit(self.allocator);
+        self.commit_dirty.deinit();
+        self.commit_at_depth.deinit(self.allocator);
     }
 
     /// Next commitment-page id: reuse a reclaimed slot when one is available.
@@ -1317,8 +1348,8 @@ pub const PrefixDB = struct {
         if (comptime options.enable_metrics) self.stats.l0_flushes += 1;
         const alloc = self.allocator;
 
-        var map = std.AutoHashMap(Key, Value).init(alloc);
-        defer map.deinit();
+        const map = &self.l0_flush_map;
+        map.clearRetainingCapacity();
 
         var k: usize = self.l0.entries.items.len;
         while (k > 0) {
@@ -1342,8 +1373,8 @@ pub const PrefixDB = struct {
 
         if (map.count() == 0) return;
 
-        var sorted = std.ArrayList(KvEntry).empty;
-        defer sorted.deinit(alloc);
+        const sorted = &self.l0_flush_sorted;
+        sorted.clearRetainingCapacity();
         var it = map.iterator();
         while (it.next()) |kv| {
             try sorted.append(alloc, .{ .key = kv.key_ptr.*, .value = kv.value_ptr.* });
@@ -1423,17 +1454,54 @@ pub const PrefixDB = struct {
     // ─── Block commitment (§9) ────────────────────────────────────────────────
 
     /// Flush every remaining L0 entry to L1 regardless of group size.
+    const IndexedKv = struct { entry: KvEntry, idx: u32 };
+
+    /// Order by key ascending, then by recency (higher idx = newer) first, so
+    /// after sorting the first entry of each equal-key run is the live value.
+    fn indexedKvLessThan(_: void, a: IndexedKv, b: IndexedKv) bool {
+        const ord = std.mem.order(u8, &a.entry.key, &b.entry.key);
+        if (ord != .eq) return ord == .lt;
+        return a.idx > b.idx;
+    }
+
     pub fn flushL0All(self: *PrefixDB) !void {
-        var prefixes = std.AutoHashMap(PrefixData, void).init(self.allocator);
-        defer prefixes.deinit();
-        for (self.l0.entries.items) |e| {
-            try prefixes.put(prefixData(&e.key, 1), {});
+        if (self.l0.entries.items.len == 0) return;
+        // One sort replaces 64 flushL0Prefix rounds (each of which rescans the
+        // whole L0 and rebuilds the remainder list).  Sorting by (key, newest
+        // first) makes duplicates adjacent with the live value first, and key
+        // order IS depth-1 prefix order, so prefix groups chunk directly.
+        const all = &self.l0_flush_all;
+        all.clearRetainingCapacity();
+        try all.ensureUnusedCapacity(self.allocator, self.l0.entries.items.len);
+        for (self.l0.entries.items, 0..) |e, idx| {
+            all.appendAssumeCapacity(.{ .entry = e, .idx = @intCast(idx) });
         }
-        var list = std.ArrayList(PrefixData).empty;
-        defer list.deinit(self.allocator);
-        var it = prefixes.iterator();
-        while (it.next()) |entry| try list.append(self.allocator, entry.key_ptr.*);
-        for (list.items) |p| try self.flushL0Prefix(p);
+        self.l0.entries.clearRetainingCapacity();
+        std.mem.sort(IndexedKv, all.items, {}, indexedKvLessThan);
+
+        var i: usize = 0;
+        while (i < all.items.len) {
+            // Per-prefix run, deduplicated (first occurrence = newest write).
+            const prefix = prefixData(&all.items[i].entry.key, 1);
+            const sorted = &self.l0_flush_sorted;
+            sorted.clearRetainingCapacity();
+            while (i < all.items.len and prefixData(&all.items[i].entry.key, 1) == prefix) {
+                const e = all.items[i].entry;
+                if (sorted.items.len == 0 or
+                    !std.mem.eql(u8, &sorted.items[sorted.items.len - 1].key, &e.key))
+                {
+                    try sorted.append(self.allocator, e);
+                }
+                i += 1;
+            }
+            if (comptime options.enable_metrics) self.stats.l0_flushes += 1;
+            var offset: usize = 0;
+            while (offset < sorted.items.len) {
+                const end = @min(offset + PAGE_ENTRIES, sorted.items.len);
+                try self.writeSstChunk(1, prefix, sorted.items[offset..end]);
+                offset = end;
+            }
+        }
     }
 
     // ─── Commitment tree internals (docs/commitment_redesign.md §4) ──────────
@@ -1532,12 +1600,39 @@ pub const PrefixDB = struct {
         }
     }
 
+    /// Recompute only the internal heap values on the paths from the changed
+    /// leaves (bit c set ⇔ h[64+c] changed) up to h[1].  Typical commits change
+    /// one or two leaves per page, needing ~6 combines instead of 63.  Falls
+    /// back to the full rebuild when most leaves changed (cold materialisation).
+    fn updateInternals(page: *CommitmentPage, changed: u64) void {
+        if (changed == 0) return;
+        if (@popCount(changed) > 16) return rebuildInternals(page);
+        var mask = changed; // node mask within the current level
+        var base: usize = 64; // level k holds h[base .. 2*base)
+        while (base > 1) {
+            const parent_base = base / 2;
+            var parents: u64 = 0;
+            var m = mask;
+            while (m != 0) : (m &= m - 1) {
+                parents |= @as(u64, 1) << @intCast(@ctz(m) / 2);
+            }
+            var it = parents;
+            while (it != 0) : (it &= it - 1) {
+                const i = parent_base + @ctz(it);
+                page.h[i] = merkle.combine(&page.h[2 * i], &page.h[2 * i + 1]);
+            }
+            mask = parents;
+            base = parent_base;
+        }
+    }
+
     /// Fill all invalid leaves of `page` (child page roots where a child node
     /// exists, bottom-slot gathers otherwise) and rebuild the internals.
     /// Recursive: a child page may itself need materialising first.
     fn cmtMaterialize(self: *PrefixDB, depth: u32, prefix: PrefixData, page: *CommitmentPage) anyerror!void {
         if (page.leaf_valid == ~@as(u64, 0)) return;
-        var missing = ~page.leaf_valid;
+        const missing0 = ~page.leaf_valid;
+        var missing = missing0;
         while (missing != 0) : (missing &= missing - 1) {
             const c: u32 = @ctz(missing);
             const child_prefix = (prefix << STRIDE) | c;
@@ -1551,7 +1646,9 @@ pub const PrefixDB = struct {
             }
             page.leaf_valid |= @as(u64, 1) << @as(u6, @intCast(c));
         }
-        rebuildInternals(page);
+        const tr0 = if (comptime options.enable_metrics) monoNs() else {};
+        updateInternals(page, missing0);
+        if (comptime options.enable_metrics) self.stats.commit_rehash_ns += monoNs() - tr0;
     }
 
     /// Deepest depth (in strides) at which a node exists on `key`'s path;
@@ -1573,9 +1670,10 @@ pub const PrefixDB = struct {
     /// it either, so all matching keys live in ancestor buffers at depths
     /// 1..level-1.  L0 is empty here: commitBlock flushes it before gathering.
     fn gatherSlotValue(self: *PrefixDB, level: u32, p: PrefixData) anyerror!Hash {
+        const tg0 = if (comptime options.enable_metrics) monoNs() else {};
         const alloc = self.allocator;
-        var found = std.AutoHashMap(Key, Value).init(alloc);
-        defer found.deinit();
+        const found = &self.gather_found;
+        found.clearRetainingCapacity();
 
         // Shallow depths first: read() precedence is shallowest-depth wins,
         // and within a node append (newest first) beats sorted.
@@ -1635,15 +1733,21 @@ pub const PrefixDB = struct {
 
         // Tombstones shadow older values during precedence resolution above;
         // only now do deleted keys drop out of the trie.
-        var list = std.ArrayList(KvEntry).empty;
-        defer list.deinit(alloc);
+        const list = &self.gather_list;
+        list.clearRetainingCapacity();
         var it = found.iterator();
         while (it.next()) |kv| {
             if (std.mem.eql(u8, kv.value_ptr, &TOMBSTONE)) continue;
             try list.append(alloc, .{ .key = kv.key_ptr.*, .value = kv.value_ptr.* });
         }
         std.mem.sort(KvEntry, list.items, {}, kvLessThan);
-        return subtreeValue(list.items, STRIDE * level);
+        const result = subtreeValue(list.items, STRIDE * level);
+        if (comptime options.enable_metrics) {
+            self.stats.commit_gather_ns += monoNs() - tg0;
+            self.stats.commit_gather_calls += 1;
+            self.stats.commit_gather_entries += list.items.len;
+        }
+        return result;
     }
 
     /// Recompute the Merkle state root after a block of writes.
@@ -1661,10 +1765,12 @@ pub const PrefixDB = struct {
         const t0 = if (comptime options.enable_metrics) monoNs() else {};
 
         try self.flushL0All();
+        const t1 = if (comptime options.enable_metrics) monoNs() else {};
+        if (comptime options.enable_metrics) self.stats.commit_flushl0_ns += t1 - t0;
 
         // Dirty slot masks per page, derived from the block's written keys.
-        var dirty = std.AutoHashMap(NodeCoord, u64).init(self.allocator);
-        defer dirty.deinit();
+        const dirty = &self.commit_dirty;
+        dirty.clearRetainingCapacity();
         var max_depth: u32 = 0;
         for (self.block_keys.items) |key| {
             const bottom = self.deepestNodeOnPath(&key);
@@ -1679,12 +1785,13 @@ pub const PrefixDB = struct {
             if (bottom > max_depth) max_depth = bottom;
         }
         self.block_keys.clearRetainingCapacity();
+        if (comptime options.enable_metrics) self.stats.commit_dirty_ns += monoNs() - t1;
 
         // Process deepest-first; each page pushes its new h[1] into its parent.
         var depth: u32 = max_depth;
         while (true) {
-            var at_depth = std.ArrayList(NodeCoord).empty;
-            defer at_depth.deinit(self.allocator);
+            const at_depth = &self.commit_at_depth;
+            at_depth.clearRetainingCapacity();
             {
                 var dit = dirty.iterator();
                 while (dit.next()) |e| {
@@ -1699,7 +1806,8 @@ pub const PrefixDB = struct {
                 const page = try self.cmtGetOrCreate(coord.depth, coord.prefix);
 
                 // Refresh lazily-invalid leaves plus the dirty bottom slots.
-                var need = ~page.leaf_valid | mask;
+                const need0 = ~page.leaf_valid | mask;
+                var need = need0;
                 while (need != 0) : (need &= need - 1) {
                     const c: u32 = @ctz(need);
                     const cbit = @as(u64, 1) << @as(u6, @intCast(c));
@@ -1717,7 +1825,9 @@ pub const PrefixDB = struct {
                     }
                     page.leaf_valid |= cbit;
                 }
-                rebuildInternals(page);
+                const tr0 = if (comptime options.enable_metrics) monoNs() else {};
+                updateInternals(page, need0);
+                if (comptime options.enable_metrics) self.stats.commit_rehash_ns += monoNs() - tr0;
                 self.cmtMarkFlush(coord.depth, coord.prefix);
 
                 if (coord.depth > 0) {

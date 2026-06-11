@@ -432,6 +432,12 @@ def run_benchmark(
             "total_disk_sst_writes":         total_disk_sst_writes,
             "total_commit_nodes_processed":  _sum_metric("commit_nodes_processed"),
             "total_commit_block_ns":         _sum_metric("commit_block_ns"),
+            "total_commit_flushl0_ns":       _sum_metric("commit_flushl0_ns"),
+            "total_commit_dirty_ns":         _sum_metric("commit_dirty_ns"),
+            "total_commit_gather_ns":        _sum_metric("commit_gather_ns"),
+            "total_commit_gather_calls":     _sum_metric("commit_gather_calls"),
+            "total_commit_gather_entries":   _sum_metric("commit_gather_entries"),
+            "total_commit_rehash_ns":        _sum_metric("commit_rehash_ns"),
         },
     }
 
@@ -545,6 +551,18 @@ def main() -> None:
         f"state_root_total={s['state_root_total_us']/1e3:.1f}ms\n"
         f"  [internal] read_amp={i['read_amp']}  write_amp={i['write_amp']}  "
         f"sst_hit={i['sst_cache_hit_rate']:.1%}  filter_sel={i['filter_selectivity']:.1%}",
+        file=sys.stderr,
+    )
+    commit_other_ns = (i['total_commit_block_ns'] - i['total_commit_flushl0_ns']
+                       - i['total_commit_dirty_ns'] - i['total_commit_gather_ns']
+                       - i['total_commit_rehash_ns'])
+    print(
+        f"  [commit] flushl0={i['total_commit_flushl0_ns']/1e6:.0f}ms  "
+        f"dirty={i['total_commit_dirty_ns']/1e6:.0f}ms  "
+        f"gather={i['total_commit_gather_ns']/1e6:.0f}ms "
+        f"({i['total_commit_gather_calls']} calls, {i['total_commit_gather_entries']} entries)  "
+        f"rehash={i['total_commit_rehash_ns']/1e6:.0f}ms  "
+        f"other={commit_other_ns/1e6:.0f}ms",
         file=sys.stderr,
     )
 

@@ -112,6 +112,13 @@ class Metrics(ctypes.Structure):
         ("free_sst_ids",            ctypes.c_uint64),
         ("free_cmt_ids",            ctypes.c_uint64),
         ("compaction_backlog",      ctypes.c_uint64),
+        # Commit-phase breakdown (subsets of commit_block_ns).
+        ("commit_flushl0_ns",       ctypes.c_uint64),
+        ("commit_dirty_ns",         ctypes.c_uint64),
+        ("commit_gather_ns",        ctypes.c_uint64),
+        ("commit_gather_calls",     ctypes.c_uint64),
+        ("commit_gather_entries",   ctypes.c_uint64),
+        ("commit_rehash_ns",        ctypes.c_uint64),
     ]
 
     def as_dict(self) -> dict:
