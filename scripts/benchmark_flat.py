@@ -67,6 +67,7 @@ def _run_block(
     live_keys: set[bytes],
     compact_budget: int,
     batch_reads: bool,
+    bal_prefetch: bool,
 ) -> dict:
     """Execute one block's ops on `db`, then end the block (freeze if due) and spend
     one idle-window compaction budget if a compaction is due. No state root."""
@@ -74,6 +75,17 @@ def _run_block(
     write_lats: list[float] = []
     read_hits = 0
     block_writes: dict[bytes, bytes] = {}
+
+    # BAL mode: the whole block read set is known upfront, so prefetch it in ONE batched
+    # io_uring pass (queue depth up to the ring), filling the prefetch map; execution then
+    # reads from RAM. Writes during the block still shadow it (read-your-writes preserved).
+    prefetch_lat = 0.0
+    if bal_prefetch:
+        read_keys = [derive_key(a, sk) for (_, a, sk, op, _) in ops if op == 'r']
+        if read_keys:
+            t0 = time.perf_counter()
+            db.prefetch(read_keys)
+            prefetch_lat = time.perf_counter() - t0
 
     # Pending run of consecutive reads, flushed as one io_uring batch (batch mode).
     pending_keys: list[bytes] = []
@@ -92,10 +104,12 @@ def _run_block(
                 read_hits += 1
         pending_keys.clear()
 
+    # In BAL mode reads resolve from the prefetch map, so issue them serially (RAM-fast).
+    use_batch = batch_reads and not bal_prefetch
     for _, account, storage_key, op, value in ops:
         k = derive_key(account, storage_key)
         if op == 'w':
-            if batch_reads:
+            if use_batch:
                 flush_reads()  # preserve read-your-writes ordering
             t0 = time.perf_counter()
             db.put(k, value)
@@ -103,7 +117,7 @@ def _run_block(
             block_writes[k] = value
             live_keys.add(k)
         else:
-            if batch_reads:
+            if use_batch:
                 pending_keys.append(k)
             else:
                 t0 = time.perf_counter()
@@ -111,7 +125,7 @@ def _run_block(
                 read_lats.append(time.perf_counter() - t0)
                 if result is not None:
                     read_hits += 1
-    if batch_reads:
+    if use_batch:
         flush_reads()
 
     # Block boundary: freeze if due (NO commit / state root).
@@ -138,7 +152,7 @@ def _run_block(
         "reads": n_r,
         "writes": n_w,
         "ops": n_r + n_w,
-        "block_duration_ms": round((op_time + end_block_lat + comp_lat) * 1e3, 3),
+        "block_duration_ms": round((op_time + prefetch_lat + end_block_lat + comp_lat) * 1e3, 3),
         "read_throughput_ops_s":  round(n_r / max(sum(read_lats),  1e-12), 1),
         "write_throughput_ops_s": round(n_w / max(sum(write_lats), 1e-12), 1),
         "read_latency":  _latency_stats(read_lats),
@@ -150,6 +164,7 @@ def _run_block(
         "end_block_latency_us": round(end_block_lat * 1e6, 2),
         "compaction_status": comp_status,
         "compaction_latency_ms": round(comp_lat * 1e3, 3),
+        "prefetch_latency_ms": round(prefetch_lat * 1e3, 3),
     }
 
 
@@ -169,6 +184,8 @@ def run_benchmark(
     freeze_interval: int,
     compact_budget: int,
     batch_reads: bool,
+    bal_prefetch: bool,
+    o_direct: bool,
 ) -> tuple[list[dict], dict]:
     block_metrics: list[dict] = []
     live_keys: set[bytes] = set()
@@ -183,9 +200,10 @@ def run_benchmark(
         memtable_cap=memtable_cap,
         l0_threshold=l0_threshold,
         freeze_interval=freeze_interval,
+        o_direct=o_direct,
     ) as db:
         def finish(bno: int, ops: list[tuple]) -> None:
-            bm = _run_block(db, bno, ops, live_keys, compact_budget, batch_reads)
+            bm = _run_block(db, bno, ops, live_keys, compact_budget, batch_reads, bal_prefetch)
             block_metrics.append(bm)
             if print_every > 0 and (bno % print_every == 0 or bno == 1):
                 _print_progress(bm, num_blocks, time.perf_counter() - bench_start)
@@ -244,6 +262,9 @@ def run_benchmark(
         "num_compactions_done": num_compactions_done,
         "final_covered_height": final_covered,
         "batch_reads": batch_reads,
+        "bal_prefetch": bal_prefetch,
+        "o_direct": o_direct,
+        "prefetch_total_ms": round(sum(m["prefetch_latency_ms"] for m in block_metrics), 2),
     }
     return block_metrics, summary
 
@@ -278,6 +299,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--freeze-interval", type=int, default=8,  help="Blocks between freezes (default 8)")
     p.add_argument("--compact-budget",  type=int, default=4 << 20, help="New-base output bytes per idle-window compaction step (default 4 MiB)")
     p.add_argument("--batch-reads", action="store_true", help="Batch consecutive reads via io_uring get_many (amortized read latency)")
+    p.add_argument("--bal-prefetch", action="store_true", help="Block Access List mode: prefetch the whole block read set in one io_uring batch (deep queue), then execute from RAM")
+    p.add_argument("--o-direct", action="store_true", help="Open the hot read fd with O_DIRECT (bypass page cache) to measure cold reads")
     p.add_argument("--db-dir", default=None, metavar="PATH", help="Directory for the store (default: a temp dir, removed at exit)")
     p.add_argument("--keep", action="store_true", help="Keep the temp db dir after the run")
     return p.parse_args()
@@ -301,6 +324,7 @@ def main() -> None:
         "prefix_bits": args.prefix_bits, "memtable_cap": args.memtable_cap,
         "l0_threshold": args.l0_threshold, "freeze_interval": args.freeze_interval,
         "compact_budget": args.compact_budget, "batch_reads": args.batch_reads,
+        "bal_prefetch": args.bal_prefetch, "o_direct": args.o_direct,
         "db_dir": db_dir,
     }
 
@@ -308,7 +332,7 @@ def main() -> None:
         f"Starting flat-db benchmark: {args.blocks} blocks, pool={args.pool_size}, "
         f"alpha={args.alpha}, read_prob={args.read_prob:.0%}, prefix_bits={args.prefix_bits}, "
         f"freeze_interval={args.freeze_interval}, l0_threshold={args.l0_threshold}, "
-        f"batch_reads={args.batch_reads}",
+        f"batch_reads={args.batch_reads}, bal_prefetch={args.bal_prefetch}, o_direct={args.o_direct}",
         file=sys.stderr,
     )
 
@@ -325,6 +349,7 @@ def main() -> None:
             prefix_bits=args.prefix_bits, memtable_cap=args.memtable_cap,
             l0_threshold=args.l0_threshold, freeze_interval=args.freeze_interval,
             compact_budget=args.compact_budget, batch_reads=args.batch_reads,
+            bal_prefetch=args.bal_prefetch, o_direct=args.o_direct,
         )
         with open(args.output, "w") as f:
             json.dump({"config": config, "summary": summary, "blocks": block_metrics}, f, indent=2)
@@ -342,6 +367,7 @@ def main() -> None:
         f"r_tput={s['overall_read_throughput_ops_s']:.0f}/s\n"
         f"  freezes={s['num_freezes']}  compactions_done={s['num_compactions_done']}  "
         f"cmp_total={s['compaction_total_ms']:.1f}ms  cmp_frac={s['compaction_fraction']:.1%}\n"
+        f"  prefetch_total={s['prefetch_total_ms']:.1f}ms  o_direct={s['o_direct']}  bal_prefetch={s['bal_prefetch']}\n"
         f"  write_amp(logical)={s['write_amplification']}  covered_height={s['final_covered_height']}",
         file=sys.stderr,
     )

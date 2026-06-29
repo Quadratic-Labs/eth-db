@@ -645,6 +645,22 @@ and some of the bandwidth just bought).
   3.65 s → 0.50 s (read latency 61.7 µs → 4.0 µs, throughput ~14.5K → ~105K ops/s).
   Batching now barely matters since the batch-scaling allocation is gone. The window size
   is still a fixed config (1024); making it configurable is below.
+- **`src/flat_store.zig` — BAL prefetch + O_DIRECT.** With a Block Access List the whole
+  block read set is known upfront, so `prefetch(keys)` issues it as **one batched
+  io_uring pass** (queue depth up to the ring, hiding cold-NVMe latency that the
+  interleaved per-write batches — effective QD ~4 — cannot), caching base values in a
+  `prefetch_map`. The map is consulted in the merge **below L0** (`memtable → L0 →
+  prefetch → base`), so writes during the block still shadow it — read-your-writes holds
+  — and execution reads resolve from RAM with no per-read disk I/O. The map is cleared on
+  each `prefetch` and on compaction (base change). `o_direct` (Config/`flatdb_open` flag)
+  opens a separate O_DIRECT fd for hot reads so cold-read behaviour can be measured
+  without a >RAM base; cold paths (compaction/recovery) keep the buffered fd. To satisfy
+  O_DIRECT, windowed reads are now **page-aligned unconditionally** (read the covering
+  pages, slice the window at `sub`), the scratch slab is 4 KiB-aligned, and base files are
+  padded to a page. C API: `flatdb_prefetch` + `o_direct` arg on `flatdb_open`; Python:
+  `FlatDB.prefetch` + `o_direct=`; benchmark: `--bal-prefetch` (prefetch the block read
+  set, then execute from RAM) and `--o-direct`. 1 new test (prefetch read-your-writes) +
+  1 (O_DIRECT aligned reads); 19 flat_store tests pass.
 - **v1 limits / next:** (1) orphan-file GC on `open` (an abandoned job leaves an
   unreferenced base file). (2) directory-fsync for strict crash durability; optional
   `O_DIRECT`. (3) a min-heap merge if `K` grows large (linear per-record source scan

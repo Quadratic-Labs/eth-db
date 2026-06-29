@@ -30,6 +30,7 @@ const std = @import("std");
 const t = @import("types.zig");
 const uring = @import("uring_read.zig");
 const Io = std.Io;
+const linux = std.os.linux;
 
 pub const RECORD_SIZE: usize = 64; // base on-disk record: key(32) || value(32)
 /// L0 run on-disk record: key(32) || value(32) || tombstone(1). Runs (RAM-resident,
@@ -44,12 +45,25 @@ pub const FREEZE_BLOCK_INTERVAL_DEFAULT: u64 = 64;
 const MANIFEST_MAGIC: u32 = 0x31_54_4C_46; // "FLT1"
 const MANIFEST_VERSION: u32 = 1;
 
+// Windowed base reads are page-aligned so they satisfy O_DIRECT (and are harmless
+// without it). The slab and base files are aligned/padded to this boundary.
+const PAGE_SIZE: usize = 4096;
+const PAGE_ALIGN: std.mem.Alignment = .fromByteUnits(PAGE_SIZE);
+
+inline fn alignDownPage(x: u64) u64 {
+    return x & ~@as(u64, PAGE_SIZE - 1);
+}
+inline fn alignUpPage(x: usize) usize {
+    return (x + (PAGE_SIZE - 1)) & ~@as(usize, PAGE_SIZE - 1);
+}
+
 pub const Config = struct {
     prefix_bits: u6,
     window_entries: u32 = 0, // 0 → default
     memtable_cap: usize = 0, // 0 → default
     l0_compact_threshold: usize = 0, // 0 → default
     freeze_block_interval: u64 = 0, // 0 → default
+    o_direct: bool = false, // open the hot read fd with O_DIRECT (bypass page cache)
 };
 
 pub const Partition = struct {
@@ -85,7 +99,7 @@ const Run = struct {
     }
 };
 
-const SlotMeta = struct { gi: usize, w0: u32, w: u32, count: u32, part_off: u64 };
+const SlotMeta = struct { gi: usize, w0: u32, w: u32, count: u32, part_off: u64, sub: usize };
 
 /// Result of a RAM-tier (memtable + L0) lookup: a live value, a tombstone (key
 /// deleted), or no entry in RAM (fall through to the base).
@@ -133,15 +147,17 @@ const RunRec = extern struct { seq: u32, entry_count: u32 };
 
 /// Reusable read-path buffers, allocated once per store (see FlatStore scratch fields).
 const Scratch = struct {
-    slab: []u8,
+    slab: []align(PAGE_SIZE) u8, // page-aligned for O_DIRECT; `slot_size` bytes per slot
     reqs: []uring.Request,
     results: []uring.Result,
     meta: []SlotMeta,
     unresolved: []usize,
+    pf_keys: []t.Key, // prefetch: keys that miss RAM
+    pf_out: []?t.Value, // prefetch: their base values
 };
 
-fn allocScratch(allocator: std.mem.Allocator, depth: usize, win_entries: usize) !Scratch {
-    const slab = try allocator.alloc(u8, depth * win_entries * RECORD_SIZE);
+fn allocScratch(allocator: std.mem.Allocator, depth: usize, slot_size: usize) !Scratch {
+    const slab = try allocator.alignedAlloc(u8, PAGE_ALIGN, depth * slot_size);
     errdefer allocator.free(slab);
     const reqs = try allocator.alloc(uring.Request, depth);
     errdefer allocator.free(reqs);
@@ -150,7 +166,11 @@ fn allocScratch(allocator: std.mem.Allocator, depth: usize, win_entries: usize) 
     const meta = try allocator.alloc(SlotMeta, depth);
     errdefer allocator.free(meta);
     const unresolved = try allocator.alloc(usize, 0);
-    return .{ .slab = slab, .reqs = reqs, .results = results, .meta = meta, .unresolved = unresolved };
+    errdefer allocator.free(unresolved);
+    const pf_keys = try allocator.alloc(t.Key, 0);
+    errdefer allocator.free(pf_keys);
+    const pf_out = try allocator.alloc(?t.Value, 0);
+    return .{ .slab = slab, .reqs = reqs, .results = results, .meta = meta, .unresolved = unresolved, .pf_keys = pf_keys, .pf_out = pf_out };
 }
 
 fn freeScratch(allocator: std.mem.Allocator, s: Scratch) void {
@@ -159,6 +179,8 @@ fn freeScratch(allocator: std.mem.Allocator, s: Scratch) void {
     allocator.free(s.results);
     allocator.free(s.meta);
     allocator.free(s.unresolved);
+    allocator.free(s.pf_keys);
+    allocator.free(s.pf_out);
 }
 
 pub const FlatStore = struct {
@@ -190,11 +212,25 @@ pub const FlatStore = struct {
 
     // Reusable read-path scratch, allocated once (single-threaded store) so getMany
     // does no per-call allocation. `scratch_slab` holds up to `reader.depth` windows.
-    scratch_slab: []u8,
+    scratch_slab: []align(PAGE_SIZE) u8,
+    slot_size: usize, // per-slot stride in scratch_slab (page-multiple, ≥ window + 1 page)
     scratch_reqs: []uring.Request,
     scratch_results: []uring.Result,
     scratch_meta: []SlotMeta,
     unresolved_buf: []usize, // grown on demand to the largest batch seen
+
+    // O_DIRECT: when set, hot windowed reads use this fd (page cache bypassed), so the
+    // benchmark can measure genuinely cold reads. Cold paths (compaction/recovery) keep
+    // using the buffered `base_file`. null ⇒ reads go through base_file.handle.
+    o_direct: bool,
+    direct_fd: ?std.posix.fd_t,
+
+    // BAL prefetch (§ block access lists): one batched base read of a block's read set,
+    // cached here and consulted in the merge *below* L0 — `memtable → L0 → prefetch → base`
+    // — so writes still shadow it (read-your-writes) while reads avoid re-hitting disk.
+    prefetch_map: std.AutoHashMap(t.Key, ?t.Value), // value null = key absent in base
+    pf_keys: []t.Key,
+    pf_out: []?t.Value,
 
     // ─── Lifecycle ───────────────────────────────────────────────────────────────
 
@@ -226,8 +262,15 @@ pub const FlatStore = struct {
         errdefer allocator.free(name_copy);
 
         const win_entries: usize = if (config.window_entries == 0) WINDOW_ENTRIES_DEFAULT else config.window_entries;
-        const sc = try allocScratch(allocator, reader.depth, win_entries);
+        const slot_size = alignUpPage(win_entries * RECORD_SIZE) + PAGE_SIZE; // window + 1 page of offset slop
+        const sc = try allocScratch(allocator, reader.depth, slot_size);
         errdefer freeScratch(allocator, sc);
+
+        const direct_fd: ?std.posix.fd_t = if (config.o_direct)
+            try std.posix.openat(dir.handle, bname, .{ .ACCMODE = .RDONLY, .DIRECT = true }, 0)
+        else
+            null;
+        errdefer if (direct_fd) |fd| { _ = linux.close(fd); };
 
         var store: FlatStore = .{
             .allocator = allocator,
@@ -248,10 +291,16 @@ pub const FlatStore = struct {
             .freeze_block_interval = if (config.freeze_block_interval == 0) FREEZE_BLOCK_INTERVAL_DEFAULT else config.freeze_block_interval,
             .covered_height = 0,
             .scratch_slab = sc.slab,
+            .slot_size = slot_size,
             .scratch_reqs = sc.reqs,
             .scratch_results = sc.results,
             .scratch_meta = sc.meta,
             .unresolved_buf = sc.unresolved,
+            .o_direct = config.o_direct,
+            .direct_fd = direct_fd,
+            .prefetch_map = std.AutoHashMap(t.Key, ?t.Value).init(allocator),
+            .pf_keys = sc.pf_keys,
+            .pf_out = sc.pf_out,
         };
         try store.writeManifest();
         return store;
@@ -303,8 +352,15 @@ pub const FlatStore = struct {
         const name_copy = try allocator.dupe(u8, name);
         errdefer allocator.free(name_copy);
 
-        const sc = try allocScratch(allocator, reader.depth, m.header.window_entries);
+        const slot_size = alignUpPage(@as(usize, m.header.window_entries) * RECORD_SIZE) + PAGE_SIZE;
+        const sc = try allocScratch(allocator, reader.depth, slot_size);
         errdefer freeScratch(allocator, sc);
+
+        const direct_fd: ?std.posix.fd_t = if (config.o_direct)
+            try std.posix.openat(dir.handle, bname, .{ .ACCMODE = .RDONLY, .DIRECT = true }, 0)
+        else
+            null;
+        errdefer if (direct_fd) |fd| { _ = linux.close(fd); };
 
         return .{
             .allocator = allocator,
@@ -325,14 +381,35 @@ pub const FlatStore = struct {
             .freeze_block_interval = if (config.freeze_block_interval == 0) FREEZE_BLOCK_INTERVAL_DEFAULT else config.freeze_block_interval,
             .covered_height = m.header.covered_height,
             .scratch_slab = sc.slab,
+            .slot_size = slot_size,
             .scratch_reqs = sc.reqs,
             .scratch_results = sc.results,
             .scratch_meta = sc.meta,
             .unresolved_buf = sc.unresolved,
+            .o_direct = config.o_direct,
+            .direct_fd = direct_fd,
+            .prefetch_map = std.AutoHashMap(t.Key, ?t.Value).init(allocator),
+            .pf_keys = sc.pf_keys,
+            .pf_out = sc.pf_out,
         };
     }
 
+    /// fd used for hot windowed reads: the O_DIRECT fd if enabled, else the base file.
+    fn hotFd(self: *const FlatStore) std.posix.fd_t {
+        return self.direct_fd orelse self.base_file.handle;
+    }
+
+    /// (Re)open the O_DIRECT fd for the current base generation.
+    fn openDirectFd(self: *FlatStore) !std.posix.fd_t {
+        var nb: [256]u8 = undefined;
+        const bname = try fmtBase(&nb, self.name, self.base_gen);
+        return std.posix.openat(self.dir.handle, bname, .{ .ACCMODE = .RDONLY, .DIRECT = true }, 0);
+    }
+
     pub fn deinit(self: *FlatStore) void {
+        if (self.direct_fd) |fd| {
+            _ = linux.close(fd);
+        }
         if (self.job) |*job| {
             job.new_file.close(self.io);
             self.allocator.free(job.new_dir);
@@ -347,12 +424,15 @@ pub const FlatStore = struct {
         self.l0.deinit(self.allocator);
         self.allocator.free(self.directory);
         self.allocator.free(self.name);
+        self.prefetch_map.deinit();
         freeScratch(self.allocator, .{
             .slab = self.scratch_slab,
             .reqs = self.scratch_reqs,
             .results = self.scratch_results,
             .meta = self.scratch_meta,
             .unresolved = self.unresolved_buf,
+            .pf_keys = self.pf_keys,
+            .pf_out = self.pf_out,
         });
     }
 
@@ -597,6 +677,15 @@ pub const FlatStore = struct {
     fn finishCompaction(self: *FlatStore) !void {
         const a = self.allocator;
         try self.flushWrite(&self.job.?);
+        // Pad the new base to a page multiple so O_DIRECT full-block reads stay in-file.
+        {
+            const real: usize = @intCast(self.job.?.write_off);
+            const padded = alignUpPage(real);
+            if (padded > real) {
+                const zeros = [_]u8{0} ** PAGE_SIZE;
+                try self.job.?.new_file.writePositionalAll(self.io, zeros[0 .. padded - real], self.job.?.write_off);
+            }
+        }
         try self.job.?.new_file.sync(self.io);
 
         const job = self.job.?;
@@ -624,9 +713,20 @@ pub const FlatStore = struct {
         self.directory = job.new_dir;
         self.base_gen = job.new_gen;
 
+        // Re-point the O_DIRECT fd at the new base generation (buffered fallback on failure).
+        if (self.o_direct) {
+            if (self.direct_fd) |fd| {
+            _ = linux.close(fd);
+        }
+            self.direct_fd = self.openDirectFd() catch null;
+        }
+
         for (0..folded) |i| self.l0.items[i].deinit(a);
         std.mem.copyForwards(Run, self.l0.items[0..remaining], self.l0.items[folded .. folded + remaining]);
         self.l0.shrinkRetainingCapacity(remaining);
+
+        // Base changed — any prefetched base values are now stale.
+        self.prefetch_map.clearRetainingCapacity();
 
         a.free(job.write_buf);
         a.free(job.base_buf);
@@ -746,12 +846,56 @@ pub const FlatStore = struct {
                 .value => |v| out[gi] = v,
                 .tombstone => out[gi] = null, // deleted in RAM — no base read
                 .miss => {
-                    unresolved[nun] = gi;
-                    nun += 1;
+                    // Below L0: a prefetched base value (or known-absent) resolves here
+                    // without a disk read; writes in memtable/L0 already took precedence.
+                    if (self.prefetch_map.get(key)) |pv| {
+                        out[gi] = pv;
+                    } else {
+                        unresolved[nun] = gi;
+                        nun += 1;
+                    }
                 },
             }
         }
         try self.lookupBase(unresolved[0..nun], keys, out);
+    }
+
+    /// Warm the prefetch map with the base values of `keys` (a block's read set, from a
+    /// Block Access List) in one batched io_uring pass. Keys already resolvable in RAM
+    /// (memtable/L0) are skipped — their reads hit RAM. Subsequent `get`/`getMany` then
+    /// resolve these keys from the map (below L0) with no per-read disk I/O, while writes
+    /// during the block still shadow them via the memtable. Replaces the previous map.
+    pub fn prefetch(self: *FlatStore, keys: []const t.Key) !void {
+        self.prefetch_map.clearRetainingCapacity();
+        if (keys.len == 0) return;
+
+        if (self.pf_keys.len < keys.len) {
+            self.allocator.free(self.pf_keys);
+            self.pf_keys = try self.allocator.alloc(t.Key, keys.len);
+        }
+        if (self.pf_out.len < keys.len) {
+            self.allocator.free(self.pf_out);
+            self.pf_out = try self.allocator.alloc(?t.Value, keys.len);
+        }
+        if (self.unresolved_buf.len < keys.len) {
+            self.allocator.free(self.unresolved_buf);
+            self.unresolved_buf = try self.allocator.alloc(usize, keys.len);
+        }
+
+        var n: usize = 0;
+        for (keys) |key| {
+            switch (self.lookupRam(&key)) {
+                .miss => {},
+                else => continue, // resolves from RAM at read time; no prefetch needed
+            }
+            self.pf_keys[n] = key;
+            self.unresolved_buf[n] = n; // identity index into pf_keys/pf_out
+            n += 1;
+        }
+        if (n == 0) return;
+
+        try self.lookupBase(self.unresolved_buf[0..n], self.pf_keys[0..n], self.pf_out[0..n]);
+        for (0..n) |i| try self.prefetch_map.put(self.pf_keys[i], self.pf_out[i]);
     }
 
     /// Resolve a key against the RAM tiers, newest first: memtable then L0 runs.
@@ -768,7 +912,7 @@ pub const FlatStore = struct {
     fn lookupBase(self: *FlatStore, idxs: []const usize, keys: []const t.Key, out: []?t.Value) !void {
         if (idxs.len == 0) return;
 
-        const win_bytes = @as(usize, self.window_entries) * RECORD_SIZE;
+        const fd = self.hotFd();
         const depth: usize = self.reader.depth; // scratch buffers are sized to `depth`
 
         var base: usize = 0;
@@ -789,13 +933,20 @@ pub const FlatStore = struct {
                 var w0: u64 = if (rank >= w / 2) rank - w / 2 else 0;
                 if (w0 + w > part.count) w0 = part.count - w;
 
+                // Page-align the read (covers the window + ≤1 page of leading slop) so it
+                // satisfies O_DIRECT; the window starts `sub` bytes into the read.
+                const w_start = part.offset + w0 * RECORD_SIZE;
+                const page_start = alignDownPage(w_start);
+                const sub: usize = @intCast(w_start - page_start);
+                const read_len = alignUpPage(sub + @as(usize, @intCast(w)) * RECORD_SIZE);
+
                 const slot = nreq;
                 self.scratch_reqs[slot] = .{
-                    .fd = self.base_file.handle,
-                    .buffer = self.scratch_slab[slot * win_bytes ..][0 .. @as(usize, @intCast(w)) * RECORD_SIZE],
-                    .offset = part.offset + w0 * RECORD_SIZE,
+                    .fd = fd,
+                    .buffer = self.scratch_slab[slot * self.slot_size ..][0..read_len],
+                    .offset = page_start,
                 };
-                self.scratch_meta[slot] = .{ .gi = gi, .w0 = @intCast(w0), .w = @intCast(w), .count = part.count, .part_off = part.offset };
+                self.scratch_meta[slot] = .{ .gi = gi, .w0 = @intCast(w0), .w = @intCast(w), .count = part.count, .part_off = part.offset, .sub = sub };
                 nreq += 1;
             }
             if (nreq == 0) {
@@ -807,8 +958,8 @@ pub const FlatStore = struct {
 
             for (0..nreq) |slot| {
                 const m = self.scratch_meta[slot];
-                const nbytes = try self.scratch_results[slot];
-                const buf = self.scratch_slab[slot * win_bytes ..][0..nbytes];
+                _ = try self.scratch_results[slot]; // propagate I/O errors; window is within the read
+                const buf = self.scratch_slab[slot * self.slot_size + m.sub ..][0 .. @as(usize, m.w) * RECORD_SIZE];
                 if (locate(buf, &keys[m.gi])) |v| {
                     out[m.gi] = v;
                 } else if (windowIsDefinitive(buf, m, &keys[m.gi])) {
@@ -823,14 +974,18 @@ pub const FlatStore = struct {
     }
 
     fn fallbackLookup(self: *FlatStore, m: SlotMeta, key: *const t.Key) !?t.Value {
-        const len = @as(usize, m.count) * RECORD_SIZE;
-        const buf = try self.allocator.alloc(u8, len);
+        // Page-align the whole-partition read for O_DIRECT (rare path; allocates per call).
+        const page_start = alignDownPage(m.part_off);
+        const sub: usize = @intCast(m.part_off - page_start);
+        const part_bytes = @as(usize, m.count) * RECORD_SIZE;
+        const read_len = alignUpPage(sub + part_bytes);
+        const buf = try self.allocator.alignedAlloc(u8, PAGE_ALIGN, read_len);
         defer self.allocator.free(buf);
-        var req = [_]uring.Request{.{ .fd = self.base_file.handle, .buffer = buf, .offset = m.part_off }};
+        var req = [_]uring.Request{.{ .fd = self.hotFd(), .buffer = buf, .offset = page_start }};
         var res = [_]uring.Result{undefined};
         try self.reader.readBatch(&req, &res);
-        const nbytes = try res[0];
-        return locate(buf[0..nbytes], key);
+        _ = try res[0];
+        return locate(buf[sub..][0..part_bytes], key);
     }
 };
 
@@ -937,9 +1092,11 @@ fn buildBaseFile(
     }
     std.mem.sort(t.KvEntry, sorted, {}, kvLessThan);
 
-    const data = try allocator.alloc(u8, sorted.len * RECORD_SIZE);
+    const real = sorted.len * RECORD_SIZE;
+    const data = try allocator.alloc(u8, alignUpPage(real)); // pad to a page for O_DIRECT
     defer allocator.free(data);
-    serialize(sorted, data);
+    serialize(sorted, data[0..real]);
+    @memset(data[real..], 0);
 
     {
         const wf = try dir.createFile(io, name, .{ .truncate = true });
@@ -1365,6 +1522,78 @@ test "FlatStore: tombstone shadows base and is dropped by compaction" {
     // The key is physically gone from the base: its partition is now empty.
     const pid = partitionOf(&k, store.prefix_bits);
     try std.testing.expectEqual(@as(u32, 0), store.directory[pid].count);
+}
+
+test "FlatStore: prefetch serves base values, shadowed by later writes/deletes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const N = 300;
+    var entries: [N]t.KvEntry = undefined;
+    for (&entries, 0..) |*e, i| {
+        e.key = poolKey(i);
+        e.value = [_]u8{@intCast(i & 0xff)} ** 32;
+    }
+    var store = try FlatStore.create(std.testing.allocator, io, tmp.dir, "flat", &entries, .{ .prefix_bits = 4, .memtable_cap = 1_000_000 });
+    defer store.deinit();
+
+    // Prefetch the whole read set (+ some absent keys).
+    var read_set: [N + 2]t.Key = undefined;
+    for (0..N) |i| read_set[i] = poolKey(i);
+    read_set[N] = poolKey(9000); // absent
+    read_set[N + 1] = poolKey(9001); // absent
+    try store.prefetch(&read_set);
+    try std.testing.expect(store.prefetch_map.count() > 0);
+
+    // Reads resolve from the prefetch map (values + known-absent).
+    for (0..N) |i| {
+        const got = try store.get(poolKey(i));
+        try std.testing.expect(got != null);
+        try std.testing.expectEqual(@as(u8, @intCast(i & 0xff)), got.?[0]);
+    }
+    try std.testing.expectEqual(@as(?t.Value, null), try store.get(poolKey(9000)));
+
+    // Read-your-writes: a write after prefetch shadows the prefetched base value.
+    try store.put(poolKey(5), [_]u8{0xEE} ** 32);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xEE} ** 32), &(try store.get(poolKey(5))).?);
+    // A delete after prefetch shadows it too.
+    try store.delete(poolKey(6));
+    try std.testing.expectEqual(@as(?t.Value, null), try store.get(poolKey(6)));
+    // Untouched prefetched keys still return their base value.
+    try std.testing.expectEqual(@as(u8, @intCast(7 & 0xff)), (try store.get(poolKey(7))).?[0]);
+}
+
+test "FlatStore: O_DIRECT page-aligned reads return correct values" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const N = 1000;
+    var entries: [N]t.KvEntry = undefined;
+    var prng = std.Random.DefaultPrng.init(0xD1EC7);
+    const rnd = prng.random();
+    for (&entries) |*e| {
+        rnd.bytes(&e.key);
+        rnd.bytes(&e.value);
+    }
+    // prefix_bits 6 → ~16 entries/partition → multi-record windows at non-page offsets.
+    var store = FlatStore.create(std.testing.allocator, io, tmp.dir, "flat", &entries, .{ .prefix_bits = 6, .o_direct = true }) catch |e| switch (e) {
+        // Some filesystems (tmpfs/overlay) reject O_DIRECT — skip rather than fail.
+        error.Unexpected => return error.SkipZigTest,
+        else => return e,
+    };
+    defer store.deinit();
+    try std.testing.expect(store.direct_fd != null);
+
+    for (entries) |e| {
+        const got = try store.get(e.key);
+        try std.testing.expect(got != null);
+        try std.testing.expectEqualSlices(u8, &e.value, &got.?);
+    }
+    var absent: t.Key = undefined;
+    rnd.bytes(&absent);
+    try std.testing.expectEqual(@as(?t.Value, null), try store.get(absent));
 }
 
 test "FlatStore: tombstone persists across recovery (no resurrection)" {

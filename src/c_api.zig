@@ -227,6 +227,7 @@ export fn flatdb_open(
     memtable_cap: u64,
     l0_threshold: u32,
     freeze_interval: u64,
+    o_direct: u8,
 ) ?*FlatState {
     const state = std.heap.page_allocator.create(FlatState) catch return null;
     state.* = .{ .dir = undefined, .store = undefined };
@@ -241,6 +242,7 @@ export fn flatdb_open(
         .memtable_cap = memtable_cap,
         .l0_compact_threshold = l0_threshold,
         .freeze_block_interval = freeze_interval,
+        .o_direct = o_direct != 0,
     };
     state.store = flat_store.FlatStore.open(flat_alloc, io, dir, "flat", cfg) catch |err| switch (err) {
         error.FileNotFound => flat_store.FlatStore.create(flat_alloc, io, dir, "flat", &.{}, cfg) catch {
@@ -304,6 +306,14 @@ export fn flatdb_get_many(
 
 export fn flatdb_del(state: *FlatState, key: *const [32]u8) i32 {
     state.store.delete(key.*) catch return -1;
+    return 0;
+}
+
+/// Prefetch a block's read set (a Block Access List) into the in-RAM prefetch map in
+/// one batched io_uring pass, so subsequent get/get_many resolve below L0 without
+/// per-read disk I/O. Replaces any prior prefetch. Returns 0 on success, -1 on error.
+export fn flatdb_prefetch(state: *FlatState, keys: [*]const [32]u8, n: usize) i32 {
+    state.store.prefetch(keys[0..n]) catch return -1;
     return 0;
 }
 

@@ -44,7 +44,7 @@ _lib = c.CDLL(str(_lib_path))
 _Buf32 = c.c_ubyte * 32
 
 _lib.flatdb_open.restype = c.c_void_p
-_lib.flatdb_open.argtypes = [c.c_char_p, c.c_uint8, c.c_uint64, c.c_uint32, c.c_uint64]
+_lib.flatdb_open.argtypes = [c.c_char_p, c.c_uint8, c.c_uint64, c.c_uint32, c.c_uint64, c.c_uint8]
 _lib.flatdb_deinit.restype = None
 _lib.flatdb_deinit.argtypes = [c.c_void_p]
 _lib.flatdb_put.restype = c.c_int
@@ -55,6 +55,8 @@ _lib.flatdb_get_many.restype = c.c_int
 _lib.flatdb_get_many.argtypes = [c.c_void_p, c.POINTER(_Buf32), c.c_size_t, c.POINTER(_Buf32), c.POINTER(c.c_ubyte)]
 _lib.flatdb_del.restype = c.c_int
 _lib.flatdb_del.argtypes = [c.c_void_p, _Buf32]
+_lib.flatdb_prefetch.restype = c.c_int
+_lib.flatdb_prefetch.argtypes = [c.c_void_p, c.POINTER(_Buf32), c.c_size_t]
 _lib.flatdb_end_block.restype = c.c_int
 _lib.flatdb_end_block.argtypes = [c.c_void_p, c.c_uint64]
 _lib.flatdb_freeze.restype = c.c_int
@@ -92,11 +94,13 @@ class FlatDB:
     """
 
     def __init__(self, path, prefix_bits: int = 16, memtable_cap: int = 0,
-                 l0_threshold: int = 0, freeze_interval: int = 0) -> None:
+                 l0_threshold: int = 0, freeze_interval: int = 0,
+                 o_direct: bool = False) -> None:
         self._handle = _lib.flatdb_open(str(path).encode(), prefix_bits,
-                                        memtable_cap, l0_threshold, freeze_interval)
+                                        memtable_cap, l0_threshold, freeze_interval,
+                                        1 if o_direct else 0)
         if not self._handle:
-            raise RuntimeError(f"flatdb_open failed for path {path!r}")
+            raise RuntimeError(f"flatdb_open failed for path {path!r} (o_direct={o_direct})")
 
     # ── lifecycle ────────────────────────────────────────────────────────────────
 
@@ -151,6 +155,18 @@ class FlatDB:
         rc = _lib.flatdb_del(self._handle, _buf32(key))
         if rc != 0:
             raise RuntimeError(f"delete failed (rc={rc})")
+
+    def prefetch(self, keys: list[bytes]) -> None:
+        """Prefetch a block's read set (BAL) into the in-RAM map in one io_uring batch;
+        subsequent get/get_many for these keys then avoid per-read disk I/O. Writes
+        during the block still take precedence (read-your-writes)."""
+        n = len(keys)
+        if n == 0:
+            return
+        karr = (_Buf32 * n)(*[_buf32(k) for k in keys])
+        rc = _lib.flatdb_prefetch(self._handle, karr, n)
+        if rc != 0:
+            raise RuntimeError(f"prefetch failed (rc={rc})")
 
     def end_block(self, height: int) -> None:
         """Signal end of block `height`; freezes the memtable if a freeze is due."""
