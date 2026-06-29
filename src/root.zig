@@ -11,6 +11,9 @@ const options = @import("options");
 // ─── Re-export sub-modules ─────────────────────────────────────────────────────
 pub const merkle = @import("merkle.zig");
 pub const page_store = @import("page_store.zig");
+pub const batch_read = @import("batch_read.zig");
+pub const uring_read = @import("uring_read.zig");
+pub const flat_store = @import("flat_store.zig");
 const cache_mod = @import("cache.zig");
 
 // ─── Re-export shared types from types.zig ─────────────────────────────────────
@@ -1051,6 +1054,9 @@ fn filterContains(filter: *const [PAGE_ENTRIES]u16, count: u8, target: u16) bool
 test {
     _ = @import("page_store.zig");
     _ = @import("cache.zig");
+    _ = @import("batch_read.zig");
+    _ = @import("uring_read.zig");
+    _ = @import("flat_store.zig");
 }
 
 test "prefixData depth 1 extracts top 6 bits" {

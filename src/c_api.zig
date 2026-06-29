@@ -196,3 +196,156 @@ export fn prefixdb_reset_metrics(state: *State) i32 {
     }
     return 0;
 }
+
+// ─── Flat store C API (`flatdb_*`) ──────────────────────────────────────────────
+//
+// Parallel surface exposing the redesigned flat KV store (src/flat_store.zig):
+// io_uring-batched windowed reads, in-RAM L0 + streaming compaction, native
+// tombstones. Files live under `path` with base name "flat". The handle owns a GPA,
+// the opened directory, and the FlatStore. Cold-path file ops use the threaded Io
+// backend; the hot read path uses the low-level io_uring reader inside FlatStore.
+//
+// Return codes match prefixdb_*: 0 = OK, 1 = not found, -1 = error (unless noted).
+
+const flat_store = root.flat_store;
+
+const FlatState = struct {
+    gpa: std.heap.DebugAllocator(.{}),
+    dir: std.Io.Dir,
+    store: flat_store.FlatStore,
+};
+
+/// Open the flat store at directory `path` (created if absent), recovering from a
+/// manifest if one is present, else starting empty. `prefix_bits` (1..32; 0 → 16) is
+/// only used when creating fresh — on recovery it comes from the manifest. The other
+/// knobs accept 0 for engine defaults.
+export fn flatdb_open(
+    path: [*:0]const u8,
+    prefix_bits: u8,
+    memtable_cap: u64,
+    l0_threshold: u32,
+    freeze_interval: u64,
+) ?*FlatState {
+    const state = std.heap.page_allocator.create(FlatState) catch return null;
+    state.* = .{ .gpa = .{}, .dir = undefined, .store = undefined };
+    const io = globalIo();
+
+    const dir = std.Io.Dir.cwd().createDirPathOpen(io, std.mem.span(path), .{}) catch {
+        _ = state.gpa.deinit();
+        std.heap.page_allocator.destroy(state);
+        return null;
+    };
+    const cfg: flat_store.Config = .{
+        .prefix_bits = if (prefix_bits == 0) 16 else @intCast(prefix_bits),
+        .memtable_cap = memtable_cap,
+        .l0_compact_threshold = l0_threshold,
+        .freeze_block_interval = freeze_interval,
+    };
+    const a = state.gpa.allocator();
+    state.store = flat_store.FlatStore.open(a, io, dir, "flat", cfg) catch |err| switch (err) {
+        error.FileNotFound => flat_store.FlatStore.create(a, io, dir, "flat", &.{}, cfg) catch {
+            dir.close(io);
+            _ = state.gpa.deinit();
+            std.heap.page_allocator.destroy(state);
+            return null;
+        },
+        else => {
+            dir.close(io);
+            _ = state.gpa.deinit();
+            std.heap.page_allocator.destroy(state);
+            return null;
+        },
+    };
+    state.dir = dir;
+    return state;
+}
+
+export fn flatdb_deinit(state: *FlatState) void {
+    state.store.deinit();
+    state.dir.close(globalIo());
+    _ = state.gpa.deinit();
+    std.heap.page_allocator.destroy(state);
+}
+
+export fn flatdb_put(state: *FlatState, key: *const [32]u8, value: *const [32]u8) i32 {
+    state.store.put(key.*, value.*) catch return -1;
+    return 0;
+}
+
+/// 0 and fills value_out if present; 1 if absent or deleted; -1 on error.
+export fn flatdb_get(state: *FlatState, key: *const [32]u8, value_out: *[32]u8) i32 {
+    const r = state.store.get(key.*) catch return -1;
+    if (r) |v| {
+        value_out.* = v;
+        return 0;
+    }
+    return 1;
+}
+
+/// Batched lookup of `n` keys. `found_out[i]` = 1 if present (value in `values_out[i]`),
+/// else 0. Returns 0 on success, -1 on error. Exercises the io_uring read batch.
+export fn flatdb_get_many(
+    state: *FlatState,
+    keys: [*]const [32]u8,
+    n: usize,
+    values_out: [*][32]u8,
+    found_out: [*]u8,
+) i32 {
+    const a = state.gpa.allocator();
+    const out = a.alloc(?[32]u8, n) catch return -1;
+    defer a.free(out);
+    state.store.getMany(keys[0..n], out) catch return -1;
+    for (0..n) |i| {
+        if (out[i]) |v| {
+            values_out[i] = v;
+            found_out[i] = 1;
+        } else {
+            found_out[i] = 0;
+        }
+    }
+    return 0;
+}
+
+export fn flatdb_del(state: *FlatState, key: *const [32]u8) i32 {
+    state.store.delete(key.*) catch return -1;
+    return 0;
+}
+
+/// Signal end of block `height` (block-aligned freeze trigger).
+export fn flatdb_end_block(state: *FlatState, height: u64) i32 {
+    state.store.endBlock(height) catch return -1;
+    return 0;
+}
+
+/// Force-freeze the memtable as a run covering `height` (e.g. to flush before exit).
+export fn flatdb_freeze(state: *FlatState, height: u64) i32 {
+    state.store.freeze(height) catch return -1;
+    return 0;
+}
+
+/// Advance compaction by ≤ `byte_budget` output bytes. Returns 0 = idle, 1 = in
+/// progress, 2 = done, -1 = error.
+export fn flatdb_compact_step(state: *FlatState, byte_budget: u64) i32 {
+    const st = state.store.compactStep(@intCast(byte_budget)) catch return -1;
+    return switch (st) {
+        .idle => 0,
+        .in_progress => 1,
+        .done => 2,
+    };
+}
+
+/// Run compaction to completion. Returns 0 on success, -1 on error.
+export fn flatdb_compact(state: *FlatState) i32 {
+    state.store.compact() catch return -1;
+    return 0;
+}
+
+/// True (1) if L0 has reached the compaction threshold or a job is in progress.
+export fn flatdb_compaction_due(state: *FlatState) i32 {
+    return if (state.store.compactionDue()) 1 else 0;
+}
+
+/// Block height the durable state reflects; replay blocks above it after open.
+export fn flatdb_covered_height(state: *FlatState) u64 {
+    return state.store.covered_height;
+}
