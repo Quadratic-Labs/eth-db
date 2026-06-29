@@ -632,6 +632,19 @@ and some of the bandwidth just bought).
   tombstone short-circuits to null with no base read. Tombstones persist in run files,
   so recovery doesn't resurrect deleted keys. 3 tests (memtable delete + idempotent +
   re-put; shadow-base-then-drop-on-compaction; survive-recovery).
+- **`src/flat_store.zig` — read-path perf fix (reusable scratch).** Originally `getMany`
+  allocated the window slab + reqs/results/meta **per call**, sized `min(depth,batch) ×
+  window_bytes` — i.e. ~64 KB *per key* below batch 256, through the slow `DebugAllocator`.
+  That allocation (not disk, not the workload) dominated read latency: an *empty* DB —
+  zero io_uring reads — still cost ~90 µs/get. Fix: allocate the scratch (slab sized
+  `depth × window_entries × 64 B` ≈ 16 MiB, plus reqs/results/meta, and a grow-on-demand
+  `unresolved_buf`) **once at open** and reuse it (the store is single-threaded). The C
+  API (`flatdb_*`) also switched from `DebugAllocator` to `std.heap.smp_allocator`. Result
+  (measured, keys served from base): per-op read latency went from 103/52/28 µs (batch
+  1/4/64) to a **flat ~5 µs regardless of batch size**; the 120-block benchmark dropped
+  3.65 s → 0.50 s (read latency 61.7 µs → 4.0 µs, throughput ~14.5K → ~105K ops/s).
+  Batching now barely matters since the batch-scaling allocation is gone. The window size
+  is still a fixed config (1024); making it configurable is below.
 - **v1 limits / next:** (1) orphan-file GC on `open` (an abandoned job leaves an
   unreferenced base file). (2) directory-fsync for strict crash durability; optional
   `O_DIRECT`. (3) a min-heap merge if `K` grows large (linear per-record source scan

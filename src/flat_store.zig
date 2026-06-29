@@ -131,6 +131,36 @@ const ManifestHeader = extern struct {
 };
 const RunRec = extern struct { seq: u32, entry_count: u32 };
 
+/// Reusable read-path buffers, allocated once per store (see FlatStore scratch fields).
+const Scratch = struct {
+    slab: []u8,
+    reqs: []uring.Request,
+    results: []uring.Result,
+    meta: []SlotMeta,
+    unresolved: []usize,
+};
+
+fn allocScratch(allocator: std.mem.Allocator, depth: usize, win_entries: usize) !Scratch {
+    const slab = try allocator.alloc(u8, depth * win_entries * RECORD_SIZE);
+    errdefer allocator.free(slab);
+    const reqs = try allocator.alloc(uring.Request, depth);
+    errdefer allocator.free(reqs);
+    const results = try allocator.alloc(uring.Result, depth);
+    errdefer allocator.free(results);
+    const meta = try allocator.alloc(SlotMeta, depth);
+    errdefer allocator.free(meta);
+    const unresolved = try allocator.alloc(usize, 0);
+    return .{ .slab = slab, .reqs = reqs, .results = results, .meta = meta, .unresolved = unresolved };
+}
+
+fn freeScratch(allocator: std.mem.Allocator, s: Scratch) void {
+    allocator.free(s.slab);
+    allocator.free(s.reqs);
+    allocator.free(s.results);
+    allocator.free(s.meta);
+    allocator.free(s.unresolved);
+}
+
 pub const FlatStore = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -157,6 +187,14 @@ pub const FlatStore = struct {
 
     /// Active streaming-compaction job, if any (RAM-only; abandoned on crash).
     job: ?Compaction = null,
+
+    // Reusable read-path scratch, allocated once (single-threaded store) so getMany
+    // does no per-call allocation. `scratch_slab` holds up to `reader.depth` windows.
+    scratch_slab: []u8,
+    scratch_reqs: []uring.Request,
+    scratch_results: []uring.Result,
+    scratch_meta: []SlotMeta,
+    unresolved_buf: []usize, // grown on demand to the largest batch seen
 
     // ─── Lifecycle ───────────────────────────────────────────────────────────────
 
@@ -187,6 +225,10 @@ pub const FlatStore = struct {
         const name_copy = try allocator.dupe(u8, name);
         errdefer allocator.free(name_copy);
 
+        const win_entries: usize = if (config.window_entries == 0) WINDOW_ENTRIES_DEFAULT else config.window_entries;
+        const sc = try allocScratch(allocator, reader.depth, win_entries);
+        errdefer freeScratch(allocator, sc);
+
         var store: FlatStore = .{
             .allocator = allocator,
             .io = io,
@@ -196,7 +238,7 @@ pub const FlatStore = struct {
             .base_gen = 0,
             .directory = directory,
             .prefix_bits = config.prefix_bits,
-            .window_entries = if (config.window_entries == 0) WINDOW_ENTRIES_DEFAULT else config.window_entries,
+            .window_entries = @intCast(win_entries),
             .reader = reader,
             .memtable = std.AutoHashMap(t.Key, ?t.Value).init(allocator),
             .memtable_cap = if (config.memtable_cap == 0) MEMTABLE_CAP_DEFAULT else config.memtable_cap,
@@ -205,6 +247,11 @@ pub const FlatStore = struct {
             .l0_threshold = if (config.l0_compact_threshold == 0) L0_COMPACT_THRESHOLD_DEFAULT else config.l0_compact_threshold,
             .freeze_block_interval = if (config.freeze_block_interval == 0) FREEZE_BLOCK_INTERVAL_DEFAULT else config.freeze_block_interval,
             .covered_height = 0,
+            .scratch_slab = sc.slab,
+            .scratch_reqs = sc.reqs,
+            .scratch_results = sc.results,
+            .scratch_meta = sc.meta,
+            .unresolved_buf = sc.unresolved,
         };
         try store.writeManifest();
         return store;
@@ -256,6 +303,9 @@ pub const FlatStore = struct {
         const name_copy = try allocator.dupe(u8, name);
         errdefer allocator.free(name_copy);
 
+        const sc = try allocScratch(allocator, reader.depth, m.header.window_entries);
+        errdefer freeScratch(allocator, sc);
+
         return .{
             .allocator = allocator,
             .io = io,
@@ -274,6 +324,11 @@ pub const FlatStore = struct {
             .l0_threshold = if (config.l0_compact_threshold == 0) L0_COMPACT_THRESHOLD_DEFAULT else config.l0_compact_threshold,
             .freeze_block_interval = if (config.freeze_block_interval == 0) FREEZE_BLOCK_INTERVAL_DEFAULT else config.freeze_block_interval,
             .covered_height = m.header.covered_height,
+            .scratch_slab = sc.slab,
+            .scratch_reqs = sc.reqs,
+            .scratch_results = sc.results,
+            .scratch_meta = sc.meta,
+            .unresolved_buf = sc.unresolved,
         };
     }
 
@@ -292,6 +347,13 @@ pub const FlatStore = struct {
         self.l0.deinit(self.allocator);
         self.allocator.free(self.directory);
         self.allocator.free(self.name);
+        freeScratch(self.allocator, .{
+            .slab = self.scratch_slab,
+            .reqs = self.scratch_reqs,
+            .results = self.scratch_results,
+            .meta = self.scratch_meta,
+            .unresolved = self.unresolved_buf,
+        });
     }
 
     // ─── Write path ────────────────────────────────────────────────────────────
@@ -672,8 +734,12 @@ pub const FlatStore = struct {
         std.debug.assert(keys.len == out.len);
         if (keys.len == 0) return;
 
-        const unresolved = try self.allocator.alloc(usize, keys.len);
-        defer self.allocator.free(unresolved);
+        // Grow the reusable unresolved buffer only when a larger batch arrives.
+        if (self.unresolved_buf.len < keys.len) {
+            self.allocator.free(self.unresolved_buf);
+            self.unresolved_buf = try self.allocator.alloc(usize, keys.len);
+        }
+        const unresolved = self.unresolved_buf;
         var nun: usize = 0;
         for (keys, 0..) |key, gi| {
             switch (self.lookupRam(&key)) {
@@ -703,20 +769,11 @@ pub const FlatStore = struct {
         if (idxs.len == 0) return;
 
         const win_bytes = @as(usize, self.window_entries) * RECORD_SIZE;
-        const slots = @min(@as(usize, self.reader.depth), idxs.len);
-
-        const slab = try self.allocator.alloc(u8, slots * win_bytes);
-        defer self.allocator.free(slab);
-        const reqs = try self.allocator.alloc(uring.Request, slots);
-        defer self.allocator.free(reqs);
-        const results = try self.allocator.alloc(uring.Result, slots);
-        defer self.allocator.free(results);
-        const meta = try self.allocator.alloc(SlotMeta, slots);
-        defer self.allocator.free(meta);
+        const depth: usize = self.reader.depth; // scratch buffers are sized to `depth`
 
         var base: usize = 0;
         while (base < idxs.len) {
-            const chunk = @min(idxs.len - base, slots);
+            const chunk = @min(idxs.len - base, depth);
 
             var nreq: usize = 0;
             for (0..chunk) |k| {
@@ -733,12 +790,12 @@ pub const FlatStore = struct {
                 if (w0 + w > part.count) w0 = part.count - w;
 
                 const slot = nreq;
-                reqs[slot] = .{
+                self.scratch_reqs[slot] = .{
                     .fd = self.base_file.handle,
-                    .buffer = slab[slot * win_bytes ..][0 .. @as(usize, @intCast(w)) * RECORD_SIZE],
+                    .buffer = self.scratch_slab[slot * win_bytes ..][0 .. @as(usize, @intCast(w)) * RECORD_SIZE],
                     .offset = part.offset + w0 * RECORD_SIZE,
                 };
-                meta[slot] = .{ .gi = gi, .w0 = @intCast(w0), .w = @intCast(w), .count = part.count, .part_off = part.offset };
+                self.scratch_meta[slot] = .{ .gi = gi, .w0 = @intCast(w0), .w = @intCast(w), .count = part.count, .part_off = part.offset };
                 nreq += 1;
             }
             if (nreq == 0) {
@@ -746,12 +803,12 @@ pub const FlatStore = struct {
                 continue;
             }
 
-            try self.reader.readBatch(reqs[0..nreq], results[0..nreq]);
+            try self.reader.readBatch(self.scratch_reqs[0..nreq], self.scratch_results[0..nreq]);
 
             for (0..nreq) |slot| {
-                const m = meta[slot];
-                const nbytes = try results[slot];
-                const buf = slab[slot * win_bytes ..][0..nbytes];
+                const m = self.scratch_meta[slot];
+                const nbytes = try self.scratch_results[slot];
+                const buf = self.scratch_slab[slot * win_bytes ..][0..nbytes];
                 if (locate(buf, &keys[m.gi])) |v| {
                     out[m.gi] = v;
                 } else if (windowIsDefinitive(buf, m, &keys[m.gi])) {

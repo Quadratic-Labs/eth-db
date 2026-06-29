@@ -209,8 +209,10 @@ export fn prefixdb_reset_metrics(state: *State) i32 {
 
 const flat_store = root.flat_store;
 
+/// Fast general allocator for the flat store (no libc, much faster than DebugAllocator).
+const flat_alloc = std.heap.smp_allocator;
+
 const FlatState = struct {
-    gpa: std.heap.DebugAllocator(.{}),
     dir: std.Io.Dir,
     store: flat_store.FlatStore,
 };
@@ -227,11 +229,10 @@ export fn flatdb_open(
     freeze_interval: u64,
 ) ?*FlatState {
     const state = std.heap.page_allocator.create(FlatState) catch return null;
-    state.* = .{ .gpa = .{}, .dir = undefined, .store = undefined };
+    state.* = .{ .dir = undefined, .store = undefined };
     const io = globalIo();
 
     const dir = std.Io.Dir.cwd().createDirPathOpen(io, std.mem.span(path), .{}) catch {
-        _ = state.gpa.deinit();
         std.heap.page_allocator.destroy(state);
         return null;
     };
@@ -241,17 +242,14 @@ export fn flatdb_open(
         .l0_compact_threshold = l0_threshold,
         .freeze_block_interval = freeze_interval,
     };
-    const a = state.gpa.allocator();
-    state.store = flat_store.FlatStore.open(a, io, dir, "flat", cfg) catch |err| switch (err) {
-        error.FileNotFound => flat_store.FlatStore.create(a, io, dir, "flat", &.{}, cfg) catch {
+    state.store = flat_store.FlatStore.open(flat_alloc, io, dir, "flat", cfg) catch |err| switch (err) {
+        error.FileNotFound => flat_store.FlatStore.create(flat_alloc, io, dir, "flat", &.{}, cfg) catch {
             dir.close(io);
-            _ = state.gpa.deinit();
             std.heap.page_allocator.destroy(state);
             return null;
         },
         else => {
             dir.close(io);
-            _ = state.gpa.deinit();
             std.heap.page_allocator.destroy(state);
             return null;
         },
@@ -263,7 +261,6 @@ export fn flatdb_open(
 export fn flatdb_deinit(state: *FlatState) void {
     state.store.deinit();
     state.dir.close(globalIo());
-    _ = state.gpa.deinit();
     std.heap.page_allocator.destroy(state);
 }
 
@@ -291,9 +288,8 @@ export fn flatdb_get_many(
     values_out: [*][32]u8,
     found_out: [*]u8,
 ) i32 {
-    const a = state.gpa.allocator();
-    const out = a.alloc(?[32]u8, n) catch return -1;
-    defer a.free(out);
+    const out = flat_alloc.alloc(?[32]u8, n) catch return -1;
+    defer flat_alloc.free(out);
     state.store.getMany(keys[0..n], out) catch return -1;
     for (0..n) |i| {
         if (out[i]) |v| {
