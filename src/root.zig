@@ -15,6 +15,7 @@ const cache_mod = @import("cache.zig");
 pub const node_arena_mod = @import("node_arena.zig");
 pub const NodeArena = node_arena_mod.NodeArena;
 const wal_mod = @import("wal.zig");
+pub const commitment = @import("commitment.zig");
 const kv_map_mod = @import("kv_map.zig");
 
 // ─── Re-export shared types from types.zig ─────────────────────────────────────
@@ -37,7 +38,6 @@ pub const PayloadSlotId = t.PayloadSlotId;
 pub const PrefixData = t.PrefixData;
 pub const SstPage = t.SstPage;
 pub const NodePage = t.NodePage;
-pub const CommitmentPage = t.CommitmentPage;
 pub const CommitmentPageId = t.CommitmentPageId;
 pub const CMT_NONE = t.CMT_NONE;
 
@@ -73,8 +73,6 @@ pub const DbStats = if (options.enable_metrics) struct {
     commit_gather_calls: u64 = 0,
     commit_gather_entries: u64 = 0,
     commit_rehash_ns: u64 = 0,
-    /// Commitment page ids served from the free list instead of fresh allocation.
-    cmt_pages_reused: u64 = 0,
 } else struct {};
 
 /// Cache hit/miss counters held by Heap.
@@ -171,50 +169,7 @@ pub const CacheConfig = struct {
 // — which by construction no longer references them — is durably on disk; only
 // then do they become allocatable.
 
-pub const FreeList = struct {
-    /// Ids dead in the last durable manifest — safe to reuse now.
-    free: std.ArrayList(u32) = .empty,
-    /// Ids freed since the last manifest write — reusable after the next one.
-    pending: std.ArrayList(u32) = .empty,
-
-    pub fn deinit(self: *FreeList, allocator: std.mem.Allocator) void {
-        self.free.deinit(allocator);
-        self.pending.deinit(allocator);
-    }
-
-    /// Quarantine a dead id until the next manifest checkpoint.
-    pub fn release(self: *FreeList, allocator: std.mem.Allocator, id: u32) !void {
-        try self.pending.append(allocator, id);
-    }
-
-    /// Pop a reusable id, or null when a fresh id must be allocated.
-    pub fn acquire(self: *FreeList) ?u32 {
-        return self.free.pop();
-    }
-
-    /// All ids that the manifest being written right now does not reference.
-    /// Both lists qualify: once that manifest is durable, `pending` is dead too.
-    pub fn totalLen(self: *const FreeList) u32 {
-        return @intCast(self.free.items.len + self.pending.items.len);
-    }
-
-    /// Append free ++ pending into `out` (manifest serialisation order).
-    pub fn appendAllTo(self: *const FreeList, allocator: std.mem.Allocator, out: *std.ArrayList(u32)) !void {
-        try out.appendSlice(allocator, self.free.items);
-        try out.appendSlice(allocator, self.pending.items);
-    }
-
-    /// The manifest excluding `pending`'s referents is durable: promote.
-    pub fn promote(self: *FreeList, allocator: std.mem.Allocator) !void {
-        try self.free.appendSlice(allocator, self.pending.items);
-        self.pending.clearRetainingCapacity();
-    }
-
-    /// Restore from a recovered manifest: everything listed is immediately reusable.
-    pub fn restore(self: *FreeList, allocator: std.mem.Allocator, ids: []const u32) !void {
-        try self.free.appendSlice(allocator, ids);
-    }
-};
+pub const FreeList = t.FreeList;
 
 // ─── Page heap (§4.3) ─────────────────────────────────────────────────────────
 //
@@ -416,50 +371,21 @@ pub const PrefixDB = struct {
     d2_last_write: []u32,   // len = 4096, heap-allocated
     d3_last_write: []u32,   // len = 262144, heap-allocated
 
-    // ─── Commitment tree (docs/commitment_redesign.md) ───────────────────────
+    // ─── Commitment subsystem v2 (docs/commitment_v2.md) ─────────────────────
     //
-    // Canonical sparse binary trie over the key-value mapping, cached at 6-bit
-    // strides in CommitmentPages.  Fully decoupled from the storage tree:
-    // compaction never touches these, and values are invariant under data
-    // movement between node buffers.
-
-    /// Depth-0 page: 64 depth-1 commitments as leaves, state root at h[1].
-    /// Memory-only; rebuilt from depth-1 pages (or gathers) after open.
-    cmt_d0: CommitmentPage,
-    cmt_d1: []CommitmentPage,     // len = 64, heap-allocated; valid iff exists bit
-    cmt_d1_exists: u64,
-    cmt_d2: []CommitmentPage,     // len = 4096, heap-allocated
-    cmt_d2_exists: []u64,         // len = 64
-    /// Depth ≥ 3 commitment pages, created/loaded lazily.
-    cmt_deep: std.AutoHashMap(NodeCoord, *CommitmentPage),
-    /// Last persisted id per deep page (lazy reload + manifest routing).
-    cmt_deep_ids: std.AutoHashMap(NodeCoord, CommitmentPageId),
-    /// Deep pages with unflushed changes.
-    cmt_deep_flush: std.AutoHashMap(NodeCoord, void),
-    /// Flush-dirty bitmaps + ages + persisted ids for d1/d2 commitment pages.
-    cmt_d1_flush: u64,
-    cmt_d2_flush: []u64,          // len = 64
-    cmt_d1_ids: [64]?CommitmentPageId,
-    cmt_d2_ids: []?CommitmentPageId,   // len = 4096
-    cmt_d1_last: [64]u32 = [_]u32{0} ** 64,
-    cmt_d2_last: []u32,           // len = 4096
-    next_cmt_id: CommitmentPageId = 0,
-    /// Reusable commitment-page ids (deferred across one manifest checkpoint).
-    cmt_free: FreeList = .{},
-    /// Reusable scratch buffers for the hot per-block paths.  None of their
-    /// users is reentrant: gatherSlotValue never nests (cmtMaterialize calls
-    /// it sequentially), flushL0Prefix never recurses, and commitBlock is the
-    /// sole user of the dirty map / at-depth list.
-    gather_found: std.AutoHashMap(Key, Value),
-    gather_list: std.ArrayList(KvEntry) = .empty,
+    // Sparse-leaf-page engine, fully decoupled from the storage tree: updates
+    // derive from the block write stream alone and never read storage pages.
+    cmt: commitment.Engine,
+    /// Reusable scratch buffers for the hot per-block paths (none of their
+    /// users is reentrant).
     l0_flush_map: std.AutoHashMap(Key, Value),
     l0_flush_sorted: std.ArrayList(KvEntry) = .empty,
     l0_flush_all: std.ArrayList(IndexedKv) = .empty,
-    commit_dirty: std.AutoHashMap(NodeCoord, u64),
-    commit_at_depth: std.ArrayList(NodeCoord) = .empty,
-    /// Keys written (incl. tombstones) since the last commitBlock; the sole
-    /// source of commitment dirtiness (write-stream derived, §4.1).
-    block_keys: std.ArrayList(Key),
+    commit_indexed: std.ArrayList(IndexedKv) = .empty,
+    commit_batch: std.ArrayList(KvEntry) = .empty,
+    /// Writes (incl. tombstones) since the last commitBlock — the sole input
+    /// to the commitment engine.
+    block_writes: std.ArrayList(KvEntry) = .empty,
     /// Deepest depth at which any node currently exists. Always ≥ 2 (d1/d2 always present).
     max_depth_used: u32 = 2,
     /// Disk store for self-flushing; null for in-memory-only databases.
@@ -470,6 +396,8 @@ pub const PrefixDB = struct {
     current_block_num: u32 = 0,
     /// Committed blocks since last flush; triggers flush at FLUSH_INTERVAL.
     flush_counter: u32 = 0,
+    /// First retained WAL segment (lazy commitment persistence).
+    wal_first_seg: u32 = 0,
     /// O(1) cache for recently-written keys; checked between L0 and SST walk.
     kv_map: kv_map_mod.KvMap,
     allocator: std.mem.Allocator,
@@ -508,23 +436,11 @@ pub const PrefixDB = struct {
         const d3_last_write = try allocator.alloc(u32, 262144);
         errdefer allocator.free(d3_last_write);
         @memset(d3_last_write, 0);
-        // Commitment-tree storage (pages accessed only when their exists bit is set).
-        const cmt_d1 = try allocator.alloc(CommitmentPage, 64);
-        errdefer allocator.free(cmt_d1);
-        const cmt_d2 = try allocator.alloc(CommitmentPage, 4096);
-        errdefer allocator.free(cmt_d2);
-        const cmt_d2_exists = try allocator.alloc(u64, 64);
-        errdefer allocator.free(cmt_d2_exists);
-        @memset(cmt_d2_exists, 0);
-        const cmt_d2_flush = try allocator.alloc(u64, 64);
-        errdefer allocator.free(cmt_d2_flush);
-        @memset(cmt_d2_flush, 0);
-        const cmt_d2_ids = try allocator.alloc(?CommitmentPageId, 4096);
-        errdefer allocator.free(cmt_d2_ids);
-        @memset(cmt_d2_ids, null);
-        const cmt_d2_last = try allocator.alloc(u32, 4096);
-        errdefer allocator.free(cmt_d2_last);
-        @memset(cmt_d2_last, 0);
+        var cmt = try commitment.Engine.init(
+            allocator,
+            if (store) |s| page_store.CommitmentPageStore.init(s.dir, s.io) else null,
+        );
+        errdefer cmt.deinit();
         var routing = RoutingTable.init(allocator);
         errdefer routing.deinit();
         return .{
@@ -542,23 +458,8 @@ pub const PrefixDB = struct {
             .d3_node_ids = d3_node_ids,
             .d2_last_write = d2_last_write,
             .d3_last_write = d3_last_write,
-            .cmt_d0 = CommitmentPage.EMPTY,
-            .cmt_d1 = cmt_d1,
-            .cmt_d1_exists = 0,
-            .cmt_d2 = cmt_d2,
-            .cmt_d2_exists = cmt_d2_exists,
-            .cmt_deep = std.AutoHashMap(NodeCoord, *CommitmentPage).init(allocator),
-            .cmt_deep_ids = std.AutoHashMap(NodeCoord, CommitmentPageId).init(allocator),
-            .cmt_deep_flush = std.AutoHashMap(NodeCoord, void).init(allocator),
-            .cmt_d1_flush = 0,
-            .cmt_d2_flush = cmt_d2_flush,
-            .cmt_d1_ids = [_]?CommitmentPageId{null} ** 64,
-            .cmt_d2_ids = cmt_d2_ids,
-            .cmt_d2_last = cmt_d2_last,
-            .block_keys = .empty,
-            .gather_found = std.AutoHashMap(Key, Value).init(allocator),
+            .cmt = cmt,
             .l0_flush_map = std.AutoHashMap(Key, Value).init(allocator),
-            .commit_dirty = std.AutoHashMap(NodeCoord, u64).init(allocator),
             .kv_map = kv_map_mod.KvMap.init(allocator),
             .allocator = allocator,
             // WAL and store are attached by openWithConfig for disk-backed databases.
@@ -577,15 +478,16 @@ pub const PrefixDB = struct {
         var manifest = page_store.readManifest(store, allocator) catch |err| switch (err) {
             error.FileNotFound => {
                 // No manifest: either a truly fresh database or the first session
-                // crashed before its initial flush.  Check for a WAL either way.
+                // crashed before its initial flush.  Check for WAL segments
+                // either way (everything replays as full blocks).
                 var db = try initWithConfig(allocator, config, store);
                 errdefer db.deinit();
-                const replayed = try replayWal(store, &db, allocator);
+                const replayed = try replayWal(store, &db, allocator, 0, 0, 0);
+                db.store = store;
+                db.wal = try wal_mod.Wal.create(store, nextSegment(store, 0), db.current_block_num);
+                db.cmt.current_block = db.current_block_num;
                 if (replayed) try db.flush(store);
                 db.flush_counter = 0;
-                db.current_block_num = 0;
-                db.store = store;
-                db.wal = try wal_mod.Wal.create(store);
                 return db;
             },
             else => return err,
@@ -622,26 +524,23 @@ pub const PrefixDB = struct {
         const d3_last_write = try allocator.alloc(u32, 262144);
         errdefer allocator.free(d3_last_write);
         @memset(d3_last_write, 0);
-        const cmt_d1 = try allocator.alloc(CommitmentPage, 64);
-        errdefer allocator.free(cmt_d1);
-        const cmt_d2 = try allocator.alloc(CommitmentPage, 4096);
-        errdefer allocator.free(cmt_d2);
-        const cmt_d2_exists = try allocator.alloc(u64, 64);
-        errdefer allocator.free(cmt_d2_exists);
-        @memset(cmt_d2_exists, 0);
-        const cmt_d2_flush = try allocator.alloc(u64, 64);
-        errdefer allocator.free(cmt_d2_flush);
-        @memset(cmt_d2_flush, 0);
-        const cmt_d2_ids = try allocator.alloc(?CommitmentPageId, 4096);
-        errdefer allocator.free(cmt_d2_ids);
-        @memset(cmt_d2_ids, null);
-        const cmt_d2_last = try allocator.alloc(u32, 4096);
-        errdefer allocator.free(cmt_d2_last);
-        @memset(cmt_d2_last, 0);
-        var cmt_d1_exists: u64 = 0;
-        var cmt_d1_ids = [_]?CommitmentPageId{null} ** 64;
-        var cmt_deep_ids = std.AutoHashMap(NodeCoord, CommitmentPageId).init(allocator);
-        errdefer cmt_deep_ids.deinit();
+        // Lazy commitment persistence (manifest v4) changed block numbering
+        // and recovery semantics; older manifests with data need a rebuild.
+        if (manifest.header.version < 4 and
+            (manifest.header.routing_count > 0 or manifest.header.cmt_root_page_id != CMT_NONE))
+            return error.CommitmentRebuildRequired;
+        var cmt = if (manifest.header.cmt_root_page_id != CMT_NONE)
+            try commitment.Engine.load(
+                allocator,
+                page_store.CommitmentPageStore.init(store.dir, store.io),
+                manifest.header.cmt_root_page_id,
+                manifest.header.next_cmt_id,
+                manifest.free_cmt,
+                manifest.header.block_num,
+            )
+        else
+            try commitment.Engine.init(allocator, page_store.CommitmentPageStore.init(store.dir, store.io));
+        errdefer cmt.deinit();
         var d1_node_ids = [_]?NodePageId{null} ** 64;
         var max_depth_used: u32 = 2;
         for (manifest.routes) |r| {
@@ -650,30 +549,16 @@ pub const PrefixDB = struct {
                 arena.put(r.depth, r.prefix, page);
                 if (r.depth == 1) {
                     d1_node_ids[@intCast(r.prefix)] = r.node_id;
-                    if (r.cmt_page_id != CMT_NONE) {
-                        cmt_d1[@intCast(r.prefix)] = try heap.cmt_store.?.read(r.cmt_page_id);
-                        cmt_d1_exists |= @as(u64, 1) << @as(u6, @intCast(r.prefix));
-                        cmt_d1_ids[@intCast(r.prefix)] = r.cmt_page_id;
-                    }
                 } else {
                     d2_node_ids[@intCast(r.prefix)] = r.node_id;
-                    if (r.cmt_page_id != CMT_NONE) {
-                        cmt_d2[@intCast(r.prefix)] = try heap.cmt_store.?.read(r.cmt_page_id);
-                        cmt_d2_exists[@intCast(r.prefix >> 6)] |= @as(u64, 1) << @as(u6, @intCast(r.prefix & 63));
-                        cmt_d2_ids[@intCast(r.prefix)] = r.cmt_page_id;
-                    }
                 }
             } else if (r.depth == 3) {
                 const page = try heap.node_store.?.read(r.node_id);
                 arena.put(3, r.prefix, page);
                 d3_node_ids[@intCast(r.prefix)] = r.node_id;
-                if (r.cmt_page_id != CMT_NONE)
-                    try cmt_deep_ids.put(.{ .depth = 3, .prefix = r.prefix }, r.cmt_page_id);
                 if (max_depth_used < 3) max_depth_used = 3;
             } else {
                 try routing.put(r.depth, r.prefix, r.node_id);
-                if (r.cmt_page_id != CMT_NONE)
-                    try cmt_deep_ids.put(.{ .depth = r.depth, .prefix = r.prefix }, r.cmt_page_id);
                 if (r.depth > max_depth_used) max_depth_used = r.depth;
             }
         }
@@ -700,25 +585,9 @@ pub const PrefixDB = struct {
             .d3_node_ids = d3_node_ids,
             .d2_last_write = d2_last_write,
             .d3_last_write = d3_last_write,
-            .cmt_d0 = CommitmentPage.EMPTY,
-            .cmt_d1 = cmt_d1,
-            .cmt_d1_exists = cmt_d1_exists,
-            .cmt_d2 = cmt_d2,
-            .cmt_d2_exists = cmt_d2_exists,
-            .cmt_deep = std.AutoHashMap(NodeCoord, *CommitmentPage).init(allocator),
-            .cmt_deep_ids = cmt_deep_ids,
-            .cmt_deep_flush = std.AutoHashMap(NodeCoord, void).init(allocator),
-            .cmt_d1_flush = 0,
-            .cmt_d2_flush = cmt_d2_flush,
-            .cmt_d1_ids = cmt_d1_ids,
-            .cmt_d2_ids = cmt_d2_ids,
-            .cmt_d2_last = cmt_d2_last,
-            .next_cmt_id = manifest.header.next_cmt_id,
-            .block_keys = .empty,
+            .cmt = cmt,
             .max_depth_used = max_depth_used,
-            .gather_found = std.AutoHashMap(Key, Value).init(allocator),
             .l0_flush_map = std.AutoHashMap(Key, Value).init(allocator),
-            .commit_dirty = std.AutoHashMap(NodeCoord, u64).init(allocator),
             .kv_map = kv_map_mod.KvMap.init(allocator),
             .allocator = allocator,
             // store and wal remain null during replay so write/commitBlock skip WAL
@@ -728,37 +597,67 @@ pub const PrefixDB = struct {
         // from the reclaimed pool instead of growing the container files.
         try db.heap.node_free.restore(allocator, manifest.free_node);
         try db.heap.sst_free.restore(allocator, manifest.free_sst);
-        try db.cmt_free.restore(allocator, manifest.free_cmt);
 
-        // Replay WAL entries accumulated after the last checkpoint, then
-        // write a consistent manifest so the next open needs no replay.
-        const replayed = try replayWal(store, &db, allocator);
-        if (replayed) try db.flush(store);
+        // Replay the retained WAL: blocks in [cmt_replay_from, block_num)
+        // re-derive lazily-persisted commitment state only; blocks ≥ block_num
+        // (post-checkpoint) replay fully.
+        db.current_block_num = manifest.header.block_num;
+        db.wal_first_seg = manifest.header.wal_first_seg;
+        const replayed = try replayWal(
+            store,
+            &db,
+            allocator,
+            manifest.header.wal_first_seg,
+            manifest.header.block_num,
+            manifest.header.cmt_replay_from,
+        );
 
         // Attach persistent state for normal (post-recovery) operation.
-        db.flush_counter = 0;
-        db.current_block_num = 0;
         db.store = store;
-        db.wal = try wal_mod.Wal.create(store);
+        db.wal = try wal_mod.Wal.create(store, nextSegment(store, db.wal_first_seg), db.current_block_num);
+        db.cmt.current_block = db.current_block_num;
+        if (replayed) try db.flush(store);
+        db.flush_counter = 0;
         return db;
     }
 
-    /// Replay WAL entries recorded after the last CHECKPOINT into `db`.
-    /// `db` must have store=null and wal=null (called during recovery before
-    /// the WAL is attached).  Returns true if any block was replayed.
-    fn replayWal(store: page_store.DiskStore, db: *PrefixDB, allocator: std.mem.Allocator) !bool {
-        const entries = try wal_mod.readAllEntries(store, allocator);
+    /// First WAL segment number that does not exist yet (probe forward,
+    /// skipping pruned leading segments).
+    fn nextSegment(store: page_store.DiskStore, first: u32) u32 {
+        var seg = first;
+        var misses: u32 = 0;
+        var last_existing: ?u32 = null;
+        while (misses < 4096) : (seg += 1) {
+            var buf: [24]u8 = undefined;
+            const name = std.fmt.bufPrint(&buf, "wal_{x:0>8}.bin", .{seg}) catch unreachable;
+            const f = store.dir.openFile(store.io, name, .{}) catch {
+                if (last_existing != null) return seg;
+                misses += 1;
+                continue;
+            };
+            f.close(store.io);
+            last_existing = seg;
+        }
+        return if (last_existing) |le| le + 1 else first;
+    }
+
+    /// Replay retained WAL segments into `db`.  Blocks below `cmt_replay_from`
+    /// are skipped (fully persisted); blocks in [cmt_replay_from, manifest_block)
+    /// re-derive commitment state only (idempotent over the lazily-flushed,
+    /// possibly mixed-age page tree); blocks ≥ manifest_block replay fully.
+    /// `db` must have store=null and wal=null.  Returns true if any block
+    /// needed a full replay or commitment state changed.
+    fn replayWal(
+        store: page_store.DiskStore,
+        db: *PrefixDB,
+        allocator: std.mem.Allocator,
+        first_seg: u32,
+        manifest_block: u32,
+        cmt_replay_from: u32,
+    ) !bool {
+        const entries = try wal_mod.readAllEntries(store, allocator, first_seg);
         defer allocator.free(entries);
         if (entries.len == 0) return false;
-
-        // Locate the last CHECKPOINT; replay everything after it.
-        var replay_start: usize = 0;
-        for (entries, 0..) |e, i| {
-            if (@as(wal_mod.WalEntryType, @enumFromInt(e.entry_type)) == .checkpoint) {
-                replay_start = i + 1;
-            }
-        }
-        if (replay_start >= entries.len) return false;
 
         // Accumulate kv_writes per block_num; commit when block_commit is seen.
         var block_writes = std.AutoHashMap(u32, std.ArrayList(KvEntry)).init(allocator);
@@ -767,11 +666,14 @@ pub const PrefixDB = struct {
             while (vit.next()) |v| v.deinit(allocator);
             block_writes.deinit();
         }
+        var batch = std.ArrayList(KvEntry).empty;
+        defer batch.deinit(allocator);
 
         var replayed = false;
-        for (entries[replay_start..]) |entry| {
+        for (entries) |entry| {
             switch (@as(wal_mod.WalEntryType, @enumFromInt(entry.entry_type))) {
                 .kv_write => {
+                    if (entry.block_num < cmt_replay_from) continue;
                     const gop = try block_writes.getOrPut(entry.block_num);
                     if (!gop.found_existing) gop.value_ptr.* = .empty;
                     try gop.value_ptr.append(allocator, .{
@@ -783,8 +685,24 @@ pub const PrefixDB = struct {
                     if (block_writes.fetchRemove(entry.block_num)) |kv| {
                         var writes = kv.value;
                         defer writes.deinit(allocator);
-                        for (writes.items) |pair| try db.write(pair.key, pair.value);
-                        _ = try db.commitBlock();
+                        if (entry.block_num < manifest_block) {
+                            // Commitment-only: dedup newest-wins, sort, apply.
+                            batch.clearRetainingCapacity();
+                            try batch.ensureUnusedCapacity(allocator, writes.items.len);
+                            var seen = std.AutoHashMap(Key, void).init(allocator);
+                            defer seen.deinit();
+                            var i = writes.items.len;
+                            while (i > 0) {
+                                i -= 1;
+                                const gop2 = try seen.getOrPut(writes.items[i].key);
+                                if (!gop2.found_existing) batch.appendAssumeCapacity(writes.items[i]);
+                            }
+                            std.mem.sort(KvEntry, batch.items, {}, kvLessThan);
+                            _ = try db.cmt.applyBlock(batch.items);
+                        } else {
+                            for (writes.items) |pair| try db.write(pair.key, pair.value);
+                            _ = try db.commitBlock();
+                        }
                         replayed = true;
                     }
                 },
@@ -865,72 +783,19 @@ pub const PrefixDB = struct {
         }
     }
 
-    /// Write at most `budget` dirty commitment pages older than `min_age`
-    /// blocks to disk, always copy-on-write under fresh page ids (the manifest
-    /// checkpoint repoints routing).  Deep pages (depth ≥ 3) are drained only
-    /// on a full flush (min_age == 0).  A no-op without a disk store.
-    fn flushDirtyCmt(self: *PrefixDB, budget: u32, min_age: u32) !void {
-        const cs = if (self.heap.cmt_store) |*s| s else return;
-        var rem = budget;
-
-        {
-            var w = self.cmt_d1_flush;
-            while (w != 0 and rem > 0) : (w &= w - 1) {
-                const i: u32 = @ctz(w);
-                if (self.current_block_num -% self.cmt_d1_last[i] < min_age) continue;
-                const id = self.allocCmtId();
-                try cs.write(id, &self.cmt_d1[i]);
-                if (self.cmt_d1_ids[i]) |old| try self.cmt_free.release(self.allocator, old);
-                self.cmt_d1_ids[i] = id;
-                self.cmt_d1_flush &= ~(@as(u64, 1) << @as(u6, @intCast(i)));
-                rem -= 1;
-            }
-        }
-
-        for (self.cmt_d2_flush, 0..) |*word, wi| {
-            if (rem == 0) return;
-            var w = word.*;
-            while (w != 0 and rem > 0) : (w &= w - 1) {
-                const bit: u32 = @ctz(w);
-                const prefix: u32 = @intCast(wi * 64 + bit);
-                if (self.current_block_num -% self.cmt_d2_last[prefix] < min_age) continue;
-                const id = self.allocCmtId();
-                try cs.write(id, &self.cmt_d2[prefix]);
-                if (self.cmt_d2_ids[prefix]) |old| try self.cmt_free.release(self.allocator, old);
-                self.cmt_d2_ids[prefix] = id;
-                word.* &= ~(@as(u64, 1) << @as(u6, @intCast(bit)));
-                rem -= 1;
-            }
-        }
-
-        if (min_age == 0) {
-            var coords = std.ArrayList(NodeCoord).empty;
-            defer coords.deinit(self.allocator);
-            var it = self.cmt_deep_flush.iterator();
-            while (it.next()) |e| try coords.append(self.allocator, e.key_ptr.*);
-            for (coords.items) |coord| {
-                const page = self.cmt_deep.get(coord) orelse {
-                    _ = self.cmt_deep_flush.remove(coord);
-                    continue;
-                };
-                const id = self.allocCmtId();
-                try cs.write(id, page);
-                if (self.cmt_deep_ids.get(coord)) |old| try self.cmt_free.release(self.allocator, old);
-                try self.cmt_deep_ids.put(coord, id);
-                _ = self.cmt_deep_flush.remove(coord);
-            }
-        }
-    }
 
     /// Persist the current state to `store`.
     /// Writes all live arena nodes to node_store, then writes manifest.bin.
     /// Must be called before process exit to preserve the database.
     pub fn flush(self: *PrefixDB, store: page_store.DiskStore) !void {
-        // Drain ALL remaining dirty arena nodes and commitment pages regardless
-        // of age — the manifest written below must reference fully-persisted
-        // pages.
+        // Drain ALL remaining dirty arena nodes regardless of age — the
+        // manifest's storage tree must be fully persisted.  Commitment pages
+        // stay lazy (stable ids, in-place slots): the manifest records the
+        // replay point instead, and recovery re-derives unflushed commitment
+        // state from the retained WAL.
         try self.flushDirtyNodes(std.math.maxInt(u32), 0);
-        try self.flushDirtyCmt(std.math.maxInt(u32), 0);
+        const cmt_root_id = self.cmt.root_page.page_id;
+        const cmt_replay_from = self.cmt.replayFrom();
 
         // Ensure all d4+ nodes and SST pages referenced by the manifest are on disk.
         // With write-back, they may still be in cache but not yet persisted.
@@ -987,19 +852,23 @@ pub const PrefixDB = struct {
         try self.heap.sst_free.appendAllTo(self.allocator, &free_sst);
         var free_cmt = std.ArrayList(u32).empty;
         defer free_cmt.deinit(self.allocator);
-        try self.cmt_free.appendAllTo(self.allocator, &free_cmt);
+        try self.cmt.free.appendAllTo(self.allocator, &free_cmt);
 
         const header = page_store.ManifestHeader{
             .magic         = page_store.MANIFEST_MAGIC,
             .version       = page_store.MANIFEST_VERSION,
             .next_node_id  = self.heap.next_node_id,
             .next_sst_id   = self.heap.next_sst_id,
-            .next_cmt_id   = self.next_cmt_id,
+            .next_cmt_id   = self.cmt.next_id,
             .routing_count = route_count,
             .l0_count      = l0_count,
             .free_node_count = @intCast(free_node.items.len),
             .free_sst_count  = @intCast(free_sst.items.len),
             .free_cmt_count  = @intCast(free_cmt.items.len),
+            .cmt_root_page_id = cmt_root_id,
+            .block_num       = self.current_block_num,
+            .cmt_replay_from = cmt_replay_from,
+            .wal_first_seg   = self.wal_first_seg,
         };
 
         // Build routing entries slice.
@@ -1015,7 +884,6 @@ pub const PrefixDB = struct {
                         .depth = 1,
                         .prefix = prefix,
                         .node_id = id,
-                        .cmt_page_id = self.cmt_d1_ids[prefix] orelse CMT_NONE,
                     });
                 }
             }
@@ -1031,7 +899,6 @@ pub const PrefixDB = struct {
                         .depth = 2,
                         .prefix = prefix,
                         .node_id = id,
-                        .cmt_page_id = self.cmt_d2_ids[prefix] orelse CMT_NONE,
                     });
                 }
             }
@@ -1047,7 +914,6 @@ pub const PrefixDB = struct {
                         .depth = 3,
                         .prefix = prefix,
                         .node_id = id,
-                        .cmt_page_id = self.cmt_deep_ids.get(.{ .depth = 3, .prefix = prefix }) orelse CMT_NONE,
                     });
                 }
             }
@@ -1060,7 +926,6 @@ pub const PrefixDB = struct {
                     .depth   = kv.key_ptr.depth,
                     .prefix  = kv.key_ptr.prefix,
                     .node_id = kv.value_ptr.*,
-                    .cmt_page_id = self.cmt_deep_ids.get(kv.key_ptr.*) orelse CMT_NONE,
                 });
             }
         }
@@ -1078,11 +943,24 @@ pub const PrefixDB = struct {
         // The new manifest is durable: this-epoch frees are now safe to reuse.
         try self.heap.node_free.promote(self.allocator);
         try self.heap.sst_free.promote(self.allocator);
-        try self.cmt_free.promote(self.allocator);
+        try self.cmt.free.promote(self.allocator);
 
-        // Everything logged so far is captured by the manifest — truncate the
-        // WAL instead of letting it grow for the lifetime of the database.
-        if (self.wal) |*w| try w.reset();
+        // Rotate the WAL into a fresh segment and prune segments wholly below
+        // the replay point.  Pruning runs only after the manifest is durable:
+        // an older manifest may still need the segments this one outgrew, and
+        // readers skip missing leading segments.
+        if (self.wal) |*w| {
+            self.wal_first_seg = wal_mod.pruneSegments(store, self.wal_first_seg, w.seg + 1, cmt_replay_from);
+            try w.rotate(self.current_block_num);
+        }
+    }
+
+    /// Full checkpoint: additionally persists every dirty commitment page so
+    /// the on-disk tree is self-contained (fast reopen, no WAL replay).  Used
+    /// on clean shutdown; periodic checkpoints stay lazy.
+    pub fn flushFull(self: *PrefixDB, store: page_store.DiskStore) !void {
+        _ = try self.cmt.flushAll();
+        try self.flush(store);
     }
 
     /// Wire write-back callbacks for both node and SST caches.
@@ -1126,38 +1004,15 @@ pub const PrefixDB = struct {
         self.allocator.free(self.d3_dirty_flush);
         self.allocator.free(self.d2_last_write);
         self.allocator.free(self.d3_last_write);
-        self.allocator.free(self.cmt_d1);
-        self.allocator.free(self.cmt_d2);
-        self.allocator.free(self.cmt_d2_exists);
-        self.allocator.free(self.cmt_d2_flush);
-        self.allocator.free(self.cmt_d2_ids);
-        self.allocator.free(self.cmt_d2_last);
-        var dit = self.cmt_deep.valueIterator();
-        while (dit.next()) |p| self.allocator.destroy(p.*);
-        self.cmt_deep.deinit();
-        self.cmt_deep_ids.deinit();
-        self.cmt_deep_flush.deinit();
-        self.cmt_free.deinit(self.allocator);
-        self.block_keys.deinit(self.allocator);
-        self.gather_found.deinit();
-        self.gather_list.deinit(self.allocator);
+        self.cmt.deinit();
+        self.block_writes.deinit(self.allocator);
         self.l0_flush_map.deinit();
         self.l0_flush_sorted.deinit(self.allocator);
         self.l0_flush_all.deinit(self.allocator);
-        self.commit_dirty.deinit();
-        self.commit_at_depth.deinit(self.allocator);
+        self.commit_indexed.deinit(self.allocator);
+        self.commit_batch.deinit(self.allocator);
     }
 
-    /// Next commitment-page id: reuse a reclaimed slot when one is available.
-    fn allocCmtId(self: *PrefixDB) CommitmentPageId {
-        if (self.cmt_free.acquire()) |id| {
-            if (comptime options.enable_metrics) self.stats.cmt_pages_reused += 1;
-            return id;
-        }
-        const id = self.next_cmt_id;
-        self.next_cmt_id += 1;
-        return id;
-    }
 
     // ─── Node access helpers (dispatch arena for d1/d2, heap for d3-d5) ───────
 
@@ -1204,9 +1059,6 @@ pub const PrefixDB = struct {
     }
 
     fn nodeRemove(self: *PrefixDB, depth: u32, prefix: PrefixData) !void {
-        // The node's commitment page goes with it; the parent's leaf retains
-        // the (canonical, placement-independent) subtree value.
-        try self.cmtRemove(depth, prefix);
         if (depth <= 3) {
             self.arena.remove(depth, prefix);
             // Release the persisted page and drop the dirty bit so a later
@@ -1242,7 +1094,7 @@ pub const PrefixDB = struct {
     pub fn write(self: *PrefixDB, key: Key, value: Value) !void {
         if (comptime options.enable_metrics) self.stats.write_ops += 1;
         if (self.wal) |*w| try w.append(wal_mod.WalEntry.kvWrite(self.current_block_num, key, value));
-        try self.block_keys.append(self.allocator, key);
+        try self.block_writes.append(self.allocator, .{ .key = key, .value = value });
         try self.l0.append(.{ .key = key, .value = value });
         self.kv_map.put(key, value);
         const p = prefixData(&key, 1);
@@ -1504,352 +1356,42 @@ pub const PrefixDB = struct {
         }
     }
 
-    // ─── Commitment tree internals (docs/commitment_redesign.md §4) ──────────
-
-    /// Return the commitment page for (depth, prefix), creating an empty
-    /// (all-leaves-invalid) page — or lazily loading the persisted one for
-    /// deep coordinates — if absent.  depth 0 is the memory-only root page.
-    fn cmtGetOrCreate(self: *PrefixDB, depth: u32, prefix: PrefixData) anyerror!*CommitmentPage {
-        if (depth == 0) return &self.cmt_d0;
-        if (depth == 1) {
-            const i: usize = @intCast(prefix);
-            const bit = @as(u64, 1) << @as(u6, @intCast(prefix));
-            if (self.cmt_d1_exists & bit == 0) {
-                self.cmt_d1[i] = CommitmentPage.EMPTY;
-                self.cmt_d1_exists |= bit;
-            }
-            return &self.cmt_d1[i];
-        }
-        if (depth == 2) {
-            const i: usize = @intCast(prefix);
-            const w: usize = @intCast(prefix >> 6);
-            const bit = @as(u64, 1) << @as(u6, @intCast(prefix & 63));
-            if (self.cmt_d2_exists[w] & bit == 0) {
-                self.cmt_d2[i] = CommitmentPage.EMPTY;
-                self.cmt_d2_exists[w] |= bit;
-            }
-            return &self.cmt_d2[i];
-        }
-        const coord = NodeCoord{ .depth = depth, .prefix = prefix };
-        if (self.cmt_deep.get(coord)) |p| return p;
-        const page = try self.allocator.create(CommitmentPage);
-        errdefer self.allocator.destroy(page);
-        if (self.cmt_deep_ids.get(coord)) |id| {
-            if (self.heap.cmt_store) |*cs| {
-                page.* = try cs.read(id);
-                try self.cmt_deep.put(coord, page);
-                return page;
-            }
-        }
-        page.* = CommitmentPage.EMPTY;
-        try self.cmt_deep.put(coord, page);
-        return page;
-    }
-
-    /// Drop the commitment page at (depth, prefix), e.g. when its node is
-    /// absorbed by a downwardMerge.  The parent's leaf keeps the canonical
-    /// subtree value, which is placement-independent.
-    fn cmtRemove(self: *PrefixDB, depth: u32, prefix: PrefixData) !void {
-        switch (depth) {
-            0 => {},
-            1 => {
-                const bit = @as(u64, 1) << @as(u6, @intCast(prefix));
-                self.cmt_d1_exists &= ~bit;
-                self.cmt_d1_flush &= ~bit;
-                if (self.cmt_d1_ids[@intCast(prefix)]) |old| try self.cmt_free.release(self.allocator, old);
-                self.cmt_d1_ids[@intCast(prefix)] = null;
-            },
-            2 => {
-                const bit = @as(u64, 1) << @as(u6, @intCast(prefix & 63));
-                self.cmt_d2_exists[@intCast(prefix >> 6)] &= ~bit;
-                self.cmt_d2_flush[@intCast(prefix >> 6)] &= ~bit;
-                if (self.cmt_d2_ids[@intCast(prefix)]) |old| try self.cmt_free.release(self.allocator, old);
-                self.cmt_d2_ids[@intCast(prefix)] = null;
-            },
-            else => {
-                const coord = NodeCoord{ .depth = depth, .prefix = prefix };
-                if (self.cmt_deep.fetchRemove(coord)) |kv| self.allocator.destroy(kv.value);
-                if (self.cmt_deep_ids.fetchRemove(coord)) |kv| try self.cmt_free.release(self.allocator, kv.value);
-                _ = self.cmt_deep_flush.remove(coord);
-            },
-        }
-    }
-
-    /// Mark a commitment page as needing a (CoW) flush, recording its age.
-    fn cmtMarkFlush(self: *PrefixDB, depth: u32, prefix: PrefixData) void {
-        switch (depth) {
-            0 => {}, // memory-only
-            1 => {
-                self.cmt_d1_flush |= @as(u64, 1) << @as(u6, @intCast(prefix));
-                self.cmt_d1_last[@intCast(prefix)] = self.current_block_num;
-            },
-            2 => {
-                self.cmt_d2_flush[@intCast(prefix >> 6)] |= @as(u64, 1) << @as(u6, @intCast(prefix & 63));
-                self.cmt_d2_last[@intCast(prefix)] = self.current_block_num;
-            },
-            else => self.cmt_deep_flush.put(.{ .depth = depth, .prefix = prefix }, {}) catch {},
-        }
-    }
-
-    /// Recompute the 63 internal heap values from the 64 leaves using the
-    /// canonical pass-through `combine` rule.  h[1] becomes the page root.
-    fn rebuildInternals(page: *CommitmentPage) void {
-        var i: usize = 63;
-        while (i >= 1) : (i -= 1) {
-            page.h[i] = merkle.combine(&page.h[2 * i], &page.h[2 * i + 1]);
-        }
-    }
-
-    /// Recompute only the internal heap values on the paths from the changed
-    /// leaves (bit c set ⇔ h[64+c] changed) up to h[1].  Typical commits change
-    /// one or two leaves per page, needing ~6 combines instead of 63.  Falls
-    /// back to the full rebuild when most leaves changed (cold materialisation).
-    fn updateInternals(page: *CommitmentPage, changed: u64) void {
-        if (changed == 0) return;
-        if (@popCount(changed) > 16) return rebuildInternals(page);
-        var mask = changed; // node mask within the current level
-        var base: usize = 64; // level k holds h[base .. 2*base)
-        while (base > 1) {
-            const parent_base = base / 2;
-            var parents: u64 = 0;
-            var m = mask;
-            while (m != 0) : (m &= m - 1) {
-                parents |= @as(u64, 1) << @intCast(@ctz(m) / 2);
-            }
-            var it = parents;
-            while (it != 0) : (it &= it - 1) {
-                const i = parent_base + @ctz(it);
-                page.h[i] = merkle.combine(&page.h[2 * i], &page.h[2 * i + 1]);
-            }
-            mask = parents;
-            base = parent_base;
-        }
-    }
-
-    /// Fill all invalid leaves of `page` (child page roots where a child node
-    /// exists, bottom-slot gathers otherwise) and rebuild the internals.
-    /// Recursive: a child page may itself need materialising first.
-    fn cmtMaterialize(self: *PrefixDB, depth: u32, prefix: PrefixData, page: *CommitmentPage) anyerror!void {
-        if (page.leaf_valid == ~@as(u64, 0)) return;
-        const missing0 = ~page.leaf_valid;
-        var missing = missing0;
-        while (missing != 0) : (missing &= missing - 1) {
-            const c: u32 = @ctz(missing);
-            const child_prefix = (prefix << STRIDE) | c;
-            const child_depth = depth + 1;
-            if (self.nodeExists(child_depth, child_prefix)) {
-                const child = try self.cmtGetOrCreate(child_depth, child_prefix);
-                try self.cmtMaterialize(child_depth, child_prefix, child);
-                page.h[64 + c] = child.h[1];
-            } else {
-                page.h[64 + c] = try self.gatherSlotValue(child_depth, child_prefix);
-            }
-            page.leaf_valid |= @as(u64, 1) << @as(u6, @intCast(c));
-        }
-        const tr0 = if (comptime options.enable_metrics) monoNs() else {};
-        updateInternals(page, missing0);
-        if (comptime options.enable_metrics) self.stats.commit_rehash_ns += monoNs() - tr0;
-    }
-
-    /// Deepest depth (in strides) at which a node exists on `key`'s path;
-    /// 0 when not even the depth-1 node exists.
-    fn deepestNodeOnPath(self: *const PrefixDB, key: *const Key) u32 {
-        var best: u32 = 0;
-        var d: u32 = 1;
-        while (d <= self.max_depth_used) : (d += 1) {
-            if (self.nodeExists(d, prefixData(key, d))) best = d;
-        }
-        return best;
-    }
-
-    /// Canonical value of the bottom slot at (level, p): the §2 trie value over
-    /// every live key with that 6·level-bit prefix.
-    ///
-    /// Precondition: no node exists at (level, p).  Path-connectivity (enforced
-    /// by the downwardMerge child guard) then guarantees no node exists below
-    /// it either, so all matching keys live in ancestor buffers at depths
-    /// 1..level-1.  L0 is empty here: commitBlock flushes it before gathering.
-    fn gatherSlotValue(self: *PrefixDB, level: u32, p: PrefixData) anyerror!Hash {
-        const tg0 = if (comptime options.enable_metrics) monoNs() else {};
-        const alloc = self.allocator;
-        const found = &self.gather_found;
-        found.clearRetainingCapacity();
-
-        // Shallow depths first: read() precedence is shallowest-depth wins,
-        // and within a node append (newest first) beats sorted.
-        var d: u32 = 1;
-        while (d < level) : (d += 1) {
-            const np = p >> @intCast(STRIDE * (level - d));
-            const node = (try self.nodeGet(d, np)) orelse continue;
-            const rel_bits: u32 = STRIDE * (level - d); // bits of p below this node's prefix
-            const rel: u64 = p & ((@as(u64, 1) << @intCast(rel_bits)) - 1);
-
-            // Append zone, newest → oldest; prefix32 filters narrow the scan.
-            const fbits: u32 = @min(rel_bits, 32);
-            const fwant: u32 = @intCast(if (rel_bits <= 32) rel else rel >> @intCast(rel_bits - 32));
-            var j: usize = node.append_count;
-            while (j > 0) {
-                j -= 1;
-                var any = false;
-                for (node.append_prefix32[j][0..node.append_page_counts[j]]) |fv| {
-                    if ((fv >> @intCast(32 - fbits)) == fwant) {
-                        any = true;
-                        break;
-                    }
-                }
-                if (!any) continue;
-                if (try self.heap.getSstPage(node.append_slot_ids[j])) |sst| {
-                    for (sst.entries[0..node.append_page_counts[j]]) |e| {
-                        if (prefixData(&e.key, level) != p) continue;
-                        const gop = try found.getOrPut(e.key);
-                        if (!gop.found_existing) gop.value_ptr.* = e.value;
-                    }
-                }
-            }
-
-            // Sorted zone: keys under the slot span a contiguous page range.
-            if (node.sorted_count > 0) {
-                const lo: u64 = if (rel_bits <= 32) rel << @intCast(32 - rel_bits) else rel >> @intCast(rel_bits - 32);
-                const hi: u64 = if (rel_bits <= 32) (rel + 1) << @intCast(32 - rel_bits) else lo + 1;
-                var plo: usize = 0;
-                var phi: usize = node.sorted_count;
-                while (plo < phi) {
-                    const mid = plo + (phi - plo) / 2;
-                    if (node.sorted_min4[mid] <= lo) plo = mid + 1 else phi = mid;
-                }
-                var pg: usize = if (plo > 0) plo - 1 else 0;
-                while (pg < node.sorted_count) : (pg += 1) {
-                    if (@as(u64, node.sorted_min4[pg]) >= hi) break;
-                    if (try self.heap.getSstPage(node.sorted_slot_ids[pg])) |sst| {
-                        for (sst.entries[0..node.sorted_page_counts[pg]]) |e| {
-                            if (prefixData(&e.key, level) != p) continue;
-                            const gop = try found.getOrPut(e.key);
-                            if (!gop.found_existing) gop.value_ptr.* = e.value;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Tombstones shadow older values during precedence resolution above;
-        // only now do deleted keys drop out of the trie.
-        const list = &self.gather_list;
-        list.clearRetainingCapacity();
-        var it = found.iterator();
-        while (it.next()) |kv| {
-            if (std.mem.eql(u8, kv.value_ptr, &TOMBSTONE)) continue;
-            try list.append(alloc, .{ .key = kv.key_ptr.*, .value = kv.value_ptr.* });
-        }
-        std.mem.sort(KvEntry, list.items, {}, kvLessThan);
-        const result = subtreeValue(list.items, STRIDE * level);
-        if (comptime options.enable_metrics) {
-            self.stats.commit_gather_ns += monoNs() - tg0;
-            self.stats.commit_gather_calls += 1;
-            self.stats.commit_gather_entries += list.items.len;
-        }
-        return result;
-    }
+    // ─── Block commitment (commitment_v2.md §4.5) ─────────────────────────────
 
     /// Recompute the Merkle state root after a block of writes.
     ///
-    /// Dirtiness is derived from the block's write stream (block_keys): each
-    /// written key dirties one bottom slot; changed pages propagate their h[1]
-    /// into the parent's leaf up to the depth-0 page, whose h[1] is the root.
-    /// Commitment values never depend on which buffer holds an entry, so
-    /// compaction and splits cannot change the root.
+    /// The block's write stream is sorted by key, deduplicated newest-wins,
+    /// and handed to the commitment engine, which owns every key's leaf hash
+    /// directly (sparse leaf pages) — no storage pages are consulted, and L0
+    /// flushing is no longer tied to commits.
     ///
-    /// Call once per block after all writes are done.  Flushes L0 internally so
-    /// callers do not need a separate flushL0All call.
+    /// Call once per block after all writes are done.
     pub fn commitBlock(self: *PrefixDB) !Hash {
         if (comptime options.enable_metrics) self.stats.commit_block_calls += 1;
         const t0 = if (comptime options.enable_metrics) monoNs() else {};
 
-        try self.flushL0All();
-        const t1 = if (comptime options.enable_metrics) monoNs() else {};
-        if (comptime options.enable_metrics) self.stats.commit_flushl0_ns += t1 - t0;
-
-        // Dirty slot masks per page, derived from the block's written keys.
-        const dirty = &self.commit_dirty;
-        dirty.clearRetainingCapacity();
-        var max_depth: u32 = 0;
-        for (self.block_keys.items) |key| {
-            const bottom = self.deepestNodeOnPath(&key);
-            const coord = NodeCoord{
-                .depth = bottom,
-                .prefix = if (bottom == 0) 0 else prefixData(&key, bottom),
-            };
-            const slot: u6 = @intCast(prefixData(&key, bottom + 1) & (CHILD_COUNT - 1));
-            const gop = try dirty.getOrPut(coord);
-            if (!gop.found_existing) gop.value_ptr.* = 0;
-            gop.value_ptr.* |= @as(u64, 1) << slot;
-            if (bottom > max_depth) max_depth = bottom;
+        // Sort by (key, newest first) and keep the first of each equal-key
+        // run — one final value per key, in key order.
+        const all = &self.commit_indexed;
+        all.clearRetainingCapacity();
+        try all.ensureUnusedCapacity(self.allocator, self.block_writes.items.len);
+        for (self.block_writes.items, 0..) |e, idx| {
+            all.appendAssumeCapacity(.{ .entry = e, .idx = @intCast(idx) });
         }
-        self.block_keys.clearRetainingCapacity();
-        if (comptime options.enable_metrics) self.stats.commit_dirty_ns += monoNs() - t1;
-
-        // Process deepest-first; each page pushes its new h[1] into its parent.
-        var depth: u32 = max_depth;
-        while (true) {
-            const at_depth = &self.commit_at_depth;
-            at_depth.clearRetainingCapacity();
-            {
-                var dit = dirty.iterator();
-                while (dit.next()) |e| {
-                    if (e.key_ptr.depth == depth) try at_depth.append(self.allocator, e.key_ptr.*);
-                }
-            }
-
-            for (at_depth.items) |coord| {
-                const mask = (dirty.fetchRemove(coord) orelse continue).value;
-                if (comptime options.enable_metrics) self.stats.commit_nodes_processed += 1;
-
-                const page = try self.cmtGetOrCreate(coord.depth, coord.prefix);
-
-                // Refresh lazily-invalid leaves plus the dirty bottom slots.
-                const need0 = ~page.leaf_valid | mask;
-                var need = need0;
-                while (need != 0) : (need &= need - 1) {
-                    const c: u32 = @ctz(need);
-                    const cbit = @as(u64, 1) << @as(u6, @intCast(c));
-                    const child_prefix = (coord.prefix << STRIDE) | c;
-                    const child_depth = coord.depth + 1;
-                    if (self.nodeExists(child_depth, child_prefix)) {
-                        if (page.leaf_valid & cbit == 0) {
-                            const child = try self.cmtGetOrCreate(child_depth, child_prefix);
-                            try self.cmtMaterialize(child_depth, child_prefix, child);
-                            page.h[64 + c] = child.h[1];
-                        }
-                        // else: a deeper dirty page already pushed the fresh value.
-                    } else {
-                        page.h[64 + c] = try self.gatherSlotValue(child_depth, child_prefix);
-                    }
-                    page.leaf_valid |= cbit;
-                }
-                const tr0 = if (comptime options.enable_metrics) monoNs() else {};
-                updateInternals(page, need0);
-                if (comptime options.enable_metrics) self.stats.commit_rehash_ns += monoNs() - tr0;
-                self.cmtMarkFlush(coord.depth, coord.prefix);
-
-                if (coord.depth > 0) {
-                    const slot: usize = @intCast(coord.prefix & (CHILD_COUNT - 1));
-                    const parent_coord = NodeCoord{ .depth = coord.depth - 1, .prefix = coord.prefix >> STRIDE };
-                    const parent = try self.cmtGetOrCreate(parent_coord.depth, parent_coord.prefix);
-                    parent.h[64 + slot] = page.h[1];
-                    parent.leaf_valid |= @as(u64, 1) << @as(u6, @intCast(slot));
-                    const gop = try dirty.getOrPut(parent_coord);
-                    if (!gop.found_existing) gop.value_ptr.* = 0;
-                    gop.value_ptr.* |= @as(u64, 1) << @as(u6, @intCast(slot));
-                }
-            }
-
-            if (depth == 0) break;
-            depth -= 1;
+        self.block_writes.clearRetainingCapacity();
+        std.mem.sort(IndexedKv, all.items, {}, indexedKvLessThan);
+        const batch = &self.commit_batch;
+        batch.clearRetainingCapacity();
+        try batch.ensureUnusedCapacity(self.allocator, all.items.len);
+        for (all.items) |ik| {
+            if (batch.items.len > 0 and
+                std.mem.eql(u8, &batch.items[batch.items.len - 1].key, &ik.entry.key)) continue;
+            batch.appendAssumeCapacity(ik.entry);
         }
+        if (comptime options.enable_metrics) self.stats.commit_dirty_ns += monoNs() - t0;
 
-        // First commit after open (or a write-free block): make sure the root
-        // page is fully materialised before reading the root.
-        try self.cmtMaterialize(0, 0, &self.cmt_d0);
-        const root = self.cmt_d0.h[1];
+        const root = try self.cmt.applyBlock(batch.items);
+
         if (comptime options.enable_metrics) {
             self.stats.commit_block_ns += monoNs() - t0;
         }
@@ -1859,7 +1401,7 @@ pub const PrefixDB = struct {
         // NODE_FLUSH_MIN_AGE blocks are persisted; hot pages stay in memory
         // until they cool down or the FLUSH_INTERVAL checkpoint drains them.
         try self.flushDirtyNodes(NODE_FLUSH_BUDGET, NODE_FLUSH_MIN_AGE);
-        try self.flushDirtyCmt(NODE_FLUSH_BUDGET, NODE_FLUSH_MIN_AGE);
+        try self.cmt.flushBudget(NODE_FLUSH_BUDGET);
         self.flush_counter += 1;
         if (self.flush_counter >= FLUSH_INTERVAL) {
             if (self.store) |s| {
@@ -1985,7 +1527,20 @@ pub const PrefixDB = struct {
                 for (node.append_page_counts[0..node.append_count]) |c| total += c;
             }
         }
-        // deep nodes (depths 3+)
+        // d3 arena (depth 3 lives in the arena's flat array, NOT routing.deep,
+        // which holds only depths ≥ 4).  Skipping it undercounts massively once
+        // the key set settles at depth 3.
+        for (self.arena.d3_exists, 0..) |word, wi| {
+            var w = word;
+            while (w != 0) : (w &= w - 1) {
+                const bit: u32 = @ctz(w);
+                const prefix: u32 = @intCast(wi * 64 + bit);
+                const node = self.arena.d3_pages[prefix];
+                for (node.sorted_page_counts[0..node.sorted_count]) |c| total += c;
+                for (node.append_page_counts[0..node.append_count]) |c| total += c;
+            }
+        }
+        // deep nodes (depths ≥ 4)
         {
             var it = self.routing.deep.iterator();
             while (it.next()) |entry| {
@@ -2317,29 +1872,9 @@ fn monoNs() u64 {
 
 // ─── Commitment helpers ───────────────────────────────────────────────────────
 
-/// Bit `bit` of a 256-bit key, MSB-first (bit 0 = top bit of key[0]).
-pub fn keyBit(key: *const Key, bit: u32) u1 {
-    return @intCast((key[bit >> 3] >> @intCast(7 - (bit & 7))) & 1);
-}
+pub const keyBit = t.keyBit;
 
-/// Canonical trie value (docs/commitment_redesign.md §2) of the subtree at
-/// bit-depth `bit` over `entries`, which must be sorted by key, unique, and
-/// tombstone-free.  Pass-through collapse: a single entry IS the subtree value.
-pub fn subtreeValue(entries: []const KvEntry, bit: u32) Hash {
-    if (entries.len == 0) return ZERO_HASH;
-    if (entries.len == 1) return merkle.leafHash(&entries[0].key, &entries[0].value);
-    std.debug.assert(bit < 256); // >1 distinct keys must diverge within 256 bits
-    // Sorted input: all bit=0 entries precede bit=1 entries; binary-search the split.
-    var lo: usize = 0;
-    var hi: usize = entries.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        if (keyBit(&entries[mid].key, bit) == 0) lo = mid + 1 else hi = mid;
-    }
-    const left = subtreeValue(entries[0..lo], bit + 1);
-    const right = subtreeValue(entries[lo..], bit + 1);
-    return merkle.combine(&left, &right);
-}
+pub const subtreeValue = t.subtreeValue;
 
 // ─── Prefix helpers (§4.2.1, §7.1) ───────────────────────────────────────────
 
@@ -2379,9 +1914,7 @@ pub fn prefix16(key: *const Key, depth: u32) u16 {
 
 // ─── Private operation helpers ────────────────────────────────────────────────
 
-fn kvLessThan(_: void, a: KvEntry, b: KvEntry) bool {
-    return std.mem.order(u8, &a.key, &b.key) == .lt;
-}
+const kvLessThan = t.kvLessThan;
 
 fn binarySearchSst(sst: *const SstPage, key: *const Key) ?Value {
     var lo: usize = 0;
@@ -2416,6 +1949,7 @@ test {
     _ = @import("wal.zig");
     _ = @import("block_journal.zig");
     _ = @import("kv_map.zig");
+    _ = @import("commitment.zig");
 }
 
 test "kv_map: write + flush + read returns correct value without SST walk" {
@@ -2479,10 +2013,12 @@ test "kv_map: SST read warms kv_map; eviction clears it" {
     const v1 = testVal(0x11);
     const v2 = testVal(0x22);
 
-    // Write both keys and commit so they land in separate SST pages.
+    // Write both keys, then flush L0 so they land in separate SST pages
+    // (commitBlock no longer drains L0 — the commitment engine is decoupled).
     try db.write(k1, v1);
     try db.write(k2, v2);
     _ = try db.commitBlock();
+    try db.flushL0All();
 
     // After commit, write()-sourced entries are in kv_map with WRITE_SST_ID.
     try std.testing.expectEqual(@as(?Value, v1), try db.read(k1));
@@ -3284,4 +2820,116 @@ test "compaction queue: duplicate enqueues collapse to one entry" {
     try std.testing.expectEqual(NodeCoord{ .depth = 1, .prefix = 5 }, db.dequeueCompaction().?);
     try std.testing.expectEqual(NodeCoord{ .depth = 2, .prefix = 5 }, db.dequeueCompaction().?);
     try std.testing.expectEqual(@as(?NodeCoord, null), db.dequeueCompaction());
+}
+
+// ─── Lazy commitment persistence tests (commitment_v2.md phase 3) ─────────────
+
+test "lazy cmt: crash after multiple checkpoints recovers root and reads" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = page_store.DiskStore{ .dir = tmp.dir, .io = std.testing.io };
+
+    var root_before: Hash = undefined;
+    {
+        var db = try PrefixDB.openWithConfig(std.testing.allocator, .{}, store);
+        // ~3 automatic checkpoints (FLUSH_INTERVAL = 64); commitment pages
+        // stay mostly unflushed (FLUSH_IDLE_AGE = 64 > touch recency).
+        var blk: u64 = 0;
+        var i: u64 = 0;
+        while (blk < 200) : (blk += 1) {
+            var j: u64 = 0;
+            while (j < 40) : (j += 1) {
+                try db.write(cmtTestKey(i, null), cmtTestVal(i));
+                i += 1;
+            }
+            root_before = try db.commitBlock();
+        }
+        // Crash: deinit without flush.
+        db.deinit();
+    }
+    {
+        var db = try PrefixDB.openWithConfig(std.testing.allocator, .{}, store);
+        defer db.deinit();
+        try std.testing.expectEqual(root_before, try db.commitBlock());
+        var i: u64 = 0;
+        while (i < 8000) : (i += 997) {
+            const got = (try db.read(cmtTestKey(i, null))) orelse return error.MissingKey;
+            try std.testing.expectEqual(cmtTestVal(i), got);
+        }
+    }
+}
+
+test "lazy cmt: clean shutdown (flushFull) reopens without replay and prunes WAL" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = page_store.DiskStore{ .dir = tmp.dir, .io = std.testing.io };
+
+    var root_before: Hash = undefined;
+    {
+        var db = try PrefixDB.openWithConfig(std.testing.allocator, .{}, store);
+        var blk: u64 = 0;
+        var i: u64 = 0;
+        while (blk < 150) : (blk += 1) {
+            var j: u64 = 0;
+            while (j < 40) : (j += 1) {
+                try db.write(cmtTestKey(i, null), cmtTestVal(i));
+                i += 1;
+            }
+            root_before = try db.commitBlock();
+        }
+        try db.flushFull(store);
+        // Everything persisted: the replay window is empty.
+        try std.testing.expectEqual(db.current_block_num, db.cmt.replayFrom());
+        db.deinit();
+    }
+    {
+        var db = try PrefixDB.openWithConfig(std.testing.allocator, .{}, store);
+        defer db.deinit();
+        try std.testing.expectEqual(root_before, try db.commitBlock());
+    }
+    // flushFull's checkpoint pruned the oldest segment on disk (the manifest
+    // may still record the pre-prune first segment; readers skip the gap).
+    {
+        const f = tmp.dir.openFile(std.testing.io, "wal_00000000.bin", .{}) catch |err| {
+            try std.testing.expectEqual(error.FileNotFound, err);
+            return;
+        };
+        f.close(std.testing.io);
+        return error.SegmentNotPruned;
+    }
+}
+
+test "lazy cmt: torn page slot falls back to the older valid slot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = page_store.DiskStore{ .dir = tmp.dir, .io = std.testing.io };
+
+    var root_before: Hash = undefined;
+    var root_id: u32 = undefined;
+    {
+        var db = try PrefixDB.openWithConfig(std.testing.allocator, .{}, store);
+        var i: u64 = 0;
+        while (i < 50) : (i += 1) try db.write(cmtTestKey(i, null), cmtTestVal(i));
+        root_before = try db.commitBlock();
+        try db.flushFull(store);
+        root_id = db.cmt.root_page.page_id;
+        db.deinit();
+    }
+    // Corrupt the slot that would hold the NEXT version (simulates a torn
+    // in-place write): recovery must keep using the current valid slot.
+    {
+        var cs = page_store.CommitmentPageStore.init(tmp.dir, std.testing.io);
+        var junk: [4096]u8 = undefined;
+        for (&junk, 0..) |*b, i| b.* = @truncate(i *% 17);
+        // Current version's slot is (version & 1); damage the other one.
+        var cur: [4096]u8 = undefined;
+        try cs.readRaw(root_id * 2, &cur);
+        const other: u32 = if (commitment.Page.slotVersion(&cur) != null) 1 else 0;
+        try cs.writeRaw(root_id * 2 + other, &junk);
+    }
+    {
+        var db = try PrefixDB.openWithConfig(std.testing.allocator, .{}, store);
+        defer db.deinit();
+        try std.testing.expectEqual(root_before, try db.commitBlock());
+    }
 }

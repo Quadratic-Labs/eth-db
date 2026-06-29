@@ -19,8 +19,14 @@ const Value = root.Value;
 
 const TOMBSTONE = t.TOMBSTONE;
 
+// The library allocator.  NOT DebugAllocator: backed by the page allocator it
+// creates one mmap per sizeable allocation, and a large database (hundreds of
+// thousands of commitment-page arrays) runs into the kernel's vm.max_map_count
+// (default 65530), after which every allocation fails spuriously.
+// smp_allocator reuses slabs and keeps the mapping count bounded.
+const lib_alloc = std.heap.smp_allocator;
+
 const State = struct {
-    gpa: std.heap.DebugAllocator(.{}),
     db: PrefixDB,
     store: ?page_store.DiskStore = null,
     journal: journal_mod.BlockJournal,
@@ -32,40 +38,37 @@ fn globalIo() std.Io {
 
 export fn prefixdb_init() ?*State {
     const state = std.heap.page_allocator.create(State) catch return null;
-    state.* = .{ .gpa = .{}, .db = undefined, .store = null, .journal = undefined };
-    state.db = PrefixDB.init(state.gpa.allocator()) catch {
-        _ = state.gpa.deinit();
+    state.* = .{ .db = undefined, .store = null, .journal = undefined };
+    state.db = PrefixDB.init(lib_alloc) catch {
         std.heap.page_allocator.destroy(state);
         return null;
     };
     state.db.enableWriteBack();
-    state.journal = journal_mod.BlockJournal.init(state.gpa.allocator());
+    state.journal = journal_mod.BlockJournal.init(lib_alloc);
     return state;
 }
 
 export fn prefixdb_init_capacity(node_cap: u32, sst_cap: u32) ?*State {
     const state = std.heap.page_allocator.create(State) catch return null;
-    state.* = .{ .gpa = .{}, .db = undefined, .store = null, .journal = undefined };
-    state.db = PrefixDB.initCapacity(state.gpa.allocator(), node_cap, sst_cap) catch {
-        _ = state.gpa.deinit();
+    state.* = .{ .db = undefined, .store = null, .journal = undefined };
+    state.db = PrefixDB.initCapacity(lib_alloc, node_cap, sst_cap) catch {
         std.heap.page_allocator.destroy(state);
         return null;
     };
     state.db.enableWriteBack();
-    state.journal = journal_mod.BlockJournal.init(state.gpa.allocator());
+    state.journal = journal_mod.BlockJournal.init(lib_alloc);
     return state;
 }
 
 export fn prefixdb_deinit(state: *State) void {
     if (state.store) |store| {
-        state.db.flush(store) catch |err| {
+        state.db.flushFull(store) catch |err| {
             std.debug.print("prefixdb_deinit: flush failed: {}\n", .{err});
         };
         store.dir.close(store.io);
     }
     state.journal.deinit();
     state.db.deinit();
-    _ = state.gpa.deinit();
     std.heap.page_allocator.destroy(state);
 }
 
@@ -74,10 +77,9 @@ export fn prefixdb_deinit(state: *State) void {
 /// node_cap and sst_cap are the LRU cache sizes (pass 0 to use engine defaults).
 export fn prefixdb_open(path: [*:0]const u8, node_cap: u32, sst_cap: u32) ?*State {
     const state = std.heap.page_allocator.create(State) catch return null;
-    state.* = .{ .gpa = .{}, .db = undefined, .store = null, .journal = undefined };
+    state.* = .{ .db = undefined, .store = null, .journal = undefined };
     const io = globalIo();
     const dir = std.Io.Dir.cwd().createDirPathOpen(io, std.mem.span(path), .{}) catch {
-        _ = state.gpa.deinit();
         std.heap.page_allocator.destroy(state);
         return null;
     };
@@ -85,15 +87,14 @@ export fn prefixdb_open(path: [*:0]const u8, node_cap: u32, sst_cap: u32) ?*Stat
     state.store = store;
     const nc = if (node_cap == 0) root.DEFAULT_NODE_CACHE_CAP else node_cap;
     const sc = if (sst_cap  == 0) root.DEFAULT_SST_CACHE_CAP  else sst_cap;
-    state.db = PrefixDB.openWithConfig(state.gpa.allocator(), .{ .node_cap = nc, .sst_cap = sc }, store) catch {
+    state.db = PrefixDB.openWithConfig(lib_alloc, .{ .node_cap = nc, .sst_cap = sc }, store) catch {
         dir.close(io);
         state.store = null;
-        _ = state.gpa.deinit();
         std.heap.page_allocator.destroy(state);
         return null;
     };
     state.db.enableWriteBack();
-    state.journal = journal_mod.BlockJournal.init(state.gpa.allocator());
+    state.journal = journal_mod.BlockJournal.init(lib_alloc);
     return state;
 }
 
@@ -238,6 +239,15 @@ pub const PrefixDBMetrics = extern struct {
     commit_gather_calls: u64,
     commit_gather_entries: u64,
     commit_rehash_ns: u64,
+    // ── Commitment v2 engine ──
+    commit_apply_ns: u64,
+    commit_propagate_ns: u64,
+    cmt_splits: u64,
+    cmt_merges: u64,
+    cmt_page_loads: u64,
+    cmt_page_flushes: u64,
+    cmt_combines: u64,
+    cmt_walk_hops: u64,
 };
 
 /// Fill *out with a snapshot of all internal counters.
@@ -246,11 +256,12 @@ export fn prefixdb_get_metrics(state: *State, out: *PrefixDBMetrics) i32 {
     // Gauges are available regardless of enable_metrics.
     const gauge_free_node = state.db.heap.node_free.totalLen();
     const gauge_free_sst = state.db.heap.sst_free.totalLen();
-    const gauge_free_cmt = state.db.cmt_free.totalLen();
+    const gauge_free_cmt = state.db.cmt.free.totalLen();
     const gauge_backlog = state.db.compactionBacklog();
     if (comptime options.enable_metrics) {
         const s = state.db.stats;
         const h = state.db.heap.heap_stats;
+        const c = state.db.cmt.stats;
         out.* = .{
             .read_ops             = s.read_ops,
             .write_ops            = s.write_ops,
@@ -278,7 +289,7 @@ export fn prefixdb_get_metrics(state: *State, out: *PrefixDBMetrics) i32 {
             .kv_map_hits            = s.kv_map_hits,
             .node_pages_reused      = h.node_pages_reused,
             .sst_pages_reused       = h.sst_pages_reused,
-            .cmt_pages_reused       = s.cmt_pages_reused,
+            .cmt_pages_reused       = c.ids_reused,
             .free_node_ids          = gauge_free_node,
             .free_sst_ids           = gauge_free_sst,
             .free_cmt_ids           = gauge_free_cmt,
@@ -289,6 +300,14 @@ export fn prefixdb_get_metrics(state: *State, out: *PrefixDBMetrics) i32 {
             .commit_gather_calls    = s.commit_gather_calls,
             .commit_gather_entries  = s.commit_gather_entries,
             .commit_rehash_ns       = s.commit_rehash_ns,
+            .commit_apply_ns        = c.apply_ns,
+            .commit_propagate_ns    = c.propagate_ns,
+            .cmt_splits             = c.splits,
+            .cmt_merges             = c.merges,
+            .cmt_page_loads         = c.page_loads,
+            .cmt_page_flushes       = c.page_flushes,
+            .cmt_combines           = c.combines,
+            .cmt_walk_hops          = c.walk_hops,
         };
     } else {
         out.* = std.mem.zeroes(PrefixDBMetrics);
@@ -305,6 +324,7 @@ export fn prefixdb_reset_metrics(state: *State) i32 {
     if (comptime options.enable_metrics) {
         state.db.stats = .{};
         state.db.heap.heap_stats = .{};
+        state.db.cmt.stats = .{};
     }
     return 0;
 }

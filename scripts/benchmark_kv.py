@@ -81,9 +81,9 @@ class WorkloadGenerator:
         hot_slots_per_account: int = 4,
         warm_anchors_per_account: int = 3,
         spread: int = 64,
-        min_block_size: int = 100,
-        max_block_size: int = 800,
-        read_prob: float = 0.85,
+        min_block_size: int = 8000,
+        max_block_size: int = 16000,
+        read_prob: float = 0.75,
         seed: int | None = None,
     ):
         self.rng = random.Random(seed)
@@ -438,6 +438,11 @@ def run_benchmark(
             "total_commit_gather_calls":     _sum_metric("commit_gather_calls"),
             "total_commit_gather_entries":   _sum_metric("commit_gather_entries"),
             "total_commit_rehash_ns":        _sum_metric("commit_rehash_ns"),
+            "total_commit_apply_ns":         _sum_metric("commit_apply_ns"),
+            "total_commit_propagate_ns":     _sum_metric("commit_propagate_ns"),
+            "total_cmt_splits":              _sum_metric("cmt_splits"),
+            "total_cmt_page_loads":          _sum_metric("cmt_page_loads"),
+            "total_cmt_page_flushes":        _sum_metric("cmt_page_flushes"),
         },
     }
 
@@ -461,9 +466,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hot-slots",      type=int,   default=4)
     p.add_argument("--warm-anchors",   type=int,   default=3)
     p.add_argument("--spread",         type=int,   default=64)
-    p.add_argument("--min-block-size", type=int,   default=100)
-    p.add_argument("--max-block-size", type=int,   default=800)
-    p.add_argument("--read-prob",      type=float, default=0.85)
+    p.add_argument("--min-block-size", type=int,   default=8000)
+    p.add_argument("--max-block-size", type=int,   default=16000)
+    p.add_argument("--read-prob",      type=float, default=0.75)
     p.add_argument("--seed",           type=int,   default=42)
     p.add_argument("-o", "--output",   default="metrics.json",
                    help="Output JSON file (default: metrics.json)")
@@ -553,16 +558,15 @@ def main() -> None:
         f"sst_hit={i['sst_cache_hit_rate']:.1%}  filter_sel={i['filter_selectivity']:.1%}",
         file=sys.stderr,
     )
-    commit_other_ns = (i['total_commit_block_ns'] - i['total_commit_flushl0_ns']
-                       - i['total_commit_dirty_ns'] - i['total_commit_gather_ns']
-                       - i['total_commit_rehash_ns'])
+    commit_other_ns = (i['total_commit_block_ns'] - i['total_commit_dirty_ns']
+                       - i['total_commit_apply_ns'] - i['total_commit_propagate_ns'])
     print(
-        f"  [commit] flushl0={i['total_commit_flushl0_ns']/1e6:.0f}ms  "
-        f"dirty={i['total_commit_dirty_ns']/1e6:.0f}ms  "
-        f"gather={i['total_commit_gather_ns']/1e6:.0f}ms "
-        f"({i['total_commit_gather_calls']} calls, {i['total_commit_gather_entries']} entries)  "
-        f"rehash={i['total_commit_rehash_ns']/1e6:.0f}ms  "
-        f"other={commit_other_ns/1e6:.0f}ms",
+        f"  [commit] sort={i['total_commit_dirty_ns']/1e6:.0f}ms  "
+        f"apply={i['total_commit_apply_ns']/1e6:.0f}ms  "
+        f"propagate={i['total_commit_propagate_ns']/1e6:.0f}ms  "
+        f"other={commit_other_ns/1e6:.0f}ms  "
+        f"(splits={i['total_cmt_splits']}, page_loads={i['total_cmt_page_loads']}, "
+        f"page_flushes={i['total_cmt_page_flushes']})",
         file=sys.stderr,
     )
 

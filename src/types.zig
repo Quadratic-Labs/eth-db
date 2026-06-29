@@ -67,34 +67,93 @@ pub const NodePage = struct {
     append_prefix32: [A_MAX][PAGE_ENTRIES]u32,
 };
 
-// ─── Commitment page (docs/commitment_redesign.md §3.1) ───────────────────────
-//
-// The complete 6-level binary subtree of one (depth, prefix) node, stored as an
-// implicit heap: h[1] is the node's own subtree commitment, h[2i]/h[2i+1] are
-// the children of h[i], and h[64..127] are the 64 child-slot values at depth+1.
-// All values follow the canonical pass-through `combine` rule (§2), so stored
-// internals are canonical trie values usable directly in Merkle proofs.
-//
-// On-disk: exactly 4096 bytes.
-//   4 B    header (version u8, flags u8, _pad[2])
-//   8 B    leaf_valid (u64 LE) — lazy-leaf validity bitmap
-//   20 B   _reserved
-//   4064 B h[1..127] (127 × 32 B)
+
+// ─── Commitment page ids ──────────────────────────────────────────────────────
 
 pub const CommitmentPageId = u32;
-/// Sentinel for "no persisted commitment page" in routing/manifest entries.
+/// Sentinel for "no persisted commitment page".
 pub const CMT_NONE: CommitmentPageId = std.math.maxInt(u32);
 
-pub const CommitmentPage = struct {
-    /// Bit c set ⇔ h[64+c] holds the canonical value of child slot c.
-    /// Invalid leaves are filled lazily (gather or child h[1]) before any
-    /// internal value of this page is used.
-    leaf_valid: u64,
-    /// Implicit heap; h[0] is unused padding.
-    h: [128]Hash,
+// ─── Deferred-reuse free list for on-disk page ids ────────────────────────────
+//
+// Page slots in the container files are reused instead of growing forever.
+// Reuse must not break crash recovery: the last durable manifest (plus the node
+// pages it references) may still point at a page freed *after* that manifest
+// was written.  Ids therefore quarantine in `pending` until the next manifest
+// — which by construction no longer references them — is durably on disk; only
+// then do they become allocatable.
 
-    pub const EMPTY = CommitmentPage{
-        .leaf_valid = 0,
-        .h = [_]Hash{ZERO_HASH} ** 128,
-    };
+pub const FreeList = struct {
+    /// Ids dead in the last durable manifest — safe to reuse now.
+    free: std.ArrayList(u32) = .empty,
+    /// Ids freed since the last manifest write — reusable after the next one.
+    pending: std.ArrayList(u32) = .empty,
+
+    pub fn deinit(self: *FreeList, allocator: std.mem.Allocator) void {
+        self.free.deinit(allocator);
+        self.pending.deinit(allocator);
+    }
+
+    /// Quarantine a dead id until the next manifest checkpoint.
+    pub fn release(self: *FreeList, allocator: std.mem.Allocator, id: u32) !void {
+        try self.pending.append(allocator, id);
+    }
+
+    /// Pop a reusable id, or null when a fresh id must be allocated.
+    pub fn acquire(self: *FreeList) ?u32 {
+        return self.free.pop();
+    }
+
+    /// All ids that the manifest being written right now does not reference.
+    /// Both lists qualify: once that manifest is durable, `pending` is dead too.
+    pub fn totalLen(self: *const FreeList) u32 {
+        return @intCast(self.free.items.len + self.pending.items.len);
+    }
+
+    /// Append free ++ pending into `out` (manifest serialisation order).
+    pub fn appendAllTo(self: *const FreeList, allocator: std.mem.Allocator, out: *std.ArrayList(u32)) !void {
+        try out.appendSlice(allocator, self.free.items);
+        try out.appendSlice(allocator, self.pending.items);
+    }
+
+    /// The manifest excluding `pending`'s referents is durable: promote.
+    pub fn promote(self: *FreeList, allocator: std.mem.Allocator) !void {
+        try self.free.appendSlice(allocator, self.pending.items);
+        self.pending.clearRetainingCapacity();
+    }
+
+    /// Restore from a recovered manifest: everything listed is immediately reusable.
+    pub fn restore(self: *FreeList, allocator: std.mem.Allocator, ids: []const u32) !void {
+        try self.free.appendSlice(allocator, ids);
+    }
 };
+
+// ─── Canonical trie helpers (shared by root.zig and commitment.zig) ──────────
+
+/// Bit `bit` of a 256-bit key, MSB-first (bit 0 = top bit of key[0]).
+pub fn keyBit(key: *const Key, bit: u32) u1 {
+    return @intCast((key[bit >> 3] >> @intCast(7 - (bit & 7))) & 1);
+}
+
+pub fn kvLessThan(_: void, a: KvEntry, b: KvEntry) bool {
+    return std.mem.order(u8, &a.key, &b.key) == .lt;
+}
+
+/// Canonical trie value (commitment_v2.md §2) of the subtree at bit-depth
+/// `bit` over `entries`, which must be sorted by key, unique, and
+/// tombstone-free.  Pass-through collapse: a single entry IS the subtree value.
+pub fn subtreeValue(entries: []const KvEntry, bit: u32) Hash {
+    if (entries.len == 0) return ZERO_HASH;
+    if (entries.len == 1) return merkle.leafHash(&entries[0].key, &entries[0].value);
+    std.debug.assert(bit < 256); // >1 distinct keys must diverge within 256 bits
+    // Sorted input: all bit=0 entries precede bit=1 entries; binary-search the split.
+    var lo: usize = 0;
+    var hi: usize = entries.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (keyBit(&entries[mid].key, bit) == 0) lo = mid + 1 else hi = mid;
+    }
+    const left = subtreeValue(entries[0..lo], bit + 1);
+    const right = subtreeValue(entries[lo..], bit + 1);
+    return merkle.combine(&left, &right);
+}

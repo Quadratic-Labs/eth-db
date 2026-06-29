@@ -39,9 +39,16 @@ pub const KvMap = struct {
         self.map.deinit();
     }
 
+    /// Hard cap on cached entries.  KvMap is a pure read cache (reads fall
+    /// back to the SST walk), but write-sourced entries are only evicted with
+    /// their source page — which for writes is never — so without a cap it
+    /// grows with every key ever written.  Reset wholesale when full.
+    pub const MAX_ENTRIES: u32 = 1 << 20;
+
     /// Insert or overwrite key → value (write-sourced; always newest).
     /// On OOM the key is removed to prevent stale reads.
     pub fn put(self: *KvMap, key: t.Key, value: t.Value) void {
+        if (self.map.count() >= MAX_ENTRIES) self.map.clearRetainingCapacity();
         self.map.put(key, .{ .value = value, .sst_id = WRITE_SST_ID }) catch {
             _ = self.map.remove(key);
         };

@@ -29,11 +29,13 @@ pub const PAGE_SIZE: u32 = 4096;
 pub const DiskStore = struct { dir: Io.Dir, io: Io };
 
 pub const MANIFEST_MAGIC: u32 = 0x01_42_44_50;
-pub const MANIFEST_VERSION: u32 = 2;
+pub const MANIFEST_VERSION: u32 = 4;
 
 /// Fixed-size header written at offset 0 of manifest.bin.
 /// The first 32 bytes are layout-identical to version 1; the free-list counts
-/// were appended in version 2 (v1 manifests are read with empty free lists).
+/// were appended in version 2 (v1 manifests are read with empty free lists);
+/// the commitment-v2 root page id was appended in version 3 (older manifests
+/// read as CMT_NONE — commitment state absent).
 pub const ManifestHeader = extern struct {
     magic: u32,
     version: u32,
@@ -48,13 +50,29 @@ pub const ManifestHeader = extern struct {
     free_sst_count: u32 = 0,
     free_cmt_count: u32 = 0,
     _pad2: u32 = 0,
+    // ── Version 3 ──
+    cmt_root_page_id: u32 = root.CMT_NONE,
+    _pad3: u32 = 0,
+    // ── Version 4 (lazy commitment persistence) ──
+    /// Next block number at checkpoint time (block numbering is persistent).
+    block_num: u32 = 0,
+    /// WAL replay starts here: earliest block with unpersisted commitment
+    /// effects.  Blocks in [cmt_replay_from, block_num) replay commitment-only;
+    /// blocks ≥ block_num replay fully.
+    cmt_replay_from: u32 = 0,
+    /// First retained WAL segment (may already be pruned; readers skip
+    /// missing leading segments).
+    wal_first_seg: u32 = 0,
+    _pad4: u32 = 0,
 };
 
-/// Byte size of the version-1 header (prefix of the current layout).
+/// Byte sizes of the older header layouts (prefixes of the current one).
 pub const MANIFEST_HEADER_V1_SIZE: usize = 32;
+pub const MANIFEST_HEADER_V2_SIZE: usize = 48;
+pub const MANIFEST_HEADER_V3_SIZE: usize = 56;
 
 comptime {
-    if (@sizeOf(ManifestHeader) != 48) @compileError("ManifestHeader layout drifted");
+    if (@sizeOf(ManifestHeader) != 72) @compileError("ManifestHeader layout drifted");
 }
 
 /// One routing-table entry (depth + prefix → node_id [+ commitment page id]).
@@ -143,12 +161,18 @@ pub fn readManifest(store: DiskStore, allocator: std.mem.Allocator) !ManifestDat
     off += MANIFEST_HEADER_V1_SIZE;
     if (header.magic != MANIFEST_MAGIC) return error.ManifestBadMagic;
     switch (header.version) {
-        1 => {},
-        2 => {
-            const tail = head_bytes[MANIFEST_HEADER_V1_SIZE..@sizeOf(ManifestHeader)];
+        1 => header.cmt_root_page_id = root.CMT_NONE,
+        2, 3, 4 => {
+            const end: usize = switch (header.version) {
+                2 => MANIFEST_HEADER_V2_SIZE,
+                3 => MANIFEST_HEADER_V3_SIZE,
+                else => @sizeOf(ManifestHeader),
+            };
+            const tail = head_bytes[MANIFEST_HEADER_V1_SIZE..end];
             const tn = try f.readPositionalAll(store.io, tail, off);
             if (tn != tail.len) return error.ManifestTruncated;
             off += tail.len;
+            if (header.version == 2) header.cmt_root_page_id = root.CMT_NONE;
         },
         else => return error.ManifestVersionMismatch,
     }
@@ -386,37 +410,11 @@ pub const NodePageStore = struct {
 // ─── Commitment page store (docs/commitment_redesign.md §3.1, §7) ─────────────
 
 const CMT_PAGE_SIZE: u32 = 4096;
-const CMT_VERSION: u8 = 1;
-const CMT_LEAF_VALID_OFF: u32 = 4;
-const CMT_HEAP_OFF: u32 = 32; // h[1..127] = 127 × 32 = 4064 B
 
-comptime {
-    if (CMT_HEAP_OFF + 127 * 32 != CMT_PAGE_SIZE)
-        @compileError("CommitmentPage layout does not fit in 4096 bytes");
-}
-
-fn serialiseCmtPage(page: *const root.CommitmentPage, buf: *[CMT_PAGE_SIZE]u8) void {
-    buf[0] = CMT_VERSION;
-    buf[1] = 0; // flags
-    buf[2] = 0;
-    buf[3] = 0;
-    std.mem.writeInt(u64, buf[CMT_LEAF_VALID_OFF..][0..8], page.leaf_valid, .little);
-    @memset(buf[12..32], 0);
-    // h[1..127]: endian-neutral 32-byte digests
-    @memcpy(buf[CMT_HEAP_OFF..][0 .. 127 * 32], std.mem.asBytes(&page.h)[32 .. 128 * 32]);
-}
-
-fn deserialiseCmtPage(buf: *const [CMT_PAGE_SIZE]u8) root.CommitmentPage {
-    var page = root.CommitmentPage.EMPTY;
-    page.leaf_valid = std.mem.readInt(u64, buf[CMT_LEAF_VALID_OFF..][0..8], .little);
-    @memcpy(std.mem.asBytes(&page.h)[32 .. 128 * 32], buf[CMT_HEAP_OFF..][0 .. 127 * 32]);
-    return page;
-}
-
-/// Persistent store for commitment pages.  Container files are named
-/// `cmt_XXXXXXXX.dat`; addressing is identical to NodePageStore.  Pages are
-/// always written copy-on-write under fresh ids; the manifest checkpoint
-/// repoints routing (logical identity = (depth, prefix), never the page id).
+/// Persistent store for commitment pages (raw 4 KiB blocks; serialisation is
+/// owned by commitment.zig).  Container files are named `cmt_XXXXXXXX.dat`;
+/// addressing is identical to NodePageStore.  Pages are written copy-on-write
+/// under ids managed by the commitment engine's deferred-reuse free list.
 pub const CommitmentPageStore = struct {
     dir: Io.Dir,
     io: Io,
@@ -425,21 +423,17 @@ pub const CommitmentPageStore = struct {
         return .{ .dir = dir, .io = io };
     }
 
-    pub fn write(self: *CommitmentPageStore, id: root.CommitmentPageId, page: *const root.CommitmentPage) !void {
-        var buf: [CMT_PAGE_SIZE]u8 = undefined;
-        serialiseCmtPage(page, &buf);
+    pub fn writeRaw(self: *CommitmentPageStore, id: u32, buf: *const [CMT_PAGE_SIZE]u8) !void {
         const f = try self.openContainer(containerId(id), .write);
         defer f.close(self.io);
-        try f.writePositionalAll(self.io, &buf, fileOffset(localPage(id)));
+        try f.writePositionalAll(self.io, buf, fileOffset(localPage(id)));
     }
 
-    pub fn read(self: *CommitmentPageStore, id: root.CommitmentPageId) !root.CommitmentPage {
-        var buf: [CMT_PAGE_SIZE]u8 = undefined;
+    pub fn readRaw(self: *CommitmentPageStore, id: u32, buf: *[CMT_PAGE_SIZE]u8) !void {
         const f = try self.openContainer(containerId(id), .read);
         defer f.close(self.io);
-        const n = try f.readPositionalAll(self.io, &buf, fileOffset(localPage(id)));
+        const n = try f.readPositionalAll(self.io, buf, fileOffset(localPage(id)));
         if (n != CMT_PAGE_SIZE) return error.UnexpectedEof;
-        return deserialiseCmtPage(&buf);
     }
 
     const OpenMode = enum { read, write };
@@ -650,24 +644,15 @@ test "NodePageStore pages across containers" {
     try std.testing.expectEqual(p1.sorted_min4[0], g1.sorted_min4[0]);
 }
 
-test "CommitmentPageStore write and read round-trip" {
+test "CommitmentPageStore raw round-trip" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = CommitmentPageStore.init(tmp.dir, std.testing.io);
 
-    var page = root.CommitmentPage.EMPTY;
-    page.leaf_valid = 0xDEAD_BEEF_CAFE_F00D;
-    page.h[1] = [_]u8{0x11} ** 32;
-    page.h[64] = [_]u8{0x40} ** 32;
-    page.h[127] = [_]u8{0x7F} ** 32;
-
-    try store.write(5, &page);
-    const got = try store.read(5);
-
-    try std.testing.expectEqual(page.leaf_valid, got.leaf_valid);
-    try std.testing.expectEqual(page.h[1], got.h[1]);
-    try std.testing.expectEqual(page.h[64], got.h[64]);
-    try std.testing.expectEqual(page.h[127], got.h[127]);
-    // h[0] is padding and must come back zeroed.
-    try std.testing.expectEqual(root.ZERO_HASH, got.h[0]);
+    var buf: [CMT_PAGE_SIZE]u8 = undefined;
+    for (&buf, 0..) |*b, i| b.* = @truncate(i *% 31);
+    try store.writeRaw(5, &buf);
+    var got: [CMT_PAGE_SIZE]u8 = undefined;
+    try store.readRaw(5, &got);
+    try std.testing.expectEqualSlices(u8, &buf, &got);
 }

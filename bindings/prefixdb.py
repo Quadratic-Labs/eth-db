@@ -119,6 +119,15 @@ class Metrics(ctypes.Structure):
         ("commit_gather_calls",     ctypes.c_uint64),
         ("commit_gather_entries",   ctypes.c_uint64),
         ("commit_rehash_ns",        ctypes.c_uint64),
+        # Commitment v2 engine.
+        ("commit_apply_ns",         ctypes.c_uint64),
+        ("commit_propagate_ns",     ctypes.c_uint64),
+        ("cmt_splits",              ctypes.c_uint64),
+        ("cmt_merges",              ctypes.c_uint64),
+        ("cmt_page_loads",          ctypes.c_uint64),
+        ("cmt_page_flushes",        ctypes.c_uint64),
+        ("cmt_combines",            ctypes.c_uint64),
+        ("cmt_walk_hops",           ctypes.c_uint64),
     ]
 
     def as_dict(self) -> dict:

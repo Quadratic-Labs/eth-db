@@ -21,7 +21,8 @@ Block model
 -----------
   Each block contains a variable number of accesses drawn uniformly from
   [--min-block-size, --max-block-size].  Each access is tagged read ('r') or
-  write ('w'); reads dominate (--read-prob, default 0.85).
+  write ('w'); reads dominate (--read-prob, default 0.75). A large block is
+  ~16K ops (≈12K reads + 4K writes), matching today's heavy Ethereum blocks.
 
   Writes carry a 32-byte value (SSTORE); reads do not (SLOAD).
 
@@ -86,9 +87,9 @@ class WorkloadGenerator:
         hot_slots_per_account: int = 4,
         warm_anchors_per_account: int = 3,
         spread: int = 64,
-        min_block_size: int = 100,
-        max_block_size: int = 800,
-        read_prob: float = 0.85,
+        min_block_size: int = 8000,
+        max_block_size: int = 16000,
+        read_prob: float = 0.75,
         seed: int | None = None,
     ):
         self.rng = random.Random(seed)
@@ -290,12 +291,12 @@ def parse_args() -> argparse.Namespace:
                    help="Warm storage region anchors per account (default: 3)")
     p.add_argument("--spread", type=int, default=64,
                    help="Warm-region locality spread in slots (default: 64)")
-    p.add_argument("--min-block-size", type=int, default=100,
-                   help="Minimum accesses per block (default: 100)")
-    p.add_argument("--max-block-size", type=int, default=800,
-                   help="Maximum accesses per block (default: 800)")
-    p.add_argument("--read-prob", type=float, default=0.85,
-                   help="Probability an access is a read vs write (default: 0.85)")
+    p.add_argument("--min-block-size", type=int, default=8000,
+                   help="Minimum accesses per block (default: 8000)")
+    p.add_argument("--max-block-size", type=int, default=16000,
+                   help="Maximum accesses per block (default: 16000)")
+    p.add_argument("--read-prob", type=float, default=0.75,
+                   help="Probability an access is a read vs write (default: 0.75)")
     p.add_argument("--seed", type=int, default=42,
                    help="Random seed for reproducibility (default: 42)")
     p.add_argument("--format", choices=["csv", "hex", "binary"], default="csv",
