@@ -144,6 +144,30 @@ pub fn build(b: *std.Build) void {
     const lib_step = b.step("lib", "Build the Python shared library (libprefixdb.so)");
     lib_step.dependOn(&install_lib.step);
 
+    // Standalone Zig tools (no Python bindings): bulk loader and benchmark.
+    // Each imports the `eth_db` module and is invoked as e.g. `zig build bulkload -- ...`.
+    const tools = [_]struct { name: []const u8, src: []const u8, desc: []const u8 }{
+        .{ .name = "bulkload", .src = "src/main_bulkload.zig", .desc = "Bulk-load a FlatStore base from storage-<block>.tsv files" },
+    };
+    for (tools) |tool| {
+        const tool_exe = b.addExecutable(.{
+            .name = tool.name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(tool.src),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "eth_db", .module = mod }},
+            }),
+        });
+        tool_exe.root_module.addOptions("options", build_opts);
+        b.installArtifact(tool_exe);
+        const tool_run = b.addRunArtifact(tool_exe);
+        tool_run.step.dependOn(b.getInstallStep());
+        if (b.args) |args| tool_run.addArgs(args);
+        const tool_step = b.step(tool.name, tool.desc);
+        tool_step.dependOn(&tool_run.step);
+    }
+
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.

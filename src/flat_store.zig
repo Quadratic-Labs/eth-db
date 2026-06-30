@@ -770,30 +770,7 @@ pub const FlatStore = struct {
     }
 
     fn writeManifestRaw(self: *FlatStore, base_gen: u32, covered_height: u64, base_count: u64, runs: []const RunRec) !void {
-        const hdr: ManifestHeader = .{
-            .magic = MANIFEST_MAGIC,
-            .version = MANIFEST_VERSION,
-            .prefix_bits = self.prefix_bits,
-            .window_entries = self.window_entries,
-            .base_gen = base_gen,
-            .next_run_seq = self.next_run_seq,
-            .run_count = @intCast(runs.len),
-            .covered_height = covered_height,
-            .base_count = base_count,
-        };
-        var tb: [256]u8 = undefined;
-        const tmp = try fmtManifestTmp(&tb, self.name);
-        {
-            const wf = try self.dir.createFile(self.io, tmp, .{ .truncate = true });
-            defer wf.close(self.io);
-            try wf.writePositionalAll(self.io, std.mem.asBytes(&hdr), 0);
-            if (runs.len > 0)
-                try wf.writePositionalAll(self.io, std.mem.sliceAsBytes(runs), @sizeOf(ManifestHeader));
-            try wf.sync(self.io);
-        }
-        var mb: [256]u8 = undefined;
-        const mname = try fmtManifest(&mb, self.name);
-        try self.dir.rename(tmp, self.dir, mname, self.io); // atomic commit
+        try writeManifestFile(self.io, self.dir, self.name, self.prefix_bits, self.window_entries, base_gen, self.next_run_seq, covered_height, base_count, runs);
     }
 
     const ManifestData = struct { header: ManifestHeader, runs: []RunRec };
@@ -986,6 +963,142 @@ pub const FlatStore = struct {
         try self.reader.readBatch(&req, &res);
         _ = try res[0];
         return locate(buf[sub..][0..part_bytes], key);
+    }
+};
+
+/// Write `name.manifest` atomically (temp + rename). Shared by FlatStore and BaseBuilder.
+fn writeManifestFile(
+    io: Io,
+    dir: Io.Dir,
+    name: []const u8,
+    prefix_bits: u6,
+    window_entries: u32,
+    base_gen: u32,
+    next_run_seq: u32,
+    covered_height: u64,
+    base_count: u64,
+    runs: []const RunRec,
+) !void {
+    const hdr: ManifestHeader = .{
+        .magic = MANIFEST_MAGIC,
+        .version = MANIFEST_VERSION,
+        .prefix_bits = prefix_bits,
+        .window_entries = window_entries,
+        .base_gen = base_gen,
+        .next_run_seq = next_run_seq,
+        .run_count = @intCast(runs.len),
+        .covered_height = covered_height,
+        .base_count = base_count,
+    };
+    var tb: [256]u8 = undefined;
+    const tmp = try fmtManifestTmp(&tb, name);
+    {
+        const wf = try dir.createFile(io, tmp, .{ .truncate = true });
+        defer wf.close(io);
+        try wf.writePositionalAll(io, std.mem.asBytes(&hdr), 0);
+        if (runs.len > 0)
+            try wf.writePositionalAll(io, std.mem.sliceAsBytes(runs), @sizeOf(ManifestHeader));
+        try wf.sync(io);
+    }
+    var mb: [256]u8 = undefined;
+    const mname = try fmtManifest(&mb, name);
+    try dir.rename(tmp, dir, mname, io);
+}
+
+/// Streaming builder for a fresh FlatStore base from a globally key-sorted record
+/// stream — for bulk loading without holding the dataset in RAM. Feed records in
+/// ascending key order (deduplicated); it writes the base file + partition directory,
+/// pads to a page, and commits a manifest (generation 0, no L0 runs). The resulting
+/// store is then opened with `FlatStore.open`.
+pub const BaseBuilder = struct {
+    allocator: std.mem.Allocator,
+    io: Io,
+    dir: Io.Dir,
+    name: []const u8,
+    prefix_bits: u6,
+    window_entries: u32,
+    file: Io.File,
+    directory: []Partition,
+    out_count: u64,
+    cur_pid: i64,
+    write_buf: []u8,
+    write_buf_len: usize,
+    write_off: u64,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: Io,
+        dir: Io.Dir,
+        name: []const u8,
+        prefix_bits: u6,
+        window_entries: u32,
+    ) !BaseBuilder {
+        std.debug.assert(prefix_bits >= 1 and prefix_bits <= 32);
+        var nb: [256]u8 = undefined;
+        const bname = try fmtBase(&nb, name, 0);
+        const file = try dir.createFile(io, bname, .{ .truncate = true });
+        errdefer file.close(io);
+        const directory = try allocator.alloc(Partition, @as(usize, 1) << prefix_bits);
+        errdefer allocator.free(directory);
+        for (directory) |*d| d.* = .{ .offset = 0, .count = 0 };
+        const write_buf = try allocator.alloc(u8, 1 << 20);
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .dir = dir,
+            .name = name,
+            .prefix_bits = prefix_bits,
+            .window_entries = if (window_entries == 0) WINDOW_ENTRIES_DEFAULT else window_entries,
+            .file = file,
+            .directory = directory,
+            .out_count = 0,
+            .cur_pid = -1,
+            .write_buf = write_buf,
+            .write_buf_len = 0,
+            .write_off = 0,
+        };
+    }
+
+    /// Append one record. Keys MUST arrive in ascending order, deduplicated.
+    pub fn feed(self: *BaseBuilder, key: *const t.Key, value: *const t.Value) !void {
+        const pid = partitionOf(key, self.prefix_bits);
+        if (@as(i64, @intCast(pid)) != self.cur_pid) {
+            self.directory[pid].offset = self.out_count * RECORD_SIZE;
+            self.cur_pid = @intCast(pid);
+        }
+        self.directory[pid].count += 1;
+        self.out_count += 1;
+        if (self.write_buf_len + RECORD_SIZE > self.write_buf.len) try self.flushBuf();
+        @memcpy(self.write_buf[self.write_buf_len ..][0..32], key);
+        @memcpy(self.write_buf[self.write_buf_len + 32 ..][0..32], value);
+        self.write_buf_len += RECORD_SIZE;
+    }
+
+    fn flushBuf(self: *BaseBuilder) !void {
+        if (self.write_buf_len == 0) return;
+        try self.file.writePositionalAll(self.io, self.write_buf[0..self.write_buf_len], self.write_off);
+        self.write_off += self.write_buf_len;
+        self.write_buf_len = 0;
+    }
+
+    /// Flush, pad to a page, fsync, and commit the manifest. The file stays open
+    /// until `deinit`.
+    pub fn finish(self: *BaseBuilder, covered_height: u64) !void {
+        try self.flushBuf();
+        const real: usize = @intCast(self.write_off);
+        const padded = alignUpPage(real);
+        if (padded > real) {
+            const zeros = [_]u8{0} ** PAGE_SIZE;
+            try self.file.writePositionalAll(self.io, zeros[0 .. padded - real], self.write_off);
+        }
+        try self.file.sync(self.io);
+        try writeManifestFile(self.io, self.dir, self.name, self.prefix_bits, self.window_entries, 0, 0, covered_height, self.out_count, &.{});
+    }
+
+    pub fn deinit(self: *BaseBuilder) void {
+        self.file.close(self.io);
+        self.allocator.free(self.directory);
+        self.allocator.free(self.write_buf);
     }
 };
 
@@ -1562,6 +1675,38 @@ test "FlatStore: prefetch serves base values, shadowed by later writes/deletes" 
     try std.testing.expectEqual(@as(?t.Value, null), try store.get(poolKey(6)));
     // Untouched prefetched keys still return their base value.
     try std.testing.expectEqual(@as(u8, @intCast(7 & 0xff)), (try store.get(poolKey(7))).?[0]);
+}
+
+test "BaseBuilder: build a base from a sorted stream, then open and read it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const N = 500;
+    var entries: [N]t.KvEntry = undefined;
+    var prng = std.Random.DefaultPrng.init(0xB111D);
+    const rnd = prng.random();
+    for (&entries) |*e| {
+        rnd.bytes(&e.key);
+        rnd.bytes(&e.value);
+    }
+    std.mem.sort(t.KvEntry, &entries, {}, kvLessThan); // BaseBuilder requires ascending keys
+
+    {
+        var bb = try BaseBuilder.init(std.testing.allocator, io, tmp.dir, "flat", 4, 0);
+        defer bb.deinit();
+        for (&entries) |*e| try bb.feed(&e.key, &e.value);
+        try bb.finish(123); // covered_height
+    }
+
+    var store = try FlatStore.open(std.testing.allocator, io, tmp.dir, "flat", .{ .prefix_bits = 4 });
+    defer store.deinit();
+    try std.testing.expectEqual(@as(u64, 123), store.covered_height);
+    for (entries) |e| {
+        const got = try store.get(e.key);
+        try std.testing.expect(got != null);
+        try std.testing.expectEqualSlices(u8, &e.value, &got.?);
+    }
 }
 
 test "FlatStore: O_DIRECT page-aligned reads return correct values" {
