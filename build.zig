@@ -148,6 +148,7 @@ pub fn build(b: *std.Build) void {
     // Each imports the `eth_db` module and is invoked as e.g. `zig build bulkload -- ...`.
     const tools = [_]struct { name: []const u8, src: []const u8, desc: []const u8 }{
         .{ .name = "bulkload", .src = "src/main_bulkload.zig", .desc = "Bulk-load a FlatStore base from storage-<block>.tsv files" },
+        .{ .name = "bench", .src = "src/main_bench.zig", .desc = "Benchmark a (seeded) FlatStore using a TSV-derived workload" },
     };
     for (tools) |tool| {
         const tool_exe = b.addExecutable(.{
