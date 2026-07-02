@@ -327,10 +327,10 @@ pub const FlatStore = struct {
         const base_file = try dir.openFile(io, bname, .{});
         errdefer base_file.close(io);
 
-        // Recompute the partition directory by scanning the (sorted) base records.
-        const base_records = try readRecords(allocator, io, base_file, @intCast(m.header.base_count));
-        defer allocator.free(base_records);
-        const directory = try directoryFromEntries(allocator, base_records, prefix_bits);
+        // Recompute the partition directory by streaming the (sorted) base records —
+        // bounded buffer, not a load of the whole base into RAM (it can be far larger
+        // than available memory; see readRecords's doc comment).
+        const directory = try directoryFromBaseFile(allocator, io, base_file, m.header.base_count, prefix_bits);
         errdefer allocator.free(directory);
 
         var l0: std.ArrayList(Run) = .empty;
@@ -1132,22 +1132,6 @@ fn serialize(entries: []const t.KvEntry, data: []u8) void {
     }
 }
 
-/// Read `count` 64-byte base records from `file` into freshly-allocated KvEntries.
-fn readRecords(allocator: std.mem.Allocator, io: Io, file: Io.File, count: usize) ![]t.KvEntry {
-    const entries = try allocator.alloc(t.KvEntry, count);
-    errdefer allocator.free(entries);
-    if (count == 0) return entries;
-    const buf = try allocator.alloc(u8, count * RECORD_SIZE);
-    defer allocator.free(buf);
-    const got = try file.readPositionalAll(io, buf, 0);
-    if (got != buf.len) return error.RecordsTruncated;
-    for (entries, 0..) |*e, i| {
-        @memcpy(&e.key, buf[i * RECORD_SIZE ..][0..32]);
-        @memcpy(&e.value, buf[i * RECORD_SIZE + 32 ..][0..32]);
-    }
-    return entries;
-}
-
 /// Read `count` 65-byte run records (key||value||tombstone) into RunEntries.
 fn readRunFile(allocator: std.mem.Allocator, io: Io, file: Io.File, count: usize) ![]RunEntry {
     const entries = try allocator.alloc(RunEntry, count);
@@ -1178,6 +1162,43 @@ fn directoryFromEntries(allocator: std.mem.Allocator, sorted: []const t.KvEntry,
         while (j < sorted.len and partitionOf(&sorted[j].key, prefix_bits) == pid) j += 1;
         directory[pid] = .{ .offset = @as(u64, idx) * RECORD_SIZE, .count = @intCast(j - idx) };
         idx = j;
+    }
+    return directory;
+}
+
+/// Build the partition directory by streaming `count` sorted base records from `file`
+/// through a bounded buffer — used on `open` recovery, where the base can be far
+/// larger than available RAM (unlike `directoryFromEntries`, which needs the records
+/// already in memory, e.g. from `create`'s in-RAM entries).
+fn directoryFromBaseFile(allocator: std.mem.Allocator, io: Io, file: Io.File, count: u64, prefix_bits: u6) ![]Partition {
+    const dir_len = @as(usize, 1) << prefix_bits;
+    var directory = try allocator.alloc(Partition, dir_len);
+    errdefer allocator.free(directory);
+    for (directory) |*d| d.* = .{ .offset = 0, .count = 0 };
+    if (count == 0) return directory;
+
+    const buf = try allocator.alloc(u8, 1 << 20);
+    defer allocator.free(buf);
+    const buf_recs: u64 = buf.len / RECORD_SIZE;
+
+    var loaded: u64 = 0;
+    var cur_pid: i64 = -1;
+    while (loaded < count) {
+        const want_recs = @min(count - loaded, buf_recs);
+        const want: usize = @intCast(want_recs * RECORD_SIZE);
+        const got = try file.readPositionalAll(io, buf[0..want], loaded * RECORD_SIZE);
+        if (got != want) return error.RecordsTruncated;
+
+        for (0..@intCast(want_recs)) |i| {
+            const key = buf[i * RECORD_SIZE ..][0..32];
+            const pid = partitionOf(key, prefix_bits);
+            if (@as(i64, @intCast(pid)) != cur_pid) {
+                directory[pid].offset = (loaded + i) * RECORD_SIZE;
+                cur_pid = @intCast(pid);
+            }
+            directory[pid].count += 1;
+        }
+        loaded += want_recs;
     }
     return directory;
 }
