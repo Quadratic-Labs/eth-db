@@ -70,6 +70,7 @@ const Args = struct {
     seed: u64 = 42,
     bal_prefetch: bool = false,
     o_direct: bool = false,
+    window_entries: usize = 0,
     memtable_cap: usize = 0,
     l0_threshold: usize = 0,
     freeze_interval: u64 = 0,
@@ -86,6 +87,9 @@ fn usage() noreturn {
         \\  --new-prob F          fraction using a fresh random key (default 0.01)
         \\  --bal-prefetch        prefetch the block read set in one io_uring batch
         \\  --o-direct            open hot reads with O_DIRECT (cold reads)
+        \\  --window-entries N    interpolation window size in entries (0 = engine default
+        \\                        1024 = 64 KiB); structural — only takes effect when
+        \\                        creating a fresh store, ignored on recovery (from manifest)
         \\  --memtable-cap N --l0-threshold N --freeze-interval N --compact-budget BYTES
         \\  --seed N --print-every N
         \\
@@ -123,6 +127,8 @@ fn parseArgs(argv: []const []const u8) !Args {
             a.bal_prefetch = true;
         } else if (std.mem.eql(u8, s, "--o-direct")) {
             a.o_direct = true;
+        } else if (std.mem.eql(u8, s, "--window-entries")) {
+            a.window_entries = try std.fmt.parseInt(usize, eat(&i, argv), 10);
         } else if (std.mem.eql(u8, s, "--memtable-cap")) {
             a.memtable_cap = try std.fmt.parseInt(usize, eat(&i, argv), 10);
         } else if (std.mem.eql(u8, s, "--l0-threshold")) {
@@ -174,6 +180,7 @@ pub fn main(init: std.process.Init) !void {
     const dir = try std.Io.Dir.cwd().createDirPathOpen(io, args.db_dir, .{});
     var store = try flat.FlatStore.open(gpa, io, dir, "flat", .{
         .prefix_bits = 24, // ignored on open (taken from the manifest)
+        .window_entries = @intCast(args.window_entries), // ignored on open (taken from the manifest)
         .memtable_cap = args.memtable_cap,
         .l0_compact_threshold = args.l0_threshold,
         .freeze_block_interval = args.freeze_interval,
@@ -185,8 +192,8 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(sample);
 
     std.debug.print(
-        "bench: blocks={d} block_size={d} read_prob={d:.2} new_prob={d:.3} sample={d} bal_prefetch={} o_direct={} covered_height0={d}\n",
-        .{ args.blocks, args.block_size, args.read_prob, args.new_prob, sample.len, args.bal_prefetch, args.o_direct, store.covered_height },
+        "bench: blocks={d} block_size={d} read_prob={d:.2} new_prob={d:.3} sample={d} bal_prefetch={} o_direct={} window_entries={d} covered_height0={d}\n",
+        .{ args.blocks, args.block_size, args.read_prob, args.new_prob, sample.len, args.bal_prefetch, args.o_direct, store.window_entries, store.covered_height },
     );
 
     var prng = std.Random.DefaultPrng.init(args.seed);

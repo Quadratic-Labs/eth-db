@@ -86,6 +86,7 @@ def main() -> None:
     p.add_argument("inputs", nargs="+", help="storage-<block>.tsv files, globs, or directories")
     p.add_argument("--db-dir", required=True, help="Directory for the FlatDB store (created if absent)")
     p.add_argument("--prefix-bits", type=int, default=24, help="Partition prefix width (only used when creating; default 24)")
+    p.add_argument("--window-entries", type=int, default=0, help="Interpolation window size in entries (0 = engine default 1024 = 64 KiB); only used when creating")
     p.add_argument("--memtable-cap", type=int, default=0, help="Unique keys before an auto-freeze is due (0 = engine default)")
     p.add_argument("--l0-threshold", type=int, default=16, help="Frozen runs before compaction is due (default 16)")
     p.add_argument("--freeze-rows", type=int, default=1_000_000, help="Rows between explicit freezes (bounds memtable RAM; default 1e6)")
@@ -106,6 +107,7 @@ def main() -> None:
     with FlatDB(
         args.db_dir,
         prefix_bits=args.prefix_bits,
+        window_entries=args.window_entries,
         memtable_cap=args.memtable_cap,
         l0_threshold=args.l0_threshold,
         freeze_interval=1,  # unused here (we freeze explicitly by row count)

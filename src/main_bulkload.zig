@@ -124,6 +124,7 @@ const Args = struct {
     db_dir: []const u8,
     inputs: [][]const u8,
     prefix_bits: u6 = 24,
+    window_entries: u32 = 0,
     bucket_bits: u6 = 8, // 2^8 = 256 buckets
     sample_n: usize = 2_000_000,
     seed: u64 = 0,
@@ -131,12 +132,14 @@ const Args = struct {
 
 fn usage() noreturn {
     std.debug.print(
-        \\usage: bulkload --db-dir DIR [--prefix-bits N] [--buckets N] [--sample N] [--seed N] FILE...
-        \\  FILE...        storage-<block>.tsv files (processed in block order)
-        \\  --db-dir DIR   output FlatStore directory (created if absent)
-        \\  --prefix-bits  partition prefix width (default 24)
-        \\  --buckets      number of external-sort buckets, rounded up to a power of two (default 256)
-        \\  --sample       frequency-weighted keys to sample for the benchmark (default 2000000)
+        \\usage: bulkload --db-dir DIR [--prefix-bits N] [--window-entries N] [--buckets N] [--sample N] [--seed N] FILE...
+        \\  FILE...          storage-<block>.tsv files (processed in block order)
+        \\  --db-dir DIR     output FlatStore directory (created if absent)
+        \\  --prefix-bits    partition prefix width (default 24)
+        \\  --window-entries interpolation window size in entries (0 = engine default
+        \\                   1024 = 64 KiB); baked into the manifest at creation time
+        \\  --buckets        number of external-sort buckets, rounded up to a power of two (default 256)
+        \\  --sample         frequency-weighted keys to sample for the benchmark (default 2000000)
         \\
     , .{});
     std.process.exit(2);
@@ -145,6 +148,7 @@ fn usage() noreturn {
 fn parseArgs(gpa: std.mem.Allocator, argv: []const []const u8) !Args {
     var db_dir: ?[]const u8 = null;
     var prefix_bits: u6 = 24;
+    var window_entries: u32 = 0;
     var buckets: usize = 256;
     var sample_n: usize = 2_000_000;
     var seed: u64 = 0;
@@ -160,6 +164,10 @@ fn parseArgs(gpa: std.mem.Allocator, argv: []const []const u8) !Args {
             i += 1;
             if (i >= argv.len) usage();
             prefix_bits = @intCast(try std.fmt.parseInt(u8, argv[i], 10));
+        } else if (std.mem.eql(u8, a, "--window-entries")) {
+            i += 1;
+            if (i >= argv.len) usage();
+            window_entries = try std.fmt.parseInt(u32, argv[i], 10);
         } else if (std.mem.eql(u8, a, "--buckets")) {
             i += 1;
             if (i >= argv.len) usage();
@@ -186,7 +194,7 @@ fn parseArgs(gpa: std.mem.Allocator, argv: []const []const u8) !Args {
         }
     }.lt);
     const bb: u6 = @intCast(std.math.log2_int_ceil(usize, @max(buckets, 1)));
-    return .{ .db_dir = db_dir.?, .inputs = inputs.items, .prefix_bits = prefix_bits, .bucket_bits = bb, .sample_n = sample_n, .seed = seed };
+    return .{ .db_dir = db_dir.?, .inputs = inputs.items, .prefix_bits = prefix_bits, .window_entries = window_entries, .bucket_bits = bb, .sample_n = sample_n, .seed = seed };
 }
 
 /// Bucket index = top `bucket_bits` of the key.
@@ -306,7 +314,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("pass 1: {d} rows ({d} bad) across {d} buckets\n", .{ rows, bad, nbuckets });
 
     // ── Pass 2: sort each bucket, dedup newest-per-key, stream into the base ─────
-    var bb = try flat.BaseBuilder.init(gpa, io, dir, "flat", args.prefix_bits, 0);
+    var bb = try flat.BaseBuilder.init(gpa, io, dir, "flat", args.prefix_bits, args.window_entries);
     defer bb.deinit();
 
     for (0..nbuckets) |b| {

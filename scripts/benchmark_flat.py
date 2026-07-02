@@ -179,6 +179,7 @@ def run_benchmark(
     db_dir: str,
     *,
     prefix_bits: int,
+    window_entries: int,
     memtable_cap: int,
     l0_threshold: int,
     freeze_interval: int,
@@ -197,6 +198,7 @@ def run_benchmark(
     with FlatDB(
         db_dir,
         prefix_bits=prefix_bits,
+        window_entries=window_entries,
         memtable_cap=memtable_cap,
         l0_threshold=l0_threshold,
         freeze_interval=freeze_interval,
@@ -261,6 +263,7 @@ def run_benchmark(
         "num_freezes":          num_freezes,
         "num_compactions_done": num_compactions_done,
         "final_covered_height": final_covered,
+        "window_entries": window_entries,
         "batch_reads": batch_reads,
         "bal_prefetch": bal_prefetch,
         "o_direct": o_direct,
@@ -294,6 +297,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--print-every", type=int, default=10)
     # Flat-store knobs.
     p.add_argument("--prefix-bits",     type=int, default=16, help="Partition prefix width (1..32, default 16)")
+    p.add_argument("--window-entries",  type=int, default=0,  help="Interpolation window size in entries (0 = engine default 1024 = 64 KiB); structural, only applies when creating a fresh store")
     p.add_argument("--memtable-cap",    type=int, default=0,  help="Unique keys before freeze (0 = engine default 64K)")
     p.add_argument("--l0-threshold",    type=int, default=4,  help="Frozen runs before compaction is due (default 4)")
     p.add_argument("--freeze-interval", type=int, default=8,  help="Blocks between freezes (default 8)")
@@ -321,7 +325,8 @@ def main() -> None:
         "new_prob": args.new_prob, "hot_slots": args.hot_slots, "warm_anchors": args.warm_anchors,
         "spread": args.spread, "min_block_size": args.min_block_size, "max_block_size": args.max_block_size,
         "read_prob": args.read_prob, "seed": args.seed,
-        "prefix_bits": args.prefix_bits, "memtable_cap": args.memtable_cap,
+        "prefix_bits": args.prefix_bits, "window_entries": args.window_entries,
+        "memtable_cap": args.memtable_cap,
         "l0_threshold": args.l0_threshold, "freeze_interval": args.freeze_interval,
         "compact_budget": args.compact_budget, "batch_reads": args.batch_reads,
         "bal_prefetch": args.bal_prefetch, "o_direct": args.o_direct,
@@ -331,6 +336,7 @@ def main() -> None:
     print(
         f"Starting flat-db benchmark: {args.blocks} blocks, pool={args.pool_size}, "
         f"alpha={args.alpha}, read_prob={args.read_prob:.0%}, prefix_bits={args.prefix_bits}, "
+        f"window_entries={args.window_entries}, "
         f"freeze_interval={args.freeze_interval}, l0_threshold={args.l0_threshold}, "
         f"batch_reads={args.batch_reads}, bal_prefetch={args.bal_prefetch}, o_direct={args.o_direct}",
         file=sys.stderr,
@@ -346,7 +352,8 @@ def main() -> None:
     try:
         block_metrics, summary = run_benchmark(
             gen, args.blocks, args.print_every, db_dir,
-            prefix_bits=args.prefix_bits, memtable_cap=args.memtable_cap,
+            prefix_bits=args.prefix_bits, window_entries=args.window_entries,
+            memtable_cap=args.memtable_cap,
             l0_threshold=args.l0_threshold, freeze_interval=args.freeze_interval,
             compact_budget=args.compact_budget, batch_reads=args.batch_reads,
             bal_prefetch=args.bal_prefetch, o_direct=args.o_direct,

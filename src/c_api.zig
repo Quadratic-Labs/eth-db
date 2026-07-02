@@ -218,12 +218,14 @@ const FlatState = struct {
 };
 
 /// Open the flat store at directory `path` (created if absent), recovering from a
-/// manifest if one is present, else starting empty. `prefix_bits` (1..32; 0 → 16) is
-/// only used when creating fresh — on recovery it comes from the manifest. The other
-/// knobs accept 0 for engine defaults.
+/// manifest if one is present, else starting empty. `prefix_bits` (1..32; 0 → 16) and
+/// `window_entries` (0 → engine default 1024) are structural — only used when creating
+/// fresh; on recovery both come from the manifest. The other knobs accept 0 for engine
+/// defaults.
 export fn flatdb_open(
     path: [*:0]const u8,
     prefix_bits: u8,
+    window_entries: u32,
     memtable_cap: u64,
     l0_threshold: u32,
     freeze_interval: u64,
@@ -239,6 +241,7 @@ export fn flatdb_open(
     };
     const cfg: flat_store.Config = .{
         .prefix_bits = if (prefix_bits == 0) 16 else @intCast(prefix_bits),
+        .window_entries = window_entries,
         .memtable_cap = memtable_cap,
         .l0_compact_threshold = l0_threshold,
         .freeze_block_interval = freeze_interval,

@@ -44,7 +44,7 @@ _lib = c.CDLL(str(_lib_path))
 _Buf32 = c.c_ubyte * 32
 
 _lib.flatdb_open.restype = c.c_void_p
-_lib.flatdb_open.argtypes = [c.c_char_p, c.c_uint8, c.c_uint64, c.c_uint32, c.c_uint64, c.c_uint8]
+_lib.flatdb_open.argtypes = [c.c_char_p, c.c_uint8, c.c_uint32, c.c_uint64, c.c_uint32, c.c_uint64, c.c_uint8]
 _lib.flatdb_deinit.restype = None
 _lib.flatdb_deinit.argtypes = [c.c_void_p]
 _lib.flatdb_put.restype = c.c_int
@@ -88,17 +88,20 @@ class FlatDB:
                          store is created.
         prefix_bits:     Partition prefix width (1..32). Only used when creating fresh;
                          on recovery it comes from the manifest. Default 16.
+        window_entries:  Interpolation window size in entries (0 → engine default 1024
+                         = 64 KiB). Structural, like prefix_bits: only used when creating
+                         fresh; on recovery it comes from the manifest.
         memtable_cap:    Unique keys before a freeze is due (0 → engine default).
         l0_threshold:    Frozen L0 runs before compaction is due (0 → engine default).
         freeze_interval: Blocks between freezes (0 → engine default).
     """
 
-    def __init__(self, path, prefix_bits: int = 16, memtable_cap: int = 0,
-                 l0_threshold: int = 0, freeze_interval: int = 0,
+    def __init__(self, path, prefix_bits: int = 16, window_entries: int = 0,
+                 memtable_cap: int = 0, l0_threshold: int = 0, freeze_interval: int = 0,
                  o_direct: bool = False) -> None:
         self._handle = _lib.flatdb_open(str(path).encode(), prefix_bits,
-                                        memtable_cap, l0_threshold, freeze_interval,
-                                        1 if o_direct else 0)
+                                        window_entries, memtable_cap, l0_threshold,
+                                        freeze_interval, 1 if o_direct else 0)
         if not self._handle:
             raise RuntimeError(f"flatdb_open failed for path {path!r} (o_direct={o_direct})")
 
