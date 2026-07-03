@@ -71,6 +71,7 @@ const Args = struct {
     bal_prefetch: bool = false,
     o_direct: bool = false,
     window_entries: usize = 0,
+    fence_gap: u32 = 0,
     memtable_cap: usize = 0,
     l0_threshold: usize = 0,
     freeze_interval: u64 = 0,
@@ -90,6 +91,11 @@ fn usage() noreturn {
         \\  --window-entries N    interpolation window size in entries (0 = engine default
         \\                        1024 = 64 KiB); structural — only takes effect when
         \\                        creating a fresh store, ignored on recovery (from manifest)
+        \\  --fence-gap G         G-gated fence index: keep every G-th base key (8 B) in
+        \\                        RAM and read exactly one G-record run per lookup instead
+        \\                        of interpolation (G=64 = one 4 KiB read). 0 = G=∞ (no
+        \\                        index, wide-window interpolation). Pure RAM policy —
+        \\                        effective on every open, no store rebuild needed
         \\  --memtable-cap N --l0-threshold N --freeze-interval N --compact-budget BYTES
         \\  --seed N --print-every N
         \\
@@ -129,6 +135,8 @@ fn parseArgs(argv: []const []const u8) !Args {
             a.o_direct = true;
         } else if (std.mem.eql(u8, s, "--window-entries")) {
             a.window_entries = try std.fmt.parseInt(usize, eat(&i, argv), 10);
+        } else if (std.mem.eql(u8, s, "--fence-gap")) {
+            a.fence_gap = try std.fmt.parseInt(u32, eat(&i, argv), 10);
         } else if (std.mem.eql(u8, s, "--memtable-cap")) {
             a.memtable_cap = try std.fmt.parseInt(usize, eat(&i, argv), 10);
         } else if (std.mem.eql(u8, s, "--l0-threshold")) {
@@ -181,6 +189,7 @@ pub fn main(init: std.process.Init) !void {
     var store = try flat.FlatStore.open(gpa, io, dir, "flat", .{
         .prefix_bits = 24, // ignored on open (taken from the manifest)
         .window_entries = @intCast(args.window_entries), // ignored on open (taken from the manifest)
+        .fence_gap = args.fence_gap, // policy: rebuilt in RAM on open, no manifest involvement
         .memtable_cap = args.memtable_cap,
         .l0_compact_threshold = args.l0_threshold,
         .freeze_block_interval = args.freeze_interval,
@@ -192,8 +201,8 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(sample);
 
     std.debug.print(
-        "bench: blocks={d} block_size={d} read_prob={d:.2} new_prob={d:.3} sample={d} bal_prefetch={} o_direct={} window_entries={d} covered_height0={d}\n",
-        .{ args.blocks, args.block_size, args.read_prob, args.new_prob, sample.len, args.bal_prefetch, args.o_direct, store.window_entries, store.covered_height },
+        "bench: blocks={d} block_size={d} read_prob={d:.2} new_prob={d:.3} sample={d} bal_prefetch={} o_direct={} window_entries={d} fence_gap={d} fences={d} covered_height0={d}\n",
+        .{ args.blocks, args.block_size, args.read_prob, args.new_prob, sample.len, args.bal_prefetch, args.o_direct, store.window_entries, store.fence_gap, store.fences.len, store.covered_height },
     );
 
     var prng = std.Random.DefaultPrng.init(args.seed);

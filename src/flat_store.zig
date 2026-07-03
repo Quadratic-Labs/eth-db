@@ -5,7 +5,10 @@
 //!   • L0 — N immutable sorted RAM runs (each a frozen memtable), also persisted to
 //!     disk as `run` files for recovery.
 //!   • base — on-disk sorted store, partitioned by the top `prefix_bits` of the key,
-//!     read by interpolation + one windowed io_uring read (§3–§4).
+//!     read by interpolation + one windowed io_uring read (§3–§4); or, with
+//!     `Config.fence_gap = G`, by a RAM fence index (8-byte prefix of every G-th key)
+//!     + one exact G-record read. The fence index is derived state: rebuilt from the
+//!     base at open/compaction, never persisted — same disk format either way.
 //!
 //! Durability (§9) exploits that blocks are externally durable, so writes are
 //! *derivable* rather than logged. Three tiers of durability:
@@ -60,6 +63,15 @@ inline fn alignUpPage(x: usize) usize {
 pub const Config = struct {
     prefix_bits: u6,
     window_entries: u32 = 0, // 0 → default
+    /// Fence-index gap G (spec §1.2): keep the 8-byte prefix of every G-th base key in
+    /// RAM; a lookup binary-searches the fences and reads exactly one G-record run —
+    /// no interpolation, no whole-partition fallback. 0 → G=∞: no index, reads use
+    /// interpolation + `window_entries`. RAM cost ≈ 8 B × base_count/G; pure policy —
+    /// rebuilt from the base at open/compaction, never stored on disk, so it can be
+    /// changed freely between runs. Records are 64 B and pages 4 KiB, so a G that is a
+    /// multiple of 64 gives page-exact runs (G=64 ⇒ one 4 KiB read per lookup); other
+    /// values cost up to one extra page per read.
+    fence_gap: u32 = 0,
     memtable_cap: usize = 0, // 0 → default
     l0_compact_threshold: usize = 0, // 0 → default
     freeze_block_interval: u64 = 0, // 0 → default
@@ -99,7 +111,10 @@ const Run = struct {
     }
 };
 
-const SlotMeta = struct { gi: usize, w0: u32, w: u32, count: u32, part_off: u64, sub: usize };
+/// `fenced` marks a window computed from the fence index: `w0` is then the fence-run
+/// index (not a partition rank) and the window is definitive on the right by
+/// construction — only a truncated-prefix tie on the left can require stepping back.
+const SlotMeta = struct { gi: usize, w0: u32, w: u32, count: u32, part_off: u64, sub: usize, fenced: bool = false };
 
 /// Result of a RAM-tier (memtable + L0) lookup: a live value, a tombstone (key
 /// deleted), or no entry in RAM (fall through to the base).
@@ -128,6 +143,7 @@ const Compaction = struct {
     base_cur: ?t.KvEntry, // current head of the base cursor
     fold_count: usize, // L0 runs being folded (the front of l0 at job start)
     run_pos: []usize, // per-run entry cursor
+    new_fences: std.ArrayList(u64), // fence index of the new base (empty if fence_gap=0)
 };
 
 /// On-disk manifest header (followed by `run_count` × RunRec).
@@ -194,6 +210,11 @@ pub const FlatStore = struct {
     directory: []Partition,
     prefix_bits: u6,
     window_entries: u32,
+    base_count: u64, // records in the current base generation
+    // Fence index (Config.fence_gap): 8-byte prefix of every `fence_gap`-th base key,
+    // global over the (globally sorted) base file. Empty when fence_gap = 0.
+    fence_gap: u32,
+    fences: []u64,
     reader: uring.Reader,
 
     memtable: std.AutoHashMap(t.Key, ?t.Value), // null value = tombstone
@@ -249,8 +270,11 @@ pub const FlatStore = struct {
 
         var nb: [256]u8 = undefined;
         const bname = try fmtBase(&nb, name, 0);
-        const directory = try buildBaseFile(allocator, io, dir, bname, entries, config.prefix_bits);
+        const built = try buildBaseFile(allocator, io, dir, bname, entries, config.prefix_bits, config.fence_gap);
+        const directory = built.directory;
         errdefer allocator.free(directory);
+        const fences = built.fences;
+        errdefer allocator.free(fences);
 
         const base_file = try dir.openFile(io, bname, .{});
         errdefer base_file.close(io);
@@ -262,7 +286,10 @@ pub const FlatStore = struct {
         errdefer allocator.free(name_copy);
 
         const win_entries: usize = if (config.window_entries == 0) WINDOW_ENTRIES_DEFAULT else config.window_entries;
-        const slot_size = alignUpPage(win_entries * RECORD_SIZE) + PAGE_SIZE; // window + 1 page of offset slop
+        // Fenced reads replace the interpolation window, so slots are sized for
+        // whichever read unit is in effect.
+        const read_entries: usize = if (config.fence_gap > 0) config.fence_gap else win_entries;
+        const slot_size = alignUpPage(read_entries * RECORD_SIZE) + PAGE_SIZE; // read unit + 1 page of offset slop
         const sc = try allocScratch(allocator, reader.depth, slot_size);
         errdefer freeScratch(allocator, sc);
 
@@ -282,6 +309,9 @@ pub const FlatStore = struct {
             .directory = directory,
             .prefix_bits = config.prefix_bits,
             .window_entries = @intCast(win_entries),
+            .base_count = sumCounts(directory),
+            .fence_gap = config.fence_gap,
+            .fences = fences,
             .reader = reader,
             .memtable = std.AutoHashMap(t.Key, ?t.Value).init(allocator),
             .memtable_cap = if (config.memtable_cap == 0) MEMTABLE_CAP_DEFAULT else config.memtable_cap,
@@ -327,11 +357,14 @@ pub const FlatStore = struct {
         const base_file = try dir.openFile(io, bname, .{});
         errdefer base_file.close(io);
 
-        // Recompute the partition directory by streaming the (sorted) base records —
-        // bounded buffer, not a load of the whole base into RAM (it can be far larger
-        // than available memory; see readRecords's doc comment).
-        const directory = try directoryFromBaseFile(allocator, io, base_file, m.header.base_count, prefix_bits);
+        // Recompute the partition directory (and the fence index, if enabled) by
+        // streaming the (sorted) base records once — bounded buffer, not a load of the
+        // whole base into RAM (it can be far larger than available memory).
+        const scan = try scanBaseFile(allocator, io, base_file, m.header.base_count, prefix_bits, config.fence_gap);
+        const directory = scan.directory;
         errdefer allocator.free(directory);
+        const fences = scan.fences;
+        errdefer allocator.free(fences);
 
         var l0: std.ArrayList(Run) = .empty;
         errdefer {
@@ -352,7 +385,8 @@ pub const FlatStore = struct {
         const name_copy = try allocator.dupe(u8, name);
         errdefer allocator.free(name_copy);
 
-        const slot_size = alignUpPage(@as(usize, m.header.window_entries) * RECORD_SIZE) + PAGE_SIZE;
+        const read_entries: usize = if (config.fence_gap > 0) config.fence_gap else m.header.window_entries;
+        const slot_size = alignUpPage(read_entries * RECORD_SIZE) + PAGE_SIZE;
         const sc = try allocScratch(allocator, reader.depth, slot_size);
         errdefer freeScratch(allocator, sc);
 
@@ -372,6 +406,9 @@ pub const FlatStore = struct {
             .directory = directory,
             .prefix_bits = prefix_bits,
             .window_entries = m.header.window_entries,
+            .base_count = m.header.base_count,
+            .fence_gap = config.fence_gap,
+            .fences = fences,
             .reader = reader,
             .memtable = std.AutoHashMap(t.Key, ?t.Value).init(allocator),
             .memtable_cap = if (config.memtable_cap == 0) MEMTABLE_CAP_DEFAULT else config.memtable_cap,
@@ -416,6 +453,7 @@ pub const FlatStore = struct {
             self.allocator.free(job.write_buf);
             self.allocator.free(job.base_buf);
             self.allocator.free(job.run_pos);
+            job.new_fences.deinit(self.allocator);
         }
         self.reader.deinit();
         self.base_file.close(self.io);
@@ -423,6 +461,7 @@ pub const FlatStore = struct {
         for (self.l0.items) |run| run.deinit(self.allocator);
         self.l0.deinit(self.allocator);
         self.allocator.free(self.directory);
+        self.allocator.free(self.fences);
         self.allocator.free(self.name);
         self.prefetch_map.deinit();
         freeScratch(self.allocator, .{
@@ -566,6 +605,7 @@ pub const FlatStore = struct {
             .base_cur = null,
             .fold_count = fold,
             .run_pos = run_pos,
+            .new_fences = .empty,
         };
         try self.advanceBase(&job); // prime the base cursor
         self.job = job; // ownership transferred; no error path past here
@@ -637,6 +677,8 @@ pub const FlatStore = struct {
             job.new_dir[pid].offset = job.out_count * RECORD_SIZE;
             job.cur_pid = @intCast(pid);
         }
+        if (self.fence_gap > 0 and job.out_count % self.fence_gap == 0)
+            try job.new_fences.append(self.allocator, keyPrefix64(key));
         job.new_dir[pid].count += 1;
         job.out_count += 1;
         if (job.write_buf_len + RECORD_SIZE > job.write_buf.len) try self.flushWrite(job);
@@ -703,6 +745,11 @@ pub const FlatStore = struct {
             recs[i] = .{ .seq = r.seq, .entry_count = @intCast(r.entries.len) };
         }
 
+        // Owned copy of the new fence index, so a failure (here or in the manifest
+        // write) leaves the job intact and retryable.
+        const new_fences = try a.dupe(u64, job.new_fences.items);
+        errdefer a.free(new_fences);
+
         // Commit point: manifest now references the new base + the un-folded runs.
         try self.writeManifestRaw(job.new_gen, self.covered_height, job.out_count, recs);
 
@@ -711,6 +758,9 @@ pub const FlatStore = struct {
         self.base_file = job.new_file;
         a.free(self.directory);
         self.directory = job.new_dir;
+        a.free(self.fences);
+        self.fences = new_fences;
+        self.base_count = job.out_count;
         self.base_gen = job.new_gen;
 
         // Re-point the O_DIRECT fd at the new base generation (buffered fallback on failure).
@@ -731,6 +781,8 @@ pub const FlatStore = struct {
         a.free(job.write_buf);
         a.free(job.base_buf);
         a.free(job.run_pos);
+        var nf = job.new_fences;
+        nf.deinit(a);
         self.job = null;
 
         // Best-effort GC of the superseded files.
@@ -899,23 +951,40 @@ pub const FlatStore = struct {
             var nreq: usize = 0;
             for (0..chunk) |k| {
                 const gi = idxs[base + k];
-                const pid = partitionOf(&keys[gi], self.prefix_bits);
-                const part = self.directory[pid];
-                if (part.count == 0) {
-                    out[gi] = null;
-                    continue;
+                var w_start: u64 = undefined;
+                var meta: SlotMeta = undefined;
+                if (self.fence_gap > 0) {
+                    // Fenced: binary-search the fence index for the run holding the key,
+                    // read exactly that G-record run. No interpolation, no directory.
+                    const idx = fenceUpperBound(self.fences, keyPrefix64(&keys[gi]));
+                    if (idx == 0) { // key sorts before the first base record
+                        out[gi] = null;
+                        continue;
+                    }
+                    const run: u64 = idx - 1;
+                    const b = self.fenceRunBounds(run);
+                    w_start = b.start * RECORD_SIZE;
+                    meta = .{ .gi = gi, .w0 = @intCast(run), .w = b.len, .count = 0, .part_off = 0, .sub = 0, .fenced = true };
+                } else {
+                    const pid = partitionOf(&keys[gi], self.prefix_bits);
+                    const part = self.directory[pid];
+                    if (part.count == 0) {
+                        out[gi] = null;
+                        continue;
+                    }
+                    const w: u64 = @min(@as(u64, self.window_entries), part.count);
+                    const rank = interpRank(&keys[gi], self.prefix_bits, part.count);
+                    var w0: u64 = if (rank >= w / 2) rank - w / 2 else 0;
+                    if (w0 + w > part.count) w0 = part.count - w;
+                    w_start = part.offset + w0 * RECORD_SIZE;
+                    meta = .{ .gi = gi, .w0 = @intCast(w0), .w = @intCast(w), .count = part.count, .part_off = part.offset, .sub = 0 };
                 }
-                const w: u64 = @min(@as(u64, self.window_entries), part.count);
-                const rank = interpRank(&keys[gi], self.prefix_bits, part.count);
-                var w0: u64 = if (rank >= w / 2) rank - w / 2 else 0;
-                if (w0 + w > part.count) w0 = part.count - w;
 
                 // Page-align the read (covers the window + ≤1 page of leading slop) so it
                 // satisfies O_DIRECT; the window starts `sub` bytes into the read.
-                const w_start = part.offset + w0 * RECORD_SIZE;
                 const page_start = alignDownPage(w_start);
-                const sub: usize = @intCast(w_start - page_start);
-                const read_len = alignUpPage(sub + @as(usize, @intCast(w)) * RECORD_SIZE);
+                meta.sub = @intCast(w_start - page_start);
+                const read_len = alignUpPage(meta.sub + @as(usize, meta.w) * RECORD_SIZE);
 
                 const slot = nreq;
                 self.scratch_reqs[slot] = .{
@@ -923,7 +992,7 @@ pub const FlatStore = struct {
                     .buffer = self.scratch_slab[slot * self.slot_size ..][0..read_len],
                     .offset = page_start,
                 };
-                self.scratch_meta[slot] = .{ .gi = gi, .w0 = @intCast(w0), .w = @intCast(w), .count = part.count, .part_off = part.offset, .sub = sub };
+                self.scratch_meta[slot] = meta;
                 nreq += 1;
             }
             if (nreq == 0) {
@@ -939,6 +1008,15 @@ pub const FlatStore = struct {
                 const buf = self.scratch_slab[slot * self.slot_size + m.sub ..][0 .. @as(usize, m.w) * RECORD_SIZE];
                 if (locate(buf, &keys[m.gi])) |v| {
                     out[m.gi] = v;
+                } else if (m.fenced) {
+                    // Definitive on the right by construction (the next fence's prefix is
+                    // strictly greater than the key's). Only a truncated-prefix tie can
+                    // put the key in an earlier run: key < the run's first record.
+                    if (m.w0 > 0 and std.mem.order(u8, &keys[m.gi], buf[0..32]) == .lt) {
+                        out[m.gi] = try self.fenceStepBack(m.w0, &keys[m.gi]);
+                    } else {
+                        out[m.gi] = null;
+                    }
                 } else if (windowIsDefinitive(buf, m, &keys[m.gi])) {
                     out[m.gi] = null;
                 } else {
@@ -963,6 +1041,38 @@ pub const FlatStore = struct {
         try self.reader.readBatch(&req, &res);
         _ = try res[0];
         return locate(buf[sub..][0..part_bytes], key);
+    }
+
+    /// Record range of fence run `i`: records [i·G, min((i+1)·G, base_count)).
+    fn fenceRunBounds(self: *const FlatStore, run: u64) struct { start: u64, len: u32 } {
+        const start = run * self.fence_gap;
+        return .{ .start = start, .len = @intCast(@min(@as(u64, self.fence_gap), self.base_count - start)) };
+    }
+
+    /// Rare fenced-read fallback: the key sorted below its candidate run's first record
+    /// (possible only when adjacent fences share the same 8-byte prefix). Walk runs
+    /// backwards with single reads until the key is covered or run 0 is passed.
+    fn fenceStepBack(self: *FlatStore, run_in: u32, key: *const t.Key) !?t.Value {
+        var run: u64 = run_in;
+        while (run > 0) {
+            run -= 1;
+            const b = self.fenceRunBounds(run);
+            const w_start = b.start * RECORD_SIZE;
+            const page_start = alignDownPage(w_start);
+            const sub: usize = @intCast(w_start - page_start);
+            const run_bytes = @as(usize, b.len) * RECORD_SIZE;
+            const read_len = alignUpPage(sub + run_bytes);
+            const buf = try self.allocator.alignedAlloc(u8, PAGE_ALIGN, read_len);
+            defer self.allocator.free(buf);
+            var req = [_]uring.Request{.{ .fd = self.hotFd(), .buffer = buf, .offset = page_start }};
+            var res = [_]uring.Result{undefined};
+            try self.reader.readBatch(&req, &res);
+            _ = try res[0];
+            const rec = buf[sub..][0..run_bytes];
+            if (locate(rec, key)) |v| return v;
+            if (std.mem.order(u8, key, rec[0..32]) != .lt) return null; // covered by this run ⇒ absent
+        }
+        return null; // below the first base record
     }
 };
 
@@ -1166,16 +1276,27 @@ fn directoryFromEntries(allocator: std.mem.Allocator, sorted: []const t.KvEntry,
     return directory;
 }
 
-/// Build the partition directory by streaming `count` sorted base records from `file`
-/// through a bounded buffer — used on `open` recovery, where the base can be far
-/// larger than available RAM (unlike `directoryFromEntries`, which needs the records
-/// already in memory, e.g. from `create`'s in-RAM entries).
-fn directoryFromBaseFile(allocator: std.mem.Allocator, io: Io, file: Io.File, count: u64, prefix_bits: u6) ![]Partition {
+const BaseScan = struct { directory: []Partition, fences: []u64 };
+
+/// Number of fence runs covering `count` records at gap `g` (0 when disabled/empty).
+fn fenceCount(count: u64, gap: u32) usize {
+    if (gap == 0 or count == 0) return 0;
+    return @intCast((count + gap - 1) / gap);
+}
+
+/// Build the partition directory — and the fence index when `fence_gap > 0` — by
+/// streaming `count` sorted base records from `file` through a bounded buffer in one
+/// pass. Used on `open` recovery, where the base can be far larger than available RAM
+/// (unlike `directoryFromEntries`, which needs the records already in memory, e.g.
+/// from `create`'s in-RAM entries). Caller owns both slices.
+fn scanBaseFile(allocator: std.mem.Allocator, io: Io, file: Io.File, count: u64, prefix_bits: u6, fence_gap: u32) !BaseScan {
     const dir_len = @as(usize, 1) << prefix_bits;
     var directory = try allocator.alloc(Partition, dir_len);
     errdefer allocator.free(directory);
     for (directory) |*d| d.* = .{ .offset = 0, .count = 0 };
-    if (count == 0) return directory;
+    const fences = try allocator.alloc(u64, fenceCount(count, fence_gap));
+    errdefer allocator.free(fences);
+    if (count == 0) return .{ .directory = directory, .fences = fences };
 
     const buf = try allocator.alloc(u8, 1 << 20);
     defer allocator.free(buf);
@@ -1197,14 +1318,18 @@ fn directoryFromBaseFile(allocator: std.mem.Allocator, io: Io, file: Io.File, co
                 cur_pid = @intCast(pid);
             }
             directory[pid].count += 1;
+            const gidx = loaded + i;
+            if (fence_gap > 0 and gidx % fence_gap == 0)
+                fences[@intCast(gidx / fence_gap)] = keyPrefix64(key);
         }
         loaded += want_recs;
     }
-    return directory;
+    return .{ .directory = directory, .fences = fences };
 }
 
 /// Write a sorted, prefix-partitioned base file from `entries` (deduplicated, last
-/// write wins) and return its RAM directory (caller owns). The file is fsynced.
+/// write wins) and return its RAM directory + fence index (caller owns both). The
+/// file is fsynced.
 fn buildBaseFile(
     allocator: std.mem.Allocator,
     io: Io,
@@ -1212,7 +1337,8 @@ fn buildBaseFile(
     name: []const u8,
     entries: []const t.KvEntry,
     prefix_bits: u6,
-) ![]Partition {
+    fence_gap: u32,
+) !BaseScan {
     var map = std.AutoHashMap(t.Key, t.Value).init(allocator);
     defer map.deinit();
     for (entries) |e| try map.put(e.key, e.value);
@@ -1239,7 +1365,11 @@ fn buildBaseFile(
         try wf.sync(io);
     }
 
-    return directoryFromEntries(allocator, sorted, prefix_bits);
+    const directory = try directoryFromEntries(allocator, sorted, prefix_bits);
+    errdefer allocator.free(directory);
+    const fences = try allocator.alloc(u64, fenceCount(sorted.len, fence_gap));
+    for (fences, 0..) |*f, i| f.* = keyPrefix64(&sorted[i * fence_gap].key);
+    return .{ .directory = directory, .fences = fences };
 }
 
 // ─── Key arithmetic / search ──────────────────────────────────────────────────
@@ -1275,6 +1405,25 @@ fn suffix64(key: *const [32]u8, prefix_bits: u6) u64 {
 fn interpRank(key: *const [32]u8, prefix_bits: u6, n: u32) u64 {
     const s = suffix64(key, prefix_bits);
     return @intCast((@as(u128, s) * @as(u128, n)) >> 64);
+}
+
+/// Truncated fence key: the first 8 bytes, big-endian, so u64 order = key order on
+/// the prefix. 8 B/fence instead of 32 keeps the index 4× smaller; ties between
+/// adjacent fences are resolved by `fenceStepBack`.
+fn keyPrefix64(key: *const [32]u8) u64 {
+    return std.mem.readInt(u64, key[0..8], .big);
+}
+
+/// First index whose fence is strictly greater than `k` (fences are non-decreasing).
+/// 0 ⇒ `k` sorts before the first base record; i>0 ⇒ candidate run is i-1.
+fn fenceUpperBound(fences: []const u64, k: u64) usize {
+    var lo: usize = 0;
+    var hi: usize = fences.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (fences[mid] <= k) lo = mid + 1 else hi = mid;
+    }
+    return lo;
 }
 
 fn locate(buf: []const u8, key: *const t.Key) ?t.Value {
@@ -1760,6 +1909,142 @@ test "FlatStore: O_DIRECT page-aligned reads return correct values" {
     var absent: t.Key = undefined;
     rnd.bytes(&absent);
     try std.testing.expectEqual(@as(?t.Value, null), try store.get(absent));
+}
+
+test "FlatStore: fenced reads (fence_gap) — hits, definitive misses, odd gap" {
+    const io = std.testing.io;
+
+    // Gaps: page-exact (64), sub-page odd (5), and one run covering everything (4096).
+    for ([_]u32{ 64, 5, 4096 }) |gap| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        var prng = std.Random.DefaultPrng.init(0xFE9CE + gap);
+        const rnd = prng.random();
+        const N = 500;
+        var entries: [N]t.KvEntry = undefined;
+        for (&entries) |*e| {
+            rnd.bytes(&e.key);
+            rnd.bytes(&e.value);
+        }
+
+        var store = try FlatStore.create(std.testing.allocator, io, tmp.dir, "flat", &entries, .{ .prefix_bits = 4, .fence_gap = gap });
+        defer store.deinit();
+        try std.testing.expectEqual(fenceCount(N, gap), store.fences.len);
+
+        for (entries) |e| {
+            const got = try store.get(e.key);
+            try std.testing.expect(got != null);
+            try std.testing.expectEqualSlices(u8, &e.value, &got.?);
+        }
+        for (0..50) |_| {
+            var k: t.Key = undefined;
+            rnd.bytes(&k);
+            try std.testing.expectEqual(@as(?t.Value, null), try store.get(k));
+        }
+        // Keys below the first / above the last base record are definitive misses.
+        try std.testing.expectEqual(@as(?t.Value, null), try store.get(std.mem.zeroes(t.Key)));
+        try std.testing.expectEqual(@as(?t.Value, null), try store.get([_]u8{0xFF} ** 32));
+    }
+}
+
+test "FlatStore: fence index is rebuilt by compaction and by open()" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cfg: Config = .{ .prefix_bits = 4, .fence_gap = 7, .memtable_cap = 1_000_000, .l0_compact_threshold = 100, .freeze_block_interval = 1 };
+    {
+        const empty = [_]t.KvEntry{};
+        var store = try FlatStore.create(std.testing.allocator, io, tmp.dir, "flat", &empty, cfg);
+        defer store.deinit();
+        for (0..100) |i| try store.put(poolKey(i), [_]u8{@intCast(i)} ** 32);
+        try store.freeze(1);
+        for (50..150) |i| try store.put(poolKey(i), [_]u8{@intCast(i + 1)} ** 32); // overwrite 50..100
+        try store.delete(poolKey(0));
+        try store.freeze(2);
+        try store.compact(); // fences rebuilt from the merge stream
+        try std.testing.expectEqual(fenceCount(149, 7), store.fences.len); // 150 keys − 1 tombstone
+        try std.testing.expectEqual(@as(u64, 149), store.base_count);
+
+        try std.testing.expectEqual(@as(?t.Value, null), try store.get(poolKey(0)));
+        for (1..50) |i| try std.testing.expectEqual(@as(u8, @intCast(i)), (try store.get(poolKey(i))).?[0]);
+        for (50..150) |i| try std.testing.expectEqual(@as(u8, @intCast(i + 1)), (try store.get(poolKey(i))).?[0]);
+    }
+
+    // Reopen with a *different* gap — the index is pure RAM policy, rebuilt on open.
+    var reopened_cfg = cfg;
+    reopened_cfg.fence_gap = 64;
+    var store = try FlatStore.open(std.testing.allocator, io, tmp.dir, "flat", reopened_cfg);
+    defer store.deinit();
+    try std.testing.expectEqual(fenceCount(149, 64), store.fences.len);
+    try std.testing.expectEqual(@as(?t.Value, null), try store.get(poolKey(0)));
+    for (1..50) |i| try std.testing.expectEqual(@as(u8, @intCast(i)), (try store.get(poolKey(i))).?[0]);
+    for (50..150) |i| try std.testing.expectEqual(@as(u8, @intCast(i + 1)), (try store.get(poolKey(i))).?[0]);
+}
+
+test "FlatStore: fenced O_DIRECT reads return correct values" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const N = 1000;
+    var entries: [N]t.KvEntry = undefined;
+    var prng = std.Random.DefaultPrng.init(0xD1EC8);
+    const rnd = prng.random();
+    for (&entries) |*e| {
+        rnd.bytes(&e.key);
+        rnd.bytes(&e.value);
+    }
+    var store = FlatStore.create(std.testing.allocator, io, tmp.dir, "flat", &entries, .{ .prefix_bits = 6, .fence_gap = 64, .o_direct = true }) catch |e| switch (e) {
+        error.Unexpected => return error.SkipZigTest, // filesystem without O_DIRECT
+        else => return e,
+    };
+    defer store.deinit();
+
+    for (entries) |e| {
+        const got = try store.get(e.key);
+        try std.testing.expect(got != null);
+        try std.testing.expectEqualSlices(u8, &e.value, &got.?);
+    }
+    var absent: t.Key = undefined;
+    rnd.bytes(&absent);
+    try std.testing.expectEqual(@as(?t.Value, null), try store.get(absent));
+}
+
+test "fenceUpperBound / fenceStepBack: truncated-prefix ties resolve to earlier runs" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Keys sharing one 8-byte prefix so adjacent fences collide, plus distinct ones.
+    var entries: [8]t.KvEntry = undefined;
+    for (&entries, 0..) |*e, i| {
+        e.key = std.mem.zeroes(t.Key);
+        std.mem.writeInt(u64, e.key[0..8], 42, .big); // identical fence prefix
+        e.key[31] = @intCast(i); // ordered by the tail
+        e.value = [_]u8{@intCast(i + 1)} ** 32;
+    }
+    // gap 2 ⇒ 4 runs, all with fence prefix 42 ⇒ every lookup lands on the last run
+    // and must step back to find earlier keys.
+    var store = try FlatStore.create(std.testing.allocator, io, tmp.dir, "flat", &entries, .{ .prefix_bits = 1, .fence_gap = 2 });
+    defer store.deinit();
+
+    for (entries) |e| {
+        const got = try store.get(e.key);
+        try std.testing.expect(got != null);
+        try std.testing.expectEqualSlices(u8, &e.value, &got.?);
+    }
+    // A key strictly below every stored key is a definitive miss (fenceUpperBound = 0).
+    var below = std.mem.zeroes(t.Key);
+    std.mem.writeInt(u64, below[0..8], 41, .big);
+    try std.testing.expectEqual(@as(?t.Value, null), try store.get(below));
+    // Same fence prefix, tail above every stored key: lands in the last run, absent
+    // without step-back (right side is definitive by construction).
+    var above = std.mem.zeroes(t.Key);
+    std.mem.writeInt(u64, above[0..8], 42, .big);
+    above[31] = 0xFF;
+    try std.testing.expectEqual(@as(?t.Value, null), try store.get(above));
 }
 
 test "FlatStore: tombstone persists across recovery (no resurrection)" {
