@@ -13,13 +13,20 @@
 //!   --bal-prefetch prefetch the whole block read set in one io_uring batch (deep QD),
 //!                  then execute from RAM — read-your-writes preserved by the memtable
 //!   --o-direct     open the hot read fd with O_DIRECT (bypass page cache → cold reads)
+//!   --commit-depth H  maintain the Commitment DB (spec §4) at heap depth H: writes
+//!                  mark units dirty, each block ends with a timed commitBlock (state
+//!                  root). Restores from flat.croot if present (H must match), else
+//!                  cold-rebuilds once (a full base pass). Checkpoints every
+//!                  --commit-checkpoint-every blocks (0 = only at exit) and at exit.
 //!
 //! Usage:
 //!   zig build bench -- --db-dir /mnt/big/flatdb -n 5000 --read-prob 0.75 --bal-prefetch --o-direct
+//!   zig build bench -- --db-dir /mnt/big/flatdb -n 1000 --commit-depth 24 --commit-checkpoint-every 200
 
 const std = @import("std");
 const eth = @import("eth_db");
 const flat = eth.flat_store;
+const cmt = eth.commitment;
 const Io = std.Io;
 const linux = std.os.linux;
 const Key = [32]u8;
@@ -77,6 +84,29 @@ const Args = struct {
     freeze_interval: u64 = 0,
     compact_budget: usize = 256 << 20,
     print_every: u64 = 50,
+    commit_depth: u8 = 0, // 0 = commitments off
+    commit_checkpoint_every: u64 = 0, // 0 = only at exit
+};
+
+/// Per-block commit latencies span µs–seconds, so a fixed-µs histogram is useless;
+/// track mean/max (and count) instead.
+const Acc = struct {
+    n: u64 = 0,
+    sum_ns: u128 = 0,
+    max_ns: u64 = 0,
+
+    fn record(self: *Acc, ns: i128) void {
+        self.n += 1;
+        self.sum_ns += @intCast(ns);
+        self.max_ns = @max(self.max_ns, @as(u64, @intCast(ns)));
+    }
+    fn meanMs(self: *const Acc) f64 {
+        if (self.n == 0) return 0;
+        return @as(f64, @floatFromInt(self.sum_ns)) / @as(f64, @floatFromInt(self.n)) / 1e6;
+    }
+    fn maxMs(self: *const Acc) f64 {
+        return @as(f64, @floatFromInt(self.max_ns)) / 1e6;
+    }
 };
 
 fn usage() noreturn {
@@ -96,6 +126,13 @@ fn usage() noreturn {
         \\                        of interpolation (G=64 = one 4 KiB read). 0 = G=∞ (no
         \\                        index, wide-window interpolation). Pure RAM policy —
         \\                        effective on every open, no store rebuild needed
+        \\  --commit-depth H      maintain the Commitment DB at heap depth H (heap RAM =
+        \\                        2^(H+1) x 32 B: 1 GiB at 24). Restores flat.croot if its
+        \\                        H matches, else cold-rebuilds once (full base pass —
+        \\                        minutes on a large store). 0 = commitments off (default)
+        \\  --commit-checkpoint-every N
+        \\                        checkpoint the depth-H row every N blocks (0 = only at
+        \\                        exit; a checkpoint writes 2^H x 32 B out-of-place)
         \\  --memtable-cap N --l0-threshold N --freeze-interval N --compact-budget BYTES
         \\  --seed N --print-every N
         \\
@@ -145,6 +182,11 @@ fn parseArgs(argv: []const []const u8) !Args {
             a.freeze_interval = try std.fmt.parseInt(u64, eat(&i, argv), 10);
         } else if (std.mem.eql(u8, s, "--compact-budget")) {
             a.compact_budget = try std.fmt.parseInt(usize, eat(&i, argv), 10);
+        } else if (std.mem.eql(u8, s, "--commit-depth")) {
+            a.commit_depth = try std.fmt.parseInt(u8, eat(&i, argv), 10);
+            if (a.commit_depth > 40) usage();
+        } else if (std.mem.eql(u8, s, "--commit-checkpoint-every")) {
+            a.commit_checkpoint_every = try std.fmt.parseInt(u64, eat(&i, argv), 10);
         } else if (std.mem.eql(u8, s, "--print-every")) {
             a.print_every = try std.fmt.parseInt(u64, eat(&i, argv), 10);
         } else usage();
@@ -201,9 +243,37 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(sample);
 
     std.debug.print(
-        "bench: blocks={d} block_size={d} read_prob={d:.2} new_prob={d:.3} sample={d} bal_prefetch={} o_direct={} window_entries={d} fence_gap={d} fences={d} covered_height0={d}\n",
-        .{ args.blocks, args.block_size, args.read_prob, args.new_prob, sample.len, args.bal_prefetch, args.o_direct, store.window_entries, store.fence_gap, store.fences.len, store.covered_height },
+        "bench: blocks={d} block_size={d} read_prob={d:.2} new_prob={d:.3} sample={d} bal_prefetch={} o_direct={} window_entries={d} fence_gap={d} fences={d} covered_height0={d} commit_depth={d}\n",
+        .{ args.blocks, args.block_size, args.read_prob, args.new_prob, sample.len, args.bal_prefetch, args.o_direct, store.window_entries, store.fence_gap, store.fences.len, store.covered_height, args.commit_depth },
     );
+
+    // Commitment DB: restore the depth-H checkpoint if present, else cold-rebuild
+    // (the bench store's mapping is exactly its durable+RAM state, so covered_height
+    // is the right height for both paths).
+    var cdb: ?cmt.CommitmentDb = null;
+    defer if (cdb) |*cd| cd.deinit();
+    if (args.commit_depth > 0) {
+        const ccfg: cmt.Config = .{ .heap_depth = @intCast(args.commit_depth) };
+        cdb = cmt.CommitmentDb.open(gpa, io, dir, "flat", ccfg) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (cdb == null) {
+            var fresh = try cmt.CommitmentDb.init(gpa, ccfg);
+            errdefer fresh.deinit();
+            std.debug.print("commit: no checkpoint — cold rebuild at H={d} (one full base pass)...\n", .{args.commit_depth});
+            const t0 = nowNs();
+            _ = try fresh.rebuild(&store, store.covered_height);
+            std.debug.print("commit: rebuild took {d:.1}s\n", .{@as(f64, @floatFromInt(nowNs() - t0)) / 1e9});
+            cdb = fresh;
+        } else {
+            std.debug.print("commit: restored checkpoint (committed_height={d})\n", .{cdb.?.committed_height});
+            if (cdb.?.committed_height < store.covered_height) std.debug.print(
+                "commit: WARNING checkpoint is behind the store ({d} < {d}) — roots reflect current data, but units written in between are stale until re-marked\n",
+                .{ cdb.?.committed_height, store.covered_height },
+            );
+        }
+    }
 
     var prng = std.Random.DefaultPrng.init(args.seed);
     const rnd = prng.random();
@@ -216,11 +286,14 @@ pub fn main(init: std.process.Init) !void {
     var rh = Hist{}; // read latency
     var wh = Hist{}; // write latency
     var ph = Hist{}; // prefetch latency (per block)
+    var ch = Acc{}; // commitBlock latency (per block)
+    var kh = Acc{}; // checkpoint latency
     var read_hits: u64 = 0;
     var total_reads: u64 = 0;
     var total_writes: u64 = 0;
     var freezes: u64 = 0;
     var compactions: u64 = 0;
+    var dirty_units: u64 = 0; // commitment units recomputed, cumulative
 
     const base_height = store.covered_height;
     const wall0 = nowNs();
@@ -256,6 +329,7 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 const t0 = nowNs();
                 try store.put(op.key, op.value);
+                if (cdb) |*cd| try cd.markDirty(&op.key);
                 wh.record(nowNs() - t0);
                 total_writes += 1;
             }
@@ -268,12 +342,31 @@ pub fn main(init: std.process.Init) !void {
             if (try store.compactStep(args.compact_budget) == .done) compactions += 1;
         }
 
+        if (cdb) |*cd| {
+            dirty_units += cd.dirty.count();
+            const t0 = nowNs();
+            _ = try cd.commitBlock(&store, base_height + blk + 1);
+            ch.record(nowNs() - t0);
+            if (args.commit_checkpoint_every != 0 and (blk + 1) % args.commit_checkpoint_every == 0) {
+                const k0 = nowNs();
+                try cd.checkpoint(io, dir, "flat");
+                kh.record(nowNs() - k0);
+            }
+        }
+
         if (args.print_every != 0 and (blk + 1) % args.print_every == 0) {
             std.debug.print(
-                "  [{d}/{d}] r_mean={d:.1}us r_p99={d:.0}us hit={d:.1}% freezes={d} compactions={d}\n",
-                .{ blk + 1, args.blocks, rh.meanUs(), rh.pctUs(99), @as(f64, @floatFromInt(read_hits)) / @as(f64, @floatFromInt(@max(total_reads, 1))) * 100.0, freezes, compactions },
+                "  [{d}/{d}] r_mean={d:.1}us r_p99={d:.0}us hit={d:.1}% freezes={d} compactions={d} c_mean={d:.2}ms\n",
+                .{ blk + 1, args.blocks, rh.meanUs(), rh.pctUs(99), @as(f64, @floatFromInt(read_hits)) / @as(f64, @floatFromInt(@max(total_reads, 1))) * 100.0, freezes, compactions, ch.meanMs() },
             );
         }
+    }
+
+    // Final checkpoint so the next run restores instead of rebuilding.
+    if (cdb) |*cd| {
+        const k0 = nowNs();
+        try cd.checkpoint(io, dir, "flat");
+        kh.record(nowNs() - k0);
     }
 
     const wall_s = @as(f64, @floatFromInt(nowNs() - wall0)) / 1e9;
@@ -288,14 +381,29 @@ pub fn main(init: std.process.Init) !void {
         \\  freezes={d}  compactions_done={d}  covered_height={d}
         \\
     , .{
-        total_ops,                                                            wall_s,
-        @as(f64, @floatFromInt(total_ops)) / @max(wall_s, 1e-9),              total_reads,
+        total_ops,                                                                                  wall_s,
+        @as(f64, @floatFromInt(total_ops)) / @max(wall_s, 1e-9),                                    total_reads,
         @as(f64, @floatFromInt(read_hits)) / @as(f64, @floatFromInt(@max(total_reads, 1))) * 100.0, rh.meanUs(),
-        rh.pctUs(50),                                                         rh.pctUs(95),
-        rh.pctUs(99),                                                         total_writes,
-        wh.meanUs(),                                                          args.bal_prefetch,
-        ph.meanUs(),                                                          args.o_direct,
-        freezes,                                                              compactions,
+        rh.pctUs(50),                                                                               rh.pctUs(95),
+        rh.pctUs(99),                                                                               total_writes,
+        wh.meanUs(),                                                                                args.bal_prefetch,
+        ph.meanUs(),                                                                                args.o_direct,
+        freezes,                                                                                    compactions,
         store.covered_height,
     });
+    if (cdb) |*cd| {
+        const root_hex = std.fmt.bytesToHex(cd.root(), .lower);
+        std.debug.print(
+            \\  commit: H={d}  blocks={d}  c_mean={d:.2}ms  c_max={d:.2}ms  units_mean={d:.1}/block
+            \\  checkpoints={d}  ckpt_mean={d:.1}ms  committed_height={d}
+            \\  root={s}
+            \\
+        , .{
+            cd.heap_depth,                                                                 ch.n,
+            ch.meanMs(),                                                                   ch.maxMs(),
+            @as(f64, @floatFromInt(dirty_units)) / @as(f64, @floatFromInt(@max(ch.n, 1))), kh.n,
+            kh.meanMs(),                                                                   cd.committed_height,
+            &root_hex,
+        });
+    }
 }

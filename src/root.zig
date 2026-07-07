@@ -14,6 +14,7 @@ pub const page_store = @import("page_store.zig");
 pub const batch_read = @import("batch_read.zig");
 pub const uring_read = @import("uring_read.zig");
 pub const flat_store = @import("flat_store.zig");
+pub const commitment = @import("commitment.zig");
 const cache_mod = @import("cache.zig");
 
 // ─── Re-export shared types from types.zig ─────────────────────────────────────
@@ -1057,6 +1058,7 @@ test {
     _ = @import("batch_read.zig");
     _ = @import("uring_read.zig");
     _ = @import("flat_store.zig");
+    _ = @import("commitment.zig");
 }
 
 test "prefixData depth 1 extracts top 6 bits" {

@@ -1,8 +1,8 @@
 # eth-db — Technical Specification
 
 - **Version:** 0.5 (Draft)
-- **Date:** 2026-06-30
-- **Status:** Work in Progress — Flat DB read/write/durability path implemented; Commitment DB separation in progress.
+- **Date:** 2026-07-06
+- **Status:** Work in Progress — Flat DB read/write/durability path implemented; Commitment DB Tiers 1–2 implemented (`src/commitment.zig`: heap + gather recompute + checkpoint/recovery); Tier 3 blobs, BAL unit-prefetch, and parallel unit recompute pending.
 - **Related:** Design synthesis in `prefix_redesign.md`; commitment subsystem in `commitment_redesign.md`.
 
 ---
@@ -27,7 +27,7 @@ Key-values and commitments are exercised at different times under different cons
 - **In-RAM L0, exact reads.** Writes are absorbed by a mutable memtable, frozen into immutable sorted RAM runs (L0), and bulk-compacted out-of-place into the partitioned base. L0 is searched exactly in RAM — no approximate filter, no false-positive disk reads (§3.4).
 - **WAL durability.** A sequential write-ahead log is the sole durability mechanism for in-RAM state; the base is rewritten out-of-place (never in place — SSD/CoW) (§3.4, §3.7).
 - **Multi-drive scaling.** App-level partition sharding scales aggregate bandwidth/IOPS ~linearly; it does not reduce single-read latency (§3.6).
-- **Recomputable commitments.** The Commitment DB keeps the dense near-root levels in RAM and is recomputable from internal subtries; persisted commitment pages are pure caches of a canonical trie function (§4).
+- **Recomputable commitments.** The Commitment DB is an implicit RAM heap for the dense top `H` levels (heap depth `H` is a RAM-for-I/O knob, default `= P`) over leaf subtrees that are recomputed from the flat store on demand rather than persisted; every cached structure is a pure cache of a canonical trie function (§4).
 
 ---
 
@@ -49,7 +49,7 @@ This is a **batched, read-and-write-heavy workload with hierarchical structure**
 **Compatibility seam (costs nothing now, avoids rework later).**
 The two stores are kept compatible so the commitment layer can be wired onto the flat store without reorganising it:
 
-- A crit-bit subtree is exactly a contiguous key range in sorted order, and a `P`-bit prefix split is precisely the set of crit-bit nodes at depth `P`. Therefore **each flat partition = one crit-bit subtree**.
+- A crit-bit subtree is exactly a contiguous key range in sorted order, and a `P`-bit prefix split is precisely the set of crit-bit nodes at depth `P`. Therefore **each flat partition = one crit-bit subtree** — and the seam holds at any depth ≥ `P`: a commitment heap leaf at depth `H > P` is a contiguous *sub-range* of one partition (§4.1).
 - Constraint on the flat store: store leaves **sorted by the same (post-hash) tree-key the crit-bit tree orders on** (not the raw address/slot), and **track a per-batch dirty set**. Incremental re-hash and witness enumeration then map straight onto partitions.
 
 ### 2.2 Storage model & hardware constraints
@@ -131,7 +131,18 @@ On NVMe a wider read is ~free in *latency* (a 64 KiB read ≈ 90 µs vs a 4 KiB 
 
 On a rare interpolation miss the read falls back to scanning the whole partition.
 
-**Property — the window/index knob.** "Wide window" (no index, RAM = 0) and a **fence index** (store every G-th key in RAM → read a fixed G-entry / 4 KiB run, no interpolation) are the two ends of one knob. The fence index trades RAM (~0.5 GiB @2³², ~8.6 GiB @2³⁶ for G = 64) for a smaller, constant read. It is a **gated upgrade** for single-drive high-QPS deployments, not a day-one cost.
+**Property — the window/index knob.** "Wide window" (no index, RAM = 0) and a **fence index** (§3.2.1) are the two ends of one knob: interpolation over a wide read window, or an exact index over a narrow one. The fence index trades RAM (~0.5 GiB @2³², ~8.6 GiB @2³⁶ for G = 64) for a smaller, constant-size read. It is a **gated upgrade** (`Config.fence_gap = G`; `--fence-gap` on the bench CLI), off by default (`G = 0` ⇒ wide-window interpolation) for single-drive high-QPS deployments.
+
+#### 3.2.1 Fence index (G-gated, in-memory)
+
+When enabled (`fence_gap = G > 0`), the fence index replaces interpolation with an exact lookup:
+
+- **Structure.** A flat, **RAM-only** array holding the 8-byte big-endian prefix of every G-th key in the (globally sorted) base — one `u64` per fence, not the full 32-byte key. Truncating to 8 bytes is enough to order fences correctly since post-hash keys are uniform (§2.5), and keeps the index 4× smaller than a full-key index.
+- **Derived, never persisted.** The fence index is not written to disk and does not appear in the manifest. It is rebuilt by streaming the base once on `create`, `open`, and after each `compact()` — the same pass that rebuilds the partition directory. Because it is pure derived RAM state, `G` can be changed freely across restarts with no migration: the on-disk base format is identical whether or not the index exists.
+- **Lookup.** Binary-search the fence array for the run covering the target key, then issue **one page-aligned read of exactly that G-record run** — no interpolation, no partition-directory lookup, no whole-partition fallback.
+- **Page alignment.** Records are 64 B and pages are 4 KiB (64 records/page); choosing `G` as a multiple of 64 makes every fenced read exactly one page (`G = 64` ⇒ one 4 KiB read per lookup). Other values of `G` cost up to one extra page of read slop.
+- **Truncated-prefix ties.** Reducing each key to its first 8 bytes means distinct keys can share a fence value. A fenced read is **definitive on the right** by construction (the next fence's prefix is strictly greater than the target key), but a **left-side tie** — the target key sorts below the first record of its candidate run — triggers a rare backward scan of prior runs until one resolves it or run 0 is exhausted.
+- **RAM cost.** `8 B × base_count / G` — e.g. ~0.5 GiB @2³², ~8.6 GiB @2³⁶ for `G = 64` (§5.2).
 
 > **Deltas note.** Interpolation needs a clean sorted run, so it applies to the **base run** only; the small per-partition delta from recent flushes (L0) is checked separately in RAM (§3.4).
 
@@ -222,23 +233,78 @@ Drives vs. the scaled 500 K reads/s target (per drive ≈ 6 GB/s, ~1 M IOPS; PCI
 - **2–3 NVMe drives + fixed P = 24 + wide-window interpolation (zero index) + partition sharding.** Simplest read code; scales to the burst target on modest hardware.
 - **io_uring-batched reads are mandatory** (the latency wall), independent of window size.
 - **Write path:** active hash-map memtable → freeze into N immutable sorted RAM runs (L0, no filters — exact in-RAM lookup) → out-of-place streaming bulk compaction into the partitioned base in idle windows; tune `K` for WAF vs. read-amp; durability via WAL + manifest.
-- **Fence index:** kept in reserve for single-drive deployments that still want high QPS.
+- **Fence index (§3.2.1):** implemented, config-gated (`fence_gap`/`--fence-gap`) and off by default; an in-memory-only structure, rebuilt from the base on open/compaction and never persisted, so it costs nothing to leave disabled and nothing to migrate when toggled. Enable for single-drive deployments that still want high QPS.
 
 ---
 
 ## 4. Commitment DB
 
-Commitments form a **crit-bit trie** with commitments carried as node payload; the structure follows the canonical trie function of `commitment_redesign.md` (§2 there) rather than any storage layout — creating or destroying a cached page never changes a committed value.
+Committed values follow the **canonical trie function** of `commitment_redesign.md` §2 unchanged: a binary trie over the 256-bit key space with `leafHash(K,V) = Blake3(0x00 ‖ K ‖ V)` (65-byte domain separation) and pass-through `combine` (empty siblings vanish; no hash chains through empty levels). Everything in this section is **cache policy around that function** — creating, destroying, deepening, or checkpointing any cached structure never changes a committed value.
 
-**Properties:**
+Uniform post-hash keys give the trie a sharp structural split that the layout exploits: **above the occupancy frontier the tree is complete** (at ≥ 2³² entries the probability of an empty depth-24 subtree is e⁻²⁵⁶ ≈ 0), and below it each subtree is small and corresponds to a contiguous key range of the flat base (§2.1 seam).
 
-- **Dense near the root, kept in RAM.** The levels closest to the root are dense and resident in memory; they are updated very frequently but are cheaply recomputable from children's cached commitments, so they need not be persisted (the depth-0 page is memory-only).
-- **Recomputable.** Commitments are derived data: on recovery the trie is rebuilt from the internal subtries (manifest restores checkpointed pages; WAL replay re-marks dirty slots and recomputes via gather).
-- **Stride-6 caching.** Commitment nodes are cached at depths that are multiples of stride `D = 6`. Each persisted **commitment page** is a 4 KiB allocation holding the complete 6-level binary subtree as an implicit heap of 127 × 32 B hashes (`h[1]` = the node's own subtree commitment; `h[64..127]` = the 64 child-slot values at depth + 1). This bounds recomputation to at most `D` levels when a cached node is invalidated, and stores every sibling a Merkle proof needs.
-- **Decoupled from storage.** Commitment computation never reads SST/append pages structurally and compaction never dirties commitment state; the only coupling is the **bottom-slot gather** (a point lookup of a slot's key set), which is layout-independent. The dirty set is derived from the block's logical writes, not from storage events.
-- **Out-of-place persistence.** Flushing is always copy-on-write; the manifest checkpoint atomically repoints routing to fresh page ids, so a crash mid-flush loses nothing.
+### 4.1 Tier 1 — the RAM heap (depths 0 … H)
 
-> The detailed commitment node rule (pass-through `combine`, domain separation, lazy leaves, deepening `T_DEEPEN`), page layouts, commit algorithm, proofs, and persistence are specified in `commitment_redesign.md`. The flat/commitment compatibility seam (partition = subtree, sorted by tree-key, per-batch dirty set) is the integration point (§2.1).
+The top `H + 1` levels are not a crit-bit structure at all but a **complete binary tree stored as one implicit heap array in RAM**: `2^(H+1) − 1` hashes of 32 B, indexed by prefix (`heap[1]` = state root; children of `heap[i]` are `heap[2i]`, `heap[2i+1]`; the bottom row `heap[2^H + prefix]` holds the depth-`H` subtree commitments). No pointers, no pages, no routing. Pass-through never fires inside the heap (no empty siblings above the frontier), so it stores plain canonical `pairHash` values.
+
+**Heap depth `H` is a configuration knob, deliberately not hardwired to `P`.** A heap leaf at depth `H ≥ P` is a contiguous sub-range of one flat partition, so the seam is preserved at any depth. Each extra level doubles heap RAM and halves the leaf-recompute unit (both its I/O and its CPU):
+
+| `H` | heap RAM | unit @ 2³² | unit @ 2³⁶ | recompute read/block (5 K writes @ 2³⁶) |
+|---|---|---|---|---|
+| 24 (= P, default) | 1.07 GiB | 256 entries, 16 KiB | 4 K entries, 256 KiB | ~1.3 GB |
+| 26 | 4.3 GiB | 64 entries | 1 K entries, 64 KiB | ~320 MB |
+| 27 | 8.6 GiB | 32 entries | 512 entries, 32 KiB | ~160 MB |
+
+Validity bound: the heap is dense while expected leaf occupancy `N / 2^H ≳ 32` (empty-leaf probability ≤ e⁻³² by Poisson), i.e. `H ≤ log₂N − 5`. Empty leaves are still *correct* (ZERO + pass-through in `combine`), merely wasteful, so the bound is a sizing guideline, not a safety limit. `H` can be raised online as `N` grows: one sweep populates the new bottom row and no committed value moves (this replaces the old `T_DEEPEN` page-deepening mechanism).
+
+Update rule: a dirty heap leaf gets its recomputed subtree value (§4.2), then its `H` ancestors are re-combined; ancestor work dedups across the block's dirty leaves (~`W · H` combines worst case, ≈ 10 ms at `W` = 5 000 before dedup).
+
+### 4.2 Tier 2 — leaf subtrees: recomputed, not persisted
+
+Below depth `H`, **nothing is stored**. A heap-leaf subtree over its `n` keys has exactly `n` leaves and `n − 1` real internal nodes (pass-through), and its recompute is:
+
+1. **Gather** — read the unit's contiguous range from the base (one windowed read; a sub-range of a partition when `H > P`), overlay the RAM-resident L0 runs + memtable newest-wins, drop tombstones. This is a range scan, not a filtered probe — the flat store's sort order (§2.1) makes it exact.
+2. **Hash** — `n` leafHashes (2 Blake3 compressions each: 65-byte input) + `n − 1` combines (1 compression) ≈ **3n compressions** ≈ 40–80 µs at `n` = 256, ~1 ms at `n` = 4 096. Embarrassingly parallel across dirty units.
+
+Per-block cost at `W` writes ≈ `W` dirty units (16 M+ leaves, collisions rare): today (`n` ≈ 256) ~10 ms of hashing at `W` = 200, ~30 ms across 16 cores at `W` = 5 000, with ~80 MB of unit reads — the same I/O the execution read path performs anyway at current scale.
+
+**At the 2³⁶ target the recompute *read* dominates, not the hashing**: execution's ±4σ window covers only ~1/16 of a 256 KiB unit at `H` = 24, so units are cold and `W` = 5 000 costs ~1.3 GB of reads at finalisation. Two independent levers restore the budget:
+
+- **BAL prefetch.** The block access list exposes the write set at block start, so full-unit reads are issued on the uring *during execution* and complete before finalisation begins. Execution is latency-bound, not bandwidth-bound (~80 MB of window reads per block), so the prefetch bandwidth (~60–130 ms of sequential reads across 2–3 drives) hides entirely.
+- **Raise `H`** (§4.1 table) — RAM for recompute I/O + CPU, no format change.
+
+### 4.3 Tier 3 (optional upgrade) — leaf-hash blobs
+
+A pure cache that can land at any time without changing a committed value: per heap leaf (or per partition), a blob of the `n` **leaf hashes** in base order (`n` × 32 B — half the flat store's bytes; ~128 GiB @ 2³², ~2 TiB @ 2³⁶), plus a small header of per-heap-leaf entry counts so sub-ranges can be sliced by rank (blob entries carry no keys). Recompute then reads the blob instead of the base and skips leaf hashing for clean keys: `(n − 1)` combines + 2 compressions per *written* key ≈ 3× less CPU and half the read bytes.
+
+The crucial property: **blobs need no per-block writes.** They reflect the base only; compaction — which already streams every `(K,V)` in sorted order — emits the updated blobs alongside the base rewrite (~+50 % compaction write volume). Between compactions a recompute overlays fresh leaf hashes for L0/memtable keys, exactly as in §4.2.
+
+**Rejected: persisting internal nodes.** Storing the `n − 1` internals per unit doubles the cache to ~100 % of the flat store and turns every block write into a copy-on-write read-modify-write of a whole blob (proof siblings are scattered under any serialisation) — gigabytes of write amplification per block at scale, to save `n − 1` combines (≤ 0.4 ms) that are the *cheap* part of the recompute. A subtree never needs a page hierarchy either: even at 2³⁶ it serialises to ≤ 256 KiB — one contiguous extent, one sequential I/O.
+
+### 4.4 Commit algorithm
+
+```
+during execution:  BAL write set → uring prefetch of dirty units (2³⁶-scale lever)
+commitBlock:
+  derive dirty heap leaves from the block's logical writes (per-batch dirty set, §2.1)
+  for each dirty leaf (parallel):
+      gather unit keys (base range + L0/memtable overlay, newest-wins, no tombstones)
+      recompute subtree: n leafHash + (n−1) pass-through combines → heap[2^H + prefix]
+  re-combine dirty ancestor paths (dedup) up to heap[1] = state root
+  every C blocks: checkpoint the depth-H heap row
+```
+
+Dirtiness derives from the write stream, never from storage events: compaction moves data but changes no mapping, so it never dirties commitment state. The only storage coupling is the gather's range read.
+
+### 4.5 Persistence & recovery
+
+The only persisted commitment state is a **checkpoint of the depth-`H` heap row**: `2^H` × 32 B (512 MiB at `H` = 24) plus a small header `{magic, version, H, covered_height}`, written sequentially to `<name>.croot` via temp + fsync + rename — always out-of-place, atomic on its own (no manifest coupling needed: the file is self-contained derived data). On open: load the row, rebuild the `H` upper rows in ~2^H combines (seconds, parallel), then the host replays blocks > `covered_height`, which re-marks dirty units and recomputes them (§4.2) — the same replay contract the flat store already imposes. Worst-case cold rebuild (no checkpoint) is one streaming pass over the base: ~3·N compressions + a full sequential read (~1–2 min at 2³² on a few cores).
+
+### 4.6 Proofs
+
+A proof for key `K`: `H` sibling hashes read directly from the RAM heap + the ~log₂(n) non-ZERO in-subtree siblings + a presence bitmap (pass-through skips ZERO siblings, compact-SMT style); verification replays the canonical rules. In-subtree siblings are **regenerated** by one unit recompute (50 µs–1 ms), not stored — this deliberately relaxes goal 4 of `commitment_redesign.md` ("every proof sibling is stored") below depth `H`, because regeneration is cheaper there than any disk read. If concurrent proof serving becomes a first-class workload, Tier 3 blobs (§4.3) cut regeneration a further 3× without a design change.
+
+> The canonical node rule (pass-through `combine`, 65-byte leaf domain separation, tombstone = absence) remains as specified in `commitment_redesign.md` §2. That document's page machinery (stride-6 pages, index-page split, `T_DEEPEN`, `CommitmentPageStore`) is superseded on this branch by the heap + recompute design above.
 
 ---
 
@@ -264,7 +330,9 @@ Commitments form a **crit-bit trie** with commitments carried as node payload; t
 | Frozen runs before compaction | `K` | tens–hundreds (test default 8) | Read-amp ↔ write-amp dial; sets base-rewrite WAF (§3.4). |
 | Base-rewrite WAF | — | ≈ `base / (K · flush)` (~16× @ K = 16) | Plus ~1× sequential WAL (§3.4). |
 | Container size | — | 4 GiB | Many partitions packed per container file; ~1100 files at target. |
-| Fence index stride | `G` | ∞ (disabled) / 64 (gated) | RAM-for-read-size knob; ~0.5 GiB @2³², ~8.6 GiB @2³⁶ at G = 64 (§3.2). |
+| Fence index stride | `G` | 0 = disabled (`G = ∞`) / 64 (gated) | RAM-for-read-size knob; **in-memory only**, rebuilt from the base on open/compaction, never persisted; ~0.5 GiB @2³², ~8.6 GiB @2³⁶ at G = 64 (§3.2.1). |
 | Drives | `N` | 2–3 (baseline) | App-level partition sharding for bandwidth/IOPS (§3.6). |
-| Commitment stride | `D` | 6 | Depth interval between cached commitment nodes ⇒ 127-hash 4 KiB subtree page (§4). |
-| Memory budget | `M` | ≈ 32 GiB | WAL + memtable + L0 runs (~`K × memtable`) + partition directory + caches + commitment near-root. |
+| Commitment heap depth | `H` | 24 (= `P`) | RAM-for-recompute knob: heap RAM = `2^(H+1)` × 32 B (1.07 GiB @ 24, 8.6 GiB @ 27); each +1 halves leaf-recompute I/O + CPU. Dense while `H ≤ log₂N − 5`; raisable online (§4.1). |
+| Commitment checkpoint | `C` | every ~10³ blocks | Depth-`H` heap row, `2^H` × 32 B (512 MiB @ 24), generation file + `covered_height` (§4.5). |
+| Leaf-hash blobs (Tier 3) | — | off (upgrade) | Compaction-maintained leaf-hash cache, 32 B/key (~½ base size); 3× less recompute CPU, ½ read bytes; no per-block writes (§4.3). |
+| Memory budget | `M` | ≈ 32 GiB | WAL + memtable + L0 runs (~`K × memtable`) + partition directory + caches + commitment heap (1–9 GiB by `H`). |

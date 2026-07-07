@@ -86,6 +86,13 @@ pub const Partition = struct {
 /// One entry in an L0 run: a value, or a tombstone (deletion marker).
 const RunEntry = struct { key: t.Key, value: t.Value, tomb: bool };
 
+/// One entry of a sorted memtable snapshot (`memtableSnapshot`); null = tombstone.
+pub const MemEntry = struct { key: t.Key, value: ?t.Value };
+
+/// gatherRange scratch: one candidate (key, value) from some tier, tagged with the
+/// tier priority (higher = newer) so the post-sort sweep keeps the newest per key.
+const Cand = struct { key: t.Key, value: t.Value, tomb: bool, pri: u32 };
+
 /// Immutable sorted RAM run (one frozen memtable), entries sorted by key.
 /// `seq` is its on-disk run-file sequence number.
 const Run = struct {
@@ -1049,6 +1056,118 @@ pub const FlatStore = struct {
         return .{ .start = start, .len = @intCast(@min(@as(u64, self.fence_gap), self.base_count - start)) };
     }
 
+    // ─── Commitment gather seam (spec §2.1 / §4.2) ───────────────────────────────
+    //
+    // The one storage↔commitment coupling point: a commitment-unit recompute needs the
+    // unit's live key set, which is a contiguous range of the sorted base overlaid by
+    // the RAM tiers. Nothing here depends on commitment values; compaction moving data
+    // never changes what gatherRange returns.
+
+    /// Sorted-by-key snapshot of the active memtable (null value = tombstone). Built
+    /// once per commit and passed to every `gatherRange` of that commit, so the
+    /// per-unit memtable cost is a binary search, not a full map iteration.
+    /// Caller owns the slice.
+    pub fn memtableSnapshot(self: *FlatStore, allocator: std.mem.Allocator) ![]MemEntry {
+        const snap = try allocator.alloc(MemEntry, self.memtable.count());
+        errdefer allocator.free(snap);
+        var it = self.memtable.iterator();
+        var i: usize = 0;
+        while (it.next()) |kv| : (i += 1) snap[i] = .{ .key = kv.key_ptr.*, .value = kv.value_ptr.* };
+        std.mem.sort(MemEntry, snap, {}, memLessThan);
+        return snap;
+    }
+
+    /// Append to `out` every live entry whose key's top `bits` bits equal `prefix`,
+    /// in ascending key order, newest tier winning, tombstones dropped. The unit's
+    /// base records are one contiguous range: a partition group when
+    /// `bits ≤ prefix_bits`, a sub-range of one partition otherwise (the whole
+    /// partition is read and filtered). `mem_snap` comes from `memtableSnapshot`.
+    pub fn gatherRange(
+        self: *FlatStore,
+        allocator: std.mem.Allocator,
+        prefix: u64,
+        bits: u6,
+        mem_snap: []const MemEntry,
+        out: *std.ArrayList(t.KvEntry),
+    ) !void {
+        std.debug.assert(bits >= 1);
+        std.debug.assert(prefix < @as(u64, 1) << bits);
+
+        var cands: std.ArrayList(Cand) = .empty;
+        defer cands.deinit(allocator);
+
+        // Base tier (priority 0, oldest). The base never holds tombstones.
+        {
+            const pb = self.prefix_bits;
+            var pid_lo: usize = undefined;
+            var pid_end: usize = undefined;
+            if (bits >= pb) {
+                const pid: usize = @intCast(prefix >> @intCast(bits - pb));
+                pid_lo = pid;
+                pid_end = pid + 1;
+            } else {
+                pid_lo = @intCast(prefix << @intCast(pb - bits));
+                pid_end = @intCast((prefix + 1) << @intCast(pb - bits));
+            }
+            var count: u64 = 0;
+            var off: u64 = 0;
+            for (pid_lo..pid_end) |pid| {
+                const p = self.directory[pid];
+                if (p.count == 0) continue;
+                if (count == 0) off = p.offset;
+                count += p.count;
+            }
+            if (count > 0) {
+                const buf = try allocator.alloc(u8, @intCast(count * RECORD_SIZE));
+                defer allocator.free(buf);
+                const got = try self.base_file.readPositionalAll(self.io, buf, off);
+                if (got != buf.len) return error.RecordsTruncated;
+                for (0..@intCast(count)) |i| {
+                    const kp = buf[i * RECORD_SIZE ..][0..32];
+                    if (topBits(kp, bits) != prefix) continue; // partition ⊃ unit when bits > prefix_bits
+                    var c: Cand = .{ .key = undefined, .value = undefined, .tomb = false, .pri = 0 };
+                    @memcpy(&c.key, kp);
+                    @memcpy(&c.value, buf[i * RECORD_SIZE + 32 ..][0..32]);
+                    try cands.append(allocator, c);
+                }
+            }
+        }
+
+        // L0 runs (priority i+1 — later runs are newer), each a sorted array.
+        for (self.l0.items, 0..) |run, ri| {
+            var i = lowerBoundPrefix(RunEntry, run.entries, prefix, bits);
+            while (i < run.entries.len and topBits(&run.entries[i].key, bits) == prefix) : (i += 1) {
+                const e = run.entries[i];
+                try cands.append(allocator, .{ .key = e.key, .value = e.value, .tomb = e.tomb, .pri = @intCast(ri + 1) });
+            }
+        }
+
+        // Memtable snapshot (newest).
+        {
+            var i = lowerBoundPrefix(MemEntry, mem_snap, prefix, bits);
+            while (i < mem_snap.len and topBits(&mem_snap[i].key, bits) == prefix) : (i += 1) {
+                const e = mem_snap[i];
+                try cands.append(allocator, .{
+                    .key = e.key,
+                    .value = e.value orelse std.mem.zeroes(t.Value),
+                    .tomb = e.value == null,
+                    .pri = std.math.maxInt(u32),
+                });
+            }
+        }
+
+        // Newest-wins sweep; a winning tombstone drops the key entirely.
+        std.mem.sort(Cand, cands.items, {}, candLessThan);
+        var i: usize = 0;
+        while (i < cands.items.len) {
+            const c = cands.items[i];
+            var j = i + 1;
+            while (j < cands.items.len and std.mem.eql(u8, &cands.items[j].key, &c.key)) j += 1;
+            if (!c.tomb) try out.append(allocator, .{ .key = c.key, .value = c.value });
+            i = j;
+        }
+    }
+
     /// Rare fenced-read fallback: the key sorted below its candidate run's first record
     /// (possible only when adjacent fences share the same 8-byte prefix). Walk runs
     /// backwards with single reads until the key is covered or run 0 is passed.
@@ -1412,6 +1531,36 @@ fn interpRank(key: *const [32]u8, prefix_bits: u6, n: u32) u64 {
 /// adjacent fences are resolved by `fenceStepBack`.
 fn keyPrefix64(key: *const [32]u8) u64 {
     return std.mem.readInt(u64, key[0..8], .big);
+}
+
+/// Top `bits` bits of the key as an integer (bits 1..63) — commitment-unit prefixes.
+fn topBits(key: *const [32]u8, bits: u6) u64 {
+    return keyPrefix64(key) >> @intCast(@as(u7, 64) - bits);
+}
+
+fn memLessThan(_: void, a: MemEntry, b: MemEntry) bool {
+    return std.mem.order(u8, &a.key, &b.key) == .lt;
+}
+
+/// Key order, ties broken newest (highest priority) first, so the dedup sweep keeps
+/// the first candidate per key.
+fn candLessThan(_: void, a: Cand, b: Cand) bool {
+    return switch (std.mem.order(u8, &a.key, &b.key)) {
+        .lt => true,
+        .gt => false,
+        .eq => a.pri > b.pri,
+    };
+}
+
+/// First index in the (key-sorted) slice whose key's top `bits` bits are ≥ `prefix`.
+fn lowerBoundPrefix(comptime E: type, items: []const E, prefix: u64, bits: u6) usize {
+    var lo: usize = 0;
+    var hi: usize = items.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (topBits(&items[mid].key, bits) < prefix) lo = mid + 1 else hi = mid;
+    }
+    return lo;
 }
 
 /// First index whose fence is strictly greater than `k` (fences are non-decreasing).

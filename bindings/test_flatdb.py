@@ -79,7 +79,56 @@ def main() -> None:
             assert db.get(k(150)) == v(150)
             assert db.get(k(210)) == v(210)
 
-    print("OK — flatdb bindings: put/get/get_many/delete/tombstone/freeze/compact/reopen/budgeted-step")
+    # ── commitments: attach / auto-mark / commit / checkpoint / restore ──────────
+    with tempfile.TemporaryDirectory() as d:
+        path = str(Path(d) / "store")
+
+        with FlatDB(path, prefix_bits=8, freeze_interval=1) as db:
+            assert db.commit_height() == -1          # not attached yet
+            assert db.commit_attach(heap_depth=6) == "fresh"
+            root_empty = db.commit_root()
+            assert root_empty == b"\x00" * 32        # empty mapping ⇒ ZERO root
+
+            for i in range(30):
+                db.put(k(i), v(i))                   # auto-marks dirty units
+            db.end_block(1)
+            root1 = db.commit_block(1)
+            assert root1 != root_empty
+
+            # Same mapping ⇒ same root, regardless of storage movement.
+            db.compact()
+            db.mark_dirty(k(0))                      # force a recompute of a unit
+            assert db.commit_block(1) == root1
+
+            # Overwrite + delete change the root; deleting restores nothing silently.
+            db.put(k(5), v(999))
+            db.delete(k(7))
+            db.end_block(2)
+            root2 = db.commit_block(2)
+            assert root2 != root1
+            assert db.commit_height() == 2
+
+            db.commit_checkpoint()
+
+        # Reopen: checkpoint restores the root with no replay (heights match).
+        with FlatDB(path, prefix_bits=8, freeze_interval=1) as db:
+            assert db.covered_height() == 2
+            assert db.commit_attach(heap_depth=6) == "restored"
+            assert db.commit_height() == 2
+            assert db.commit_root() == root2
+
+            # H mismatch on a second handle-level attach is rejected.
+            try:
+                db.commit_attach(heap_depth=7)
+                raise AssertionError("double attach should fail")
+            except RuntimeError:
+                pass
+
+            # A cold rebuild from the store agrees with the restored checkpoint.
+            assert db.commit_rebuild(2) == root2
+
+    print("OK — flatdb bindings: put/get/get_many/delete/tombstone/freeze/compact/reopen/"
+          "budgeted-step/commit-attach/commit-block/checkpoint-restore/rebuild")
 
 
 if __name__ == "__main__":

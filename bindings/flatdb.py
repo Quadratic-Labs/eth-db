@@ -69,6 +69,20 @@ _lib.flatdb_compaction_due.restype = c.c_int
 _lib.flatdb_compaction_due.argtypes = [c.c_void_p]
 _lib.flatdb_covered_height.restype = c.c_uint64
 _lib.flatdb_covered_height.argtypes = [c.c_void_p]
+_lib.flatdb_commit_attach.restype = c.c_int
+_lib.flatdb_commit_attach.argtypes = [c.c_void_p, c.c_uint8]
+_lib.flatdb_mark_dirty.restype = c.c_int
+_lib.flatdb_mark_dirty.argtypes = [c.c_void_p, _Buf32]
+_lib.flatdb_commit_block.restype = c.c_int
+_lib.flatdb_commit_block.argtypes = [c.c_void_p, c.c_uint64, _Buf32]
+_lib.flatdb_commit_root.restype = c.c_int
+_lib.flatdb_commit_root.argtypes = [c.c_void_p, _Buf32]
+_lib.flatdb_commit_rebuild.restype = c.c_int
+_lib.flatdb_commit_rebuild.argtypes = [c.c_void_p, c.c_uint64, _Buf32]
+_lib.flatdb_commit_checkpoint.restype = c.c_int
+_lib.flatdb_commit_checkpoint.argtypes = [c.c_void_p]
+_lib.flatdb_commit_height.restype = c.c_int64
+_lib.flatdb_commit_height.argtypes = [c.c_void_p]
 
 _STEP = {0: "idle", 1: "in_progress", 2: "done"}
 
@@ -210,3 +224,69 @@ class FlatDB:
     def covered_height(self) -> int:
         """Block height the durable state reflects; replay blocks above it after open."""
         return _lib.flatdb_covered_height(self._handle)
+
+    # ── commitments (state root) ─────────────────────────────────────────────────
+    #
+    # The Commitment DB (src/commitment.zig): a RAM heap of the canonical trie values
+    # at depths 0..H over leaf subtrees recomputed from the flat store. Attach once;
+    # put/delete then auto-mark dirty units, and commit_block(height) at each block
+    # boundary returns the 32-byte state root. Only the depth-H row is ever persisted
+    # (`flat.croot`), by an explicit commit_checkpoint() — close() never writes it.
+
+    def commit_attach(self, heap_depth: int = 24) -> str:
+        """Attach a CommitmentDb with heap depth H (heap RAM = 2^(H+1) × 32 B: 1 GiB
+        at H=24). Returns "restored" if an existing checkpoint was loaded (then replay
+        blocks above commit_height() — re-put or mark_dirty their keys — and commit
+        once), or "fresh" if none was found (heap all-zero: call commit_rebuild()
+        unless the store is empty). Raises if a checkpoint exists with a different H."""
+        rc = _lib.flatdb_commit_attach(self._handle, heap_depth)
+        if rc == 0:
+            return "restored"
+        if rc == 1:
+            return "fresh"
+        raise RuntimeError(f"commit_attach failed (rc={rc}) — already attached, bad H, "
+                           "or checkpoint heap_depth mismatch")
+
+    def mark_dirty(self, key: bytes) -> None:
+        """Mark key's commitment unit dirty without writing it — for replaying blocks
+        the flat store already holds durably (put/delete mark automatically)."""
+        rc = _lib.flatdb_mark_dirty(self._handle, _buf32(key))
+        if rc != 0:
+            raise RuntimeError(f"mark_dirty failed (rc={rc}) — commitments attached?")
+
+    def commit_block(self, height: int) -> bytes:
+        """Commit block `height`: recompute dirty units from the store and return the
+        32-byte state root. Call at a block boundary (after end_block)."""
+        out = _Buf32()
+        rc = _lib.flatdb_commit_block(self._handle, height, out)
+        if rc != 0:
+            raise RuntimeError(f"commit_block failed (rc={rc}) — commitments attached?")
+        return bytes(out)
+
+    def commit_root(self) -> bytes:
+        """The state root as of the last commit/rebuild/attach."""
+        out = _Buf32()
+        rc = _lib.flatdb_commit_root(self._handle, out)
+        if rc != 0:
+            raise RuntimeError(f"commit_root failed (rc={rc}) — commitments attached?")
+        return bytes(out)
+
+    def commit_rebuild(self, height: int) -> bytes:
+        """Cold rebuild: recompute every unit from the flat store (one full pass —
+        minutes on a large store) and return the root. The store must reflect exactly
+        the mapping as of `height`."""
+        out = _Buf32()
+        rc = _lib.flatdb_commit_rebuild(self._handle, height, out)
+        if rc != 0:
+            raise RuntimeError(f"commit_rebuild failed (rc={rc}) — commitments attached?")
+        return bytes(out)
+
+    def commit_checkpoint(self) -> None:
+        """Persist the depth-H row to flat.croot (out-of-place, atomic)."""
+        rc = _lib.flatdb_commit_checkpoint(self._handle)
+        if rc != 0:
+            raise RuntimeError(f"commit_checkpoint failed (rc={rc}) — commitments attached?")
+
+    def commit_height(self) -> int:
+        """Block height the commitment heap reflects (-1 if not attached)."""
+        return _lib.flatdb_commit_height(self._handle)
