@@ -38,7 +38,7 @@ const CrootHeader = extern struct {
     magic: u32,
     version: u32,
     heap_depth: u32,
-    _pad: u32 = 0,
+    leaf_tag: u32 = 0,
     covered_height: u64,
 };
 
@@ -47,20 +47,30 @@ pub const Config = struct {
     /// halves unit-recompute I/O + CPU. Density guideline (not a safety limit):
     /// H ≤ log2(N) − 5. Structural for checkpoints: `open` requires the stored H.
     heap_depth: u6 = HEAP_DEPTH_DEFAULT,
+    /// Leaf kind this tree commits (0x00 = storage/value leaves; 0x01 = account
+    /// leaves in the two-tier design). Structural for checkpoints, like H.
+    leaf_tag: u8 = 0x00,
 };
 
 // ─── Canonical trie function (commitment_redesign.md §2) ──────────────────────
 
-/// leafHash(K, V) = Blake3(0x00 ‖ K ‖ V). The 65-byte input gives domain separation
+/// leafHash(K, V) = Blake3(tag ‖ K ‖ V). The 65-byte input gives domain separation
 /// from `combine`'s 64-byte input; the embedded full key gives position binding.
-pub fn leafHash(key: *const t.Key, value: *const t.Value) Hash {
+/// Tags separate leaf *kinds*: 0x00 = storage/value leaf, 0x01 = account leaf
+/// (two-tier design, where V is the account's storage root).
+pub fn leafHashTagged(tag: u8, key: *const t.Key, value: *const t.Value) Hash {
     var buf: [65]u8 = undefined;
-    buf[0] = 0x00;
+    buf[0] = tag;
     @memcpy(buf[1..33], key);
     @memcpy(buf[33..65], value);
     var out: Hash = undefined;
     std.crypto.hash.Blake3.hash(&buf, &out, .{});
     return out;
+}
+
+/// The 0x00-tagged (storage/value) leaf.
+pub fn leafHash(key: *const t.Key, value: *const t.Value) Hash {
+    return leafHashTagged(0x00, key, value);
 }
 
 /// Pass-through combine: an empty sibling passes the other side up unchanged, so a
@@ -84,12 +94,13 @@ fn getBit(key: *const t.Key, bit: u16) u1 {
 }
 
 /// Canonical value of the subtree rooted at bit-depth `bit` over its live entries
-/// (sorted by key, unique keys). At bit 0 over the full mapping this *is* the naive
-/// §2 evaluator — the reference the heap-maintained root is tested against.
-/// n entries cost n leafHashes + (n−1) combines; pass-through frames hash nothing.
-pub fn subtreeRoot(entries: []const t.KvEntry, bit: u16) Hash {
+/// (sorted by key, unique keys), with `tag`-kind leaves. At bit 0 over the full
+/// mapping this *is* the naive §2 evaluator — the reference the heap-maintained
+/// root is tested against. n entries cost n leafHashes + (n−1) combines;
+/// pass-through frames hash nothing.
+pub fn subtreeRootTagged(entries: []const t.KvEntry, bit: u16, tag: u8) Hash {
     if (entries.len == 0) return ZERO_HASH;
-    if (entries.len == 1) return leafHash(&entries[0].key, &entries[0].value);
+    if (entries.len == 1) return leafHashTagged(tag, &entries[0].key, &entries[0].value);
     std.debug.assert(bit < 256); // distinct keys must diverge within 256 bits
     // Sorted keys ⇒ entries with `bit` clear precede entries with `bit` set.
     var lo: usize = 0;
@@ -98,9 +109,44 @@ pub fn subtreeRoot(entries: []const t.KvEntry, bit: u16) Hash {
         const mid = lo + (hi - lo) / 2;
         if (getBit(&entries[mid].key, bit) == 0) lo = mid + 1 else hi = mid;
     }
-    const l = subtreeRoot(entries[0..lo], bit + 1);
-    const r = subtreeRoot(entries[lo..], bit + 1);
+    const l = subtreeRootTagged(entries[0..lo], bit + 1, tag);
+    const r = subtreeRootTagged(entries[lo..], bit + 1, tag);
     return combine(&l, &r);
+}
+
+/// 0x00-tagged subtree value (the single-tier canonical function).
+pub fn subtreeRoot(entries: []const t.KvEntry, bit: u16) Hash {
+    return subtreeRootTagged(entries, bit, 0x00);
+}
+
+// ─── Implicit-heap helpers (shared with the two-tier per-account committers) ──
+
+/// Re-combine ancestors of the (sorted, unique, same-level) heap indices in `idxs`,
+/// level by level, deduplicating shared parents; `idxs` is consumed as scratch.
+/// ~|idxs| × depth combines worst case, less as paths converge.
+pub fn heapRecombine(heap: []Hash, idxs: *std.ArrayList(u64)) void {
+    while (idxs.items.len > 0 and idxs.items[0] != 1) {
+        var w: usize = 0;
+        var last: u64 = 0;
+        for (idxs.items) |i| {
+            const p = i >> 1;
+            if (p == last) continue; // sibling already handled
+            heap[p] = combine(&heap[2 * p], &heap[2 * p + 1]);
+            idxs.items[w] = p;
+            w += 1;
+            last = p;
+        }
+        idxs.shrinkRetainingCapacity(w);
+    }
+}
+
+/// Recompute all internal levels of an implicit heap from its leaf row
+/// (`heap.len / 2` leaves ⇒ `heap.len / 2` combines).
+pub fn heapRebuildInternals(heap: []Hash) void {
+    var i: u64 = heap.len / 2 - 1;
+    while (i >= 1) : (i -= 1) {
+        heap[i] = combine(&heap[2 * i], &heap[2 * i + 1]);
+    }
 }
 
 /// Top `bits` bits of the key — the commitment-unit prefix (heap-leaf index offset).
@@ -118,6 +164,7 @@ pub const CommitmentDb = struct {
     /// own combines use the same pass-through rule, so sparse bottom rows stay exact.
     heap: []Hash,
     heap_depth: u6,
+    leaf_tag: u8,
     /// Unit prefixes touched by writes since the last `commitBlock`.
     dirty: std.AutoHashMap(u64, void),
     /// Block height the heap reflects (advanced by commitBlock, persisted by
@@ -136,6 +183,7 @@ pub const CommitmentDb = struct {
             .allocator = allocator,
             .heap = heap,
             .heap_depth = h,
+            .leaf_tag = config.leaf_tag,
             .dirty = std.AutoHashMap(u64, void).init(allocator),
             .committed_height = 0,
             .dirty_list = .empty,
@@ -186,31 +234,11 @@ pub const CommitmentDb = struct {
             const prefix = hidx - self.leafBase();
             self.gather_buf.clearRetainingCapacity();
             try store.gatherRange(a, prefix, self.heap_depth, snap, &self.gather_buf);
-            self.heap[hidx] = subtreeRoot(self.gather_buf.items, self.heap_depth);
+            self.heap[hidx] = subtreeRootTagged(self.gather_buf.items, self.heap_depth, self.leaf_tag);
         }
-        self.recombine();
+        heapRecombine(self.heap, &self.dirty_list);
         self.dirty.clearRetainingCapacity();
         return self.heap[1];
-    }
-
-    /// Re-combine ancestors of the (sorted, unique, same-level) heap indices in
-    /// `dirty_list`, level by level, deduplicating shared parents. ~|dirty| × H
-    /// combines worst case, less as paths converge.
-    fn recombine(self: *CommitmentDb) void {
-        var idxs = &self.dirty_list;
-        while (idxs.items.len > 0 and idxs.items[0] != 1) {
-            var w: usize = 0;
-            var last: u64 = 0;
-            for (idxs.items) |i| {
-                const p = i >> 1;
-                if (p == last) continue; // sibling already handled
-                self.heap[p] = combine(&self.heap[2 * p], &self.heap[2 * p + 1]);
-                idxs.items[w] = p;
-                w += 1;
-                last = p;
-            }
-            idxs.shrinkRetainingCapacity(w);
-        }
     }
 
     /// Cold rebuild (§4.5 worst case): recompute every unit from the flat store, then
@@ -225,20 +253,12 @@ pub const CommitmentDb = struct {
         while (p < n_units) : (p += 1) {
             self.gather_buf.clearRetainingCapacity();
             try store.gatherRange(a, p, self.heap_depth, snap, &self.gather_buf);
-            self.heap[self.leafBase() + p] = subtreeRoot(self.gather_buf.items, self.heap_depth);
+            self.heap[self.leafBase() + p] = subtreeRootTagged(self.gather_buf.items, self.heap_depth, self.leaf_tag);
         }
-        self.rebuildInternals();
+        heapRebuildInternals(self.heap);
         self.dirty.clearRetainingCapacity();
         self.committed_height = height;
         return self.heap[1];
-    }
-
-    /// Recompute heap levels H−1 … 0 from the leaf row (2^H combines).
-    fn rebuildInternals(self: *CommitmentDb) void {
-        var i: u64 = self.leafBase() - 1;
-        while (i >= 1) : (i -= 1) {
-            self.heap[i] = combine(&self.heap[2 * i], &self.heap[2 * i + 1]);
-        }
     }
 
     // ─── Persistence (§4.5) ──────────────────────────────────────────────────────
@@ -251,6 +271,7 @@ pub const CommitmentDb = struct {
             .magic = CROOT_MAGIC,
             .version = CROOT_VERSION,
             .heap_depth = self.heap_depth,
+            .leaf_tag = self.leaf_tag,
             .covered_height = self.committed_height,
         };
         var tb: [256]u8 = undefined;
@@ -285,13 +306,14 @@ pub const CommitmentDb = struct {
         if (hdr.magic != CROOT_MAGIC) return error.CrootBadMagic;
         if (hdr.version != CROOT_VERSION) return error.CrootVersionMismatch;
         if (hdr.heap_depth != config.heap_depth) return error.HeapDepthMismatch;
+        if (hdr.leaf_tag != config.leaf_tag) return error.LeafTagMismatch;
 
         var db = try init(allocator, config);
         errdefer db.deinit();
         const row = db.heap[@intCast(db.leafBase())..];
         const rn = try f.readPositionalAll(io, std.mem.sliceAsBytes(row), @sizeOf(CrootHeader));
         if (rn != row.len * 32) return error.CrootTruncated;
-        db.rebuildInternals();
+        heapRebuildInternals(db.heap);
         db.committed_height = hdr.covered_height;
         return db;
     }

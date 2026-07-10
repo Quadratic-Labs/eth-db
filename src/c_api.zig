@@ -445,3 +445,212 @@ export fn flatdb_commit_height(state: *FlatState) i64 {
     const cdb = if (state.cdb) |*p| p else return -1;
     return @intCast(cdb.committed_height);
 }
+
+// ─── Two-tier C API (`ttdb_*`) ──────────────────────────────────────────────────
+//
+// The two-tier engine (src/two_tier.zig): composite account‖slot state with a
+// per-account storage commitment layer. One handle owns the directory plus three
+// engine objects: the slots store ("slots", 64-byte keys), the accounts store
+// ("acct", 32-byte keys — wholly commitment-maintained derived data), and the
+// TwoTierDb (checkpoints under name "state"). The host only ever speaks
+// (account_hash, slot_hash, value): account records are engine-internal.
+//
+// Block cycle: ttdb_put_slot/ttdb_delete_slot during the block, ttdb_end_block,
+// then ttdb_commit_block → state root. Recovery: reopen, then for blocks above
+// ttdb_committed_height re-put (above ttdb_covered_height) or ttdb_mark_dirty_slot
+// (already durable), and commit once. Return codes as above.
+
+const two_tier = root.two_tier;
+
+const TtState = struct {
+    dir: std.Io.Dir,
+    accts: two_tier.AcctStore,
+    slots: two_tier.SlotStore,
+    db: two_tier.TwoTierDb,
+};
+
+/// Open (or create) a two-tier state DB at directory `path`. Zeros pick engine
+/// defaults: prefix_bits→16, fence_gap→64 (mandatory for the slots store),
+/// acct_heap_depth→24, t_big_log2→12. Structural params are only used when
+/// creating fresh (else manifest/croot win; mismatches fail the open).
+export fn ttdb_open(
+    path: [*:0]const u8,
+    prefix_bits: u8,
+    fence_gap: u32,
+    memtable_cap: u64,
+    l0_threshold: u32,
+    freeze_interval: u64,
+    o_direct: u8,
+    acct_heap_depth: u8,
+    t_big_log2: u8,
+) ?*TtState {
+    const state = std.heap.page_allocator.create(TtState) catch return null;
+    const io = globalIo();
+
+    const dir = std.Io.Dir.cwd().createDirPathOpen(io, std.mem.span(path), .{}) catch {
+        std.heap.page_allocator.destroy(state);
+        return null;
+    };
+    const pb: u6 = if (prefix_bits == 0) 16 else @intCast(prefix_bits);
+    const acct_cfg: flat_store.Config = .{
+        .prefix_bits = pb,
+        .memtable_cap = memtable_cap,
+        .l0_compact_threshold = l0_threshold,
+        .freeze_block_interval = if (freeze_interval == 0) 1 else freeze_interval,
+    };
+    const slot_cfg: flat_store.Config = .{
+        .prefix_bits = pb,
+        .fence_gap = if (fence_gap == 0) 64 else fence_gap,
+        .memtable_cap = memtable_cap,
+        .l0_compact_threshold = l0_threshold,
+        .freeze_block_interval = freeze_interval,
+        .o_direct = o_direct != 0,
+    };
+    const tt_cfg: two_tier.Config = .{
+        .acct_heap_depth = if (acct_heap_depth == 0) 24 else @intCast(acct_heap_depth),
+        .t_big_log2 = if (t_big_log2 == 0) 12 else @intCast(t_big_log2),
+    };
+
+    state.accts = openOrCreate(two_tier.AcctStore, io, dir, "acct", acct_cfg) orelse {
+        dir.close(io);
+        std.heap.page_allocator.destroy(state);
+        return null;
+    };
+    state.slots = openOrCreate(two_tier.SlotStore, io, dir, "slots", slot_cfg) orelse {
+        state.accts.deinit();
+        dir.close(io);
+        std.heap.page_allocator.destroy(state);
+        return null;
+    };
+    state.db = two_tier.TwoTierDb.open(flat_alloc, io, dir, "state", tt_cfg) catch |err| blk: {
+        if (err != error.FileNotFound) {
+            state.slots.deinit();
+            state.accts.deinit();
+            dir.close(io);
+            std.heap.page_allocator.destroy(state);
+            return null;
+        }
+        break :blk two_tier.TwoTierDb.init(flat_alloc, tt_cfg) catch {
+            state.slots.deinit();
+            state.accts.deinit();
+            dir.close(io);
+            std.heap.page_allocator.destroy(state);
+            return null;
+        };
+    };
+    state.dir = dir;
+    return state;
+}
+
+fn openOrCreate(comptime Store: type, io: std.Io, dir: std.Io.Dir, name: []const u8, cfg: flat_store.Config) ?Store {
+    return Store.open(flat_alloc, io, dir, name, cfg) catch |err| switch (err) {
+        error.FileNotFound => Store.create(flat_alloc, io, dir, name, &.{}, cfg) catch null,
+        else => null,
+    };
+}
+
+export fn ttdb_deinit(state: *TtState) void {
+    state.db.deinit();
+    state.slots.deinit();
+    state.accts.deinit();
+    state.dir.close(globalIo());
+    std.heap.page_allocator.destroy(state);
+}
+
+export fn ttdb_put_slot(state: *TtState, acct: *const [32]u8, slot: *const [32]u8, value: *const [32]u8) i32 {
+    state.db.putSlot(&state.slots, acct, slot, value.*) catch return -1;
+    return 0;
+}
+
+export fn ttdb_delete_slot(state: *TtState, acct: *const [32]u8, slot: *const [32]u8) i32 {
+    state.db.deleteSlot(&state.slots, acct, slot) catch return -1;
+    return 0;
+}
+
+/// 0 and fills value_out if present; 1 if absent or deleted; -1 on error.
+export fn ttdb_get_slot(state: *TtState, acct: *const [32]u8, slot: *const [32]u8, value_out: *[32]u8) i32 {
+    const r = state.slots.get(two_tier.composeKey(acct, slot)) catch return -1;
+    if (r) |v| {
+        value_out.* = v;
+        return 0;
+    }
+    return 1;
+}
+
+/// Storage root of one account as of the last commit. 1 = account absent
+/// (no storage). Reads the commitment-maintained accounts store.
+export fn ttdb_storage_root(state: *TtState, acct: *const [32]u8, root_out: *[32]u8) i32 {
+    const r = state.accts.get(acct.*) catch return -1;
+    if (r) |v| {
+        root_out.* = v;
+        return 0;
+    }
+    return 1;
+}
+
+/// Mark (acct, slot) dirty without writing — replay of already-durable blocks.
+export fn ttdb_mark_dirty_slot(state: *TtState, acct: *const [32]u8, slot: *const [32]u8) i32 {
+    state.db.markDirtySlot(acct, slot) catch return -1;
+    return 0;
+}
+
+/// Signal end of block `height` on the slots store (block-aligned freeze).
+export fn ttdb_end_block(state: *TtState, height: u64) i32 {
+    state.slots.endBlock(height) catch return -1;
+    return 0;
+}
+
+/// Commit block `height`: storage roots → account write-backs → account tree.
+/// Writes the state root to `root_out`.
+export fn ttdb_commit_block(state: *TtState, height: u64, root_out: *[32]u8) i32 {
+    root_out.* = state.db.commitBlock(&state.accts, &state.slots, height) catch return -1;
+    return 0;
+}
+
+export fn ttdb_root(state: *TtState, root_out: *[32]u8) void {
+    root_out.* = state.db.root();
+}
+
+/// Block height the commitment state reflects.
+export fn ttdb_committed_height(state: *TtState) u64 {
+    return state.db.committedHeight();
+}
+
+/// Block height the durable slot data reflects; replay blocks above it after open.
+export fn ttdb_covered_height(state: *TtState) u64 {
+    return state.slots.covered_height;
+}
+
+/// Checkpoint the commitment state ("state.croot" + "state.cstor"), atomically.
+export fn ttdb_checkpoint(state: *TtState) i32 {
+    state.db.checkpoint(globalIo(), state.dir, "state") catch return -1;
+    return 0;
+}
+
+/// Run both stores' compaction to completion.
+export fn ttdb_compact(state: *TtState) i32 {
+    state.slots.compact() catch return -1;
+    state.accts.compact() catch return -1;
+    return 0;
+}
+
+/// Advance slots-store compaction by ≤ `byte_budget` bytes (0/1/2 = idle/in
+/// progress/done, -1 = error). The accounts store is small — compact it via
+/// ttdb_compact.
+export fn ttdb_compact_step(state: *TtState, byte_budget: u64) i32 {
+    const st = state.slots.compactStep(@intCast(byte_budget)) catch return -1;
+    return switch (st) {
+        .idle => 0,
+        .in_progress => 1,
+        .done => 2,
+    };
+}
+
+export fn ttdb_compaction_due(state: *TtState) i32 {
+    return if (state.slots.compactionDue() or state.accts.compactionDue()) 1 else 0;
+}
+
+/// Number of accounts currently above T_big (holding a per-account unit row).
+export fn ttdb_big_count(state: *TtState) u32 {
+    return state.db.big.count();
+}

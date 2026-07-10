@@ -149,6 +149,7 @@ pub fn build(b: *std.Build) void {
     const tools = [_]struct { name: []const u8, src: []const u8, desc: []const u8 }{
         .{ .name = "bulkload", .src = "src/main_bulkload.zig", .desc = "Bulk-load a FlatStore base from storage-<block>.tsv files" },
         .{ .name = "bench", .src = "src/main_bench.zig", .desc = "Benchmark a (seeded) FlatStore using a TSV-derived workload" },
+        .{ .name = "bench2", .src = "src/main_bench2.zig", .desc = "Two-tier (account‖slot) commitment benchmark with Zipf account sizes" },
     };
     for (tools) |tool| {
         const tool_exe = b.addExecutable(.{

@@ -314,7 +314,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("pass 1: {d} rows ({d} bad) across {d} buckets\n", .{ rows, bad, nbuckets });
 
     // ── Pass 2: sort each bucket, dedup newest-per-key, stream into the base ─────
-    var bb = try flat.BaseBuilder.init(gpa, io, dir, "flat", args.prefix_bits, args.window_entries);
+    var bb = try flat.FlatStore.BaseBuilder.init(gpa, io, dir, "flat", args.prefix_bits, args.window_entries);
     defer bb.deinit();
 
     for (0..nbuckets) |b| {
