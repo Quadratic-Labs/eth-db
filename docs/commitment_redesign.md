@@ -3,7 +3,7 @@
 Status: IMPLEMENTED 2026-06-11 (pass-through rule signed off; Merkle proof
 *generation* API still pending — the stored page internals already serve it).
 Supersedes the buffer-hash commitment scheme formerly implemented in
-`commitBlock` (`nodeDataHash` mixing). Spec reference: `overview.md` §2.2.
+`commitBlock` (`nodeDataHash` mixing). Spec reference: `archive/overview.md` §2.2 (a duplicate of `specifications_v4.md`).
 
 > **Partially superseded 2026-07-06 on the flat-store branch**
 > (`exploratory/prefix-files`): the canonical trie function of §2

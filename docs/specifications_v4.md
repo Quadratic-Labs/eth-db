@@ -1,8 +1,16 @@
-# PrefixDB — Technical Specification
+# PrefixDB — Technical Specification (legacy engine)
 
-- **Version:** 0.4 (Draft)
+- **Version:** 0.4
 - **Date:** 2026-05-22
-- **Status:** Work in Progress
+- **Status:** LEGACY (2026-08-25) — superseded as the project architecture by
+  `specifications_v5.md` (flat store + commitment heap) and `two_tier_plan.md`,
+  but kept because it is the only description of the **still-compiled legacy
+  PrefixDB engine**: `src/root.zig`, `src/page_store.zig`, the `prefixdb_*`
+  C API in `src/c_api.zig`, and `bindings/prefixdb.py`. The storage, compaction,
+  and relative-prefix-encoding sections (§4–§7) still match that code. The
+  commitment sections (§2.2 and related) no longer apply: commit logic was
+  removed from `root.zig`, and `child_commitments` survives only as a dead
+  node-page field. §5.4 range query was never implemented.
 
 ---
 

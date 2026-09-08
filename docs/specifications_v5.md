@@ -2,8 +2,8 @@
 
 - **Version:** 0.5 (Draft)
 - **Date:** 2026-07-06
-- **Status:** Work in Progress — Flat DB read/write/durability path implemented; Commitment DB Tiers 1–2 implemented (`src/commitment.zig`: heap + gather recompute + checkpoint/recovery); Tier 3 blobs, BAL unit-prefetch, and parallel unit recompute pending.
-- **Related:** Design synthesis in `prefix_redesign.md`; commitment subsystem in `commitment_redesign.md`.
+- **Status:** Work in Progress — Flat DB read/write/durability path implemented (`src/flat_store.zig`), including the §3.2.1 fence index; Commitment DB Tiers 1–2 implemented (`src/commitment.zig`: heap + gather recompute + checkpoint/recovery); Tier 3 blobs, BAL unit-prefetch, parallel unit recompute, and §4.6 proofs pending.
+- **Related:** Design synthesis in `prefix_redesign.md`; commitment subsystem in `commitment_redesign.md`. The single-key-space assumption (§2.5, §4) is superseded for the MPT account‖slot model by `two_tier_plan.md` (`src/two_tier.zig`); this spec remains authoritative for the single-key-space engine that the two-tier design composes.
 
 ---
 
@@ -25,7 +25,7 @@ Key-values and commitments are exercised at different times under different cons
 - **Fixed partitioning.** A single global prefix width `P = 24` (16 M partitions) holds from mainnet-today through the 2³⁶ target with no repartitioning (§3.3).
 - **Batched, async read path is mandatory.** Reads cannot be serialised within the execution budget; the read path is io_uring-batched, not blocking `pread` (§3.1).
 - **In-RAM L0, exact reads.** Writes are absorbed by a mutable memtable, frozen into immutable sorted RAM runs (L0), and bulk-compacted out-of-place into the partitioned base. L0 is searched exactly in RAM — no approximate filter, no false-positive disk reads (§3.4).
-- **WAL durability.** A sequential write-ahead log is the sole durability mechanism for in-RAM state; the base is rewritten out-of-place (never in place — SSD/CoW) (§3.4, §3.7).
+- **Manifest-committed durability (no per-write WAL).** L0 runs are persisted at freeze (fsync) and a manifest written temp + fsync + rename is the atomic commit point; the memtable is never durable — the host replays blocks above `covered_height`. The base is rewritten out-of-place (never in place — SSD/CoW) (§3.4, §3.5).
 - **Multi-drive scaling.** App-level partition sharding scales aggregate bandwidth/IOPS ~linearly; it does not reduce single-read latency (§3.6).
 - **Recomputable commitments.** The Commitment DB is an implicit RAM heap for the dense top `H` levels (heap depth `H` is a RAM-for-I/O knob, default `= P`) over leaf subtrees that are recomputed from the flat store on demand rather than persisted; every cached structure is a pure cache of a canonical trie function (§4).
 
@@ -151,25 +151,25 @@ When enabled (`fence_gap = G > 0`), the fence index replaces interpolation with 
 `P` is chosen so partitions stay small at target scale and never need repartitioning across the growth curve:
 
 - **P = 24** ⇒ 16 M partitions: ~256 entries each today (16 KiB, read whole partition), growing to ~4 K entries (256 KiB, 16 KiB window) at 2³⁶. Stays in the top row of the §3.2 table (~366 K reads/s/drive) the whole way.
-- **Partitions are not 16 M files.** They are packed into 4 GiB container files via an in-house page container scheme with its own allocator (`page_id = container_id << 20 | local_page`) — ~1100 files at target.
-- **Partition directory** `partition → (container_file, offset, n[, drive])` ≈ **256 MiB RAM**. Under uniform keys, fixed-P partitions are already balanced, so the read path needs no variable-depth radix routing — adaptive depth buys nothing here.
+- **Partitions are not 16 M files.** As built, the whole base is a **single generation-suffixed file** (`<name>.base.<gen>`) with partitions at computed offsets. (An earlier 4 GiB container-file packing scheme survives only in the legacy PrefixDB engine's `page_store.zig`; multi-drive sharding, §3.6, will reintroduce per-drive files.)
+- **Partition directory** `partition → (offset, n)` in RAM (≈ 256 MiB at the 2³⁶ target). Under uniform keys, fixed-P partitions are already balanced, so the read path needs no variable-depth radix routing — adaptive depth buys nothing here.
 - Smaller partitions help on every axis simultaneously: smaller read windows (more bandwidth headroom), smaller/uniform compaction units, cheaper rewrites. Total compaction write volume is **independent of P** (it is the base size); `P` only sets granularity.
 
 ### 3.4 Write scheme — in-RAM L0 runs + bulk partitioned compaction
 
 Writes are uniform and thin: a memtable flush touches almost every partition with only a handful of keys each. **Per-partition flush is fatal** (millions of scattered tiny writes + 256×+ WAF). Instead the store keeps a 2-level structure: a small mutable memtable plus N immutable sorted RAM runs as L0, compacted in bulk into the prefix-partitioned on-disk base.
 
-**Durability is the WAL's job, not L0's.** Each write is appended to a sequential WAL (cheap, predictable) before entering RAM, so L0 living in memory loses nothing on a crash: recovery replays the WAL segments not yet folded into the base. L0 is purely the in-RAM read + compaction structure.
+**Durability is the freeze's job — there is no per-write WAL.** L0 runs are persisted as run files at freeze (fsync) and the manifest is the atomic commit point; the active memtable is never durable — on a crash the host replays blocks above the manifest's `covered_height` (§3.5). In RAM, L0 is purely the read + compaction structure; its run files exist only for recovery.
 
 The lifecycle has three stages, each chosen for predictability:
 
-1. **Execution** *(Predictability #1)* — each write → WAL append (sequential) + the active memtable, a plain unordered hash map with O(1) point lookups. Base/compaction are untouched ⇒ no random-write jitter on the critical path.
-2. **Freeze** *(Predictability #2)* — when the active memtable fills, sort it once into a compact immutable RAM run (the same 64 B `key‖value` sorted-array layout as the base) and start a fresh empty active map. No disk write here (the WAL already holds the bytes); cost is one memtable's worth of sort. Freezing is block-aligned.
-3. **Compaction (idle window)** *(Predictability #3)* — once `K` frozen runs accumulate, k-way *merge* them (all pre-sorted) with the affected base partitions and write a new base **out-of-place** (new files + atomic rename; never in place — SSD/CoW), then drop those RAM runs and truncate their WAL segments. Each base partition is rewritten once per cycle; bounded, schedulable, evenly divisible across uniform partitions ⇒ time-sliceable and pausable.
+1. **Execution** *(Predictability #1)* — each write → the active memtable, a plain unordered hash map with O(1) point lookups. No disk I/O on the critical path; base/compaction are untouched ⇒ no random-write jitter.
+2. **Freeze** *(Predictability #2)* — when the active memtable fills, sort it once into a compact immutable RAM run (the same 64 B `key‖value` sorted-array layout as the base) and start a fresh empty active map. The run file is persisted (fsync) and the manifest committed — this is the durability point (§3.5). Freezing is block-aligned.
+3. **Compaction (idle window)** *(Predictability #3)* — once `K` frozen runs accumulate, k-way *merge* them (all pre-sorted) with the affected base partitions and write a new base **out-of-place** (new files + atomic rename; never in place — SSD/CoW), then drop those RAM runs and delete their run files. Each base partition is rewritten once per cycle; bounded, schedulable, evenly divisible across uniform partitions ⇒ time-sliceable and pausable.
 
 **Read path — no filter needed.** A lookup checks, newest-wins: active memtable (hash, RAM) → each frozen RAM run (binary search of a sorted array, RAM, **exact**) → base (one windowed io_uring read). Frozen runs are searched exactly and cheaply in RAM, so there is **no approximate filter and no false-positive disk reads**. The only disk I/O on a cold read is the single base window read, preceded by ~`K` cache-friendly RAM binary searches.
 
-**Amplification.** Disk writes are only: the WAL (1× the data, sequential, unavoidable for durability) + periodic base compaction. With memtable = 1 GiB and `K = 16` (16 GiB folded per cycle) into a 256 GiB base ⇒ base-rewrite **WAF ≈ 256/16 = 16×**, plus ~1× for the WAL. `K` is the read-amp ↔ write-amp dial: larger `K` ⇒ lower WAF, but more RAM runs to scan per read, more RAM resident, and longer crash replay.
+**Amplification.** Disk writes are only: run files at freeze (~1× the data, sequential, the durability write) + periodic base compaction. With memtable = 1 GiB and `K = 16` (16 GiB folded per cycle) into a 256 GiB base ⇒ base-rewrite **WAF ≈ 256/16 = 16×**, plus ~1× for the run files. `K` is the read-amp ↔ write-amp dial: larger `K` ⇒ lower WAF, but more RAM runs to scan per read, more RAM resident, and longer crash replay.
 
 > **WAF in absolute terms.** Under uniform thin writes a compaction rewrites ~the whole base, so WAF ≈ `base / (K · flush)` — streaming compaction (§3.5 ops) fixes memory and budgetability, not write volume. But Ethereum's logical write rate is tiny (~64 KB/s), so even a high WAF is modest in bytes (e.g. K = 64 ⇒ ~84× ⇒ ~5 MB/s ⇒ ~0.45 TB/day).
 
@@ -180,7 +180,7 @@ Same bytes in RAM either way; the win is structure + lifecycle, not volume:
 1. **Representation (the big one).** A single ever-growing memtable must stay *mutable and searchable*: a skiplist/tree (pointer-chasing, 2–4× bloat, cache-hostile `O(log n)`) or a hash map (unordered ⇒ must be sorted later anyway). Freezing transcodes each run **once** into a dense sorted array identical to the base — lock-free, cache-dense, binary/interpolation-searchable with the **same code as the base**, and already sorted, so compaction is a cheap k-way merge. Only the small active map pays the mutable-structure cost.
 2. **Write/compaction overlap.** Freeze + fresh active map ⇒ writes never stall while the previous batch compacts in the background. One growing memtable forces a stall at flush (or a concurrent-mutation structure).
 3. **Lock-free concurrent reads.** Immutable runs are read by the parallel/batched read path with zero synchronisation; a live mutable memtable needs locking/MVCC.
-4. **Bounded compaction + bounded recovery.** Discrete runs = bounded, pausable compaction units and per-segment WAL truncation (bounded crash replay). One giant memtable = one giant flush event + a large WAL to replay.
+4. **Bounded compaction + bounded recovery.** Discrete runs = bounded, pausable compaction units, each with its own run file that is deleted once folded into the base (bounded recovery reload). One giant memtable = one giant flush event.
 
 > **Non-reason: WAF.** A bigger memtable and more frozen runs both raise data-per-base-rewrite, so they amortise base WAF identically — WAF does **not** distinguish them; reasons 1–4 do. (A bigger *active* memtable independently buys fewer freezes; tune it separately from `K`.)
 
@@ -191,7 +191,7 @@ The first sketch put L0 runs **on disk** and used a per-run approximate filter t
 - One static **xor / binary-fuse filter per run**, built at flush (runs are immutable). *Not* per-partition, and *not* min/max zone-maps — neither cuts the probe count, and zone-maps are useless under uniform keys (every run spans the whole range).
 - A read probes the `R` run-filters in RAM; false-positive cost is `R × f` wasted window reads, negligible for small `R` (e.g. 8 × 1 % ≈ 0.08 reads/lookup) — even a blocked Bloom would do. Space is a non-issue (bits/key, tens of MB).
 
-**Why rejected for now:** strictly more work and slightly slower than in-RAM L0 — it adds a second on-disk write per flush (beyond the WAL), `R` filter probes *plus* occasional false-positive disk reads, and filter build/maintenance — whereas in-RAM L0 is **exact** (zero FP, zero L0 disk reads) and reuses the base's sorted-array machinery. The in-RAM model trades ~`K × memtable` of RAM (a few GiB) for that simplicity and the slight speed edge.
+**Why rejected for now:** strictly more work and slightly slower than in-RAM L0 — it adds `R` filter probes *plus* occasional false-positive disk reads, and filter build/maintenance — whereas in-RAM L0 is **exact** (zero FP, zero L0 disk reads) and reuses the base's sorted-array machinery. The in-RAM model trades ~`K × memtable` of RAM (a few GiB) for that simplicity and the slight speed edge.
 
 **When to revisit:** if the RAM budget can't hold ~`K × memtable` of resident L0. The read path already binary-searches sorted runs, so the only additions are: persist runs, build a per-run filter, and gate each run read behind its filter. Layout, compaction, and newest-wins ordering are unchanged.
 
@@ -201,7 +201,7 @@ The first sketch put L0 runs **on disk** and used a per-run approximate filter t
 
 **Read(K).** Resolve newest-wins across tiers: active memtable (hash) → L0 runs (binary search, newest run first) → base (windowed io_uring read; §3.2). A tombstone encountered in RAM short-circuits to *absent* with no base read. With BAL prefetch, a prefetch map sits **below L0 and above base** (`memtable → L0 → prefetch → base`), so in-block writes still shadow prefetched values (read-your-writes holds) and execution reads resolve from RAM with no per-read disk I/O.
 
-**Write(K, V).** WAL append + insert into the active memtable. No base or compaction work on the critical path.
+**Write(K, V).** Insert into the active memtable. No disk I/O, base, or compaction work on the critical path — durability comes at freeze (§3.4).
 
 **Delete(K).** Records a memtable tombstone (the memtable maps `Key → ?Value`, null = tombstone). On freeze, tombstones are carried into the L0 run; the **base stays a pure 64-byte format** — compaction's newest-wins merge simply drops a key whose newest source is a tombstone, so tombstones never reach the base. Tombstones persist in run files, so recovery does not resurrect deleted keys. (Per Ethereum convention, writing the zero value is also equivalent to absence at the application layer.)
 
@@ -215,7 +215,7 @@ The first sketch put L0 runs **on disk** and used a per-run approximate filter t
 
 Independent NVMe drives scale aggregate **bandwidth and IOPS ~linearly**; they do **not** reduce single-read latency (io_uring concurrency is still required).
 
-Use **app-level partition sharding, not RAID-0**: map `partition → drive` (`partition_id % N` or a directory field), placing each drive's container files on its mount. Uniform keys ⇒ each drive automatically gets ~1/N of reads, and every window read stays **one contiguous I/O to one drive** (no stripe-misalignment, no split-read coordination). Compaction's bulk rewrite also spreads across all N drives.
+Use **app-level partition sharding, not RAID-0**: map `partition → drive` (`partition_id % N` or a directory field), placing each drive's base files on its mount. Uniform keys ⇒ each drive automatically gets ~1/N of reads, and every window read stays **one contiguous I/O to one drive** (no stripe-misalignment, no split-read coordination). Compaction's bulk rewrite also spreads across all N drives.
 
 Drives vs. the scaled 500 K reads/s target (per drive ≈ 6 GB/s, ~1 M IOPS; PCIe 5.0 ~2×):
 
@@ -232,7 +232,7 @@ Drives vs. the scaled 500 K reads/s target (per drive ≈ 6 GB/s, ~1 M IOPS; PCI
 
 - **2–3 NVMe drives + fixed P = 24 + wide-window interpolation (zero index) + partition sharding.** Simplest read code; scales to the burst target on modest hardware.
 - **io_uring-batched reads are mandatory** (the latency wall), independent of window size.
-- **Write path:** active hash-map memtable → freeze into N immutable sorted RAM runs (L0, no filters — exact in-RAM lookup) → out-of-place streaming bulk compaction into the partitioned base in idle windows; tune `K` for WAF vs. read-amp; durability via WAL + manifest.
+- **Write path:** active hash-map memtable → freeze into N immutable sorted RAM runs (L0, no filters — exact in-RAM lookup) → out-of-place streaming bulk compaction into the partitioned base in idle windows; tune `K` for WAF vs. read-amp; durability via run files at freeze + atomic manifest commit (no per-write WAL).
 - **Fence index (§3.2.1):** implemented, config-gated (`fence_gap`/`--fence-gap`) and off by default; an in-memory-only structure, rebuilt from the base on open/compaction and never persisted, so it costs nothing to leave disabled and nothing to migrate when toggled. Enable for single-drive deployments that still want high QPS.
 
 ---
@@ -298,9 +298,11 @@ Dirtiness derives from the write stream, never from storage events: compaction m
 
 ### 4.5 Persistence & recovery
 
-The only persisted commitment state is a **checkpoint of the depth-`H` heap row**: `2^H` × 32 B (512 MiB at `H` = 24) plus a small header `{magic, version, H, covered_height}`, written sequentially to `<name>.croot` via temp + fsync + rename — always out-of-place, atomic on its own (no manifest coupling needed: the file is self-contained derived data). On open: load the row, rebuild the `H` upper rows in ~2^H combines (seconds, parallel), then the host replays blocks > `covered_height`, which re-marks dirty units and recomputes them (§4.2) — the same replay contract the flat store already imposes. Worst-case cold rebuild (no checkpoint) is one streaming pass over the base: ~3·N compressions + a full sequential read (~1–2 min at 2³² on a few cores).
+The only persisted commitment state is a **checkpoint of the depth-`H` heap row**: `2^H` × 32 B (512 MiB at `H` = 24) plus a small header `{magic "CRO1", version, H, leaf_tag, covered_height}`, written sequentially to `<name>.croot` via temp + fsync + rename — always out-of-place, atomic on its own (no manifest coupling needed: the file is self-contained derived data). On open: load the row, rebuild the `H` upper rows in ~2^H combines (seconds, parallel), then the host replays blocks > `covered_height`, which re-marks dirty units and recomputes them (§4.2) — the same replay contract the flat store already imposes. Worst-case cold rebuild (no checkpoint) is one streaming pass over the base: ~3·N compressions + a full sequential read (~1–2 min at 2³² on a few cores).
 
 ### 4.6 Proofs
+
+*(Design only — no proof API is implemented yet.)*
 
 A proof for key `K`: `H` sibling hashes read directly from the RAM heap + the ~log₂(n) non-ZERO in-subtree siblings + a presence bitmap (pass-through skips ZERO siblings, compact-SMT style); verification replays the canonical rules. In-subtree siblings are **regenerated** by one unit recompute (50 µs–1 ms), not stored — this deliberately relaxes goal 4 of `commitment_redesign.md` ("every proof sibling is stored") below depth `H`, because regeneration is cheaper there than any disk read. If concurrent proof serving becomes a first-class workload, Tier 3 blobs (§4.3) cut regeneration a further 3× without a design change.
 
@@ -325,14 +327,13 @@ A proof for key `K`: `H` sibling hashes read directly from the RAM heap + the ~l
 | Record size | — | 64 B | 32 B key + 32 B value, cache-line aligned. |
 | Page | — | 4 KiB = 64 entries | Disk I/O unit; O_DIRECT alignment unit. |
 | Read window | ±4σ | 4√n entries (default 1024 = 64 KiB) | Centred interpolation window; single-I/O hit ~99.99 % (§3.2). |
-| Partition directory RAM | — | ≈ 256 MiB | `partition → (container_file, offset, n[, drive])` (§3.3). |
+| Partition directory RAM | — | ≈ 256 MiB | `partition → (offset, n)` into the single base file (§3.3). |
 | Memtable capacity | — | ≈ 1 GiB | Active mutable hash map; freeze trigger (§3.4). |
 | Frozen runs before compaction | `K` | tens–hundreds (test default 8) | Read-amp ↔ write-amp dial; sets base-rewrite WAF (§3.4). |
-| Base-rewrite WAF | — | ≈ `base / (K · flush)` (~16× @ K = 16) | Plus ~1× sequential WAL (§3.4). |
-| Container size | — | 4 GiB | Many partitions packed per container file; ~1100 files at target. |
+| Base-rewrite WAF | — | ≈ `base / (K · flush)` (~16× @ K = 16) | Plus ~1× sequential run-file writes at freeze (§3.4). |
 | Fence index stride | `G` | 0 = disabled (`G = ∞`) / 64 (gated) | RAM-for-read-size knob; **in-memory only**, rebuilt from the base on open/compaction, never persisted; ~0.5 GiB @2³², ~8.6 GiB @2³⁶ at G = 64 (§3.2.1). |
 | Drives | `N` | 2–3 (baseline) | App-level partition sharding for bandwidth/IOPS (§3.6). |
 | Commitment heap depth | `H` | 24 (= `P`) | RAM-for-recompute knob: heap RAM = `2^(H+1)` × 32 B (1.07 GiB @ 24, 8.6 GiB @ 27); each +1 halves leaf-recompute I/O + CPU. Dense while `H ≤ log₂N − 5`; raisable online (§4.1). |
 | Commitment checkpoint | `C` | every ~10³ blocks | Depth-`H` heap row, `2^H` × 32 B (512 MiB @ 24), generation file + `covered_height` (§4.5). |
 | Leaf-hash blobs (Tier 3) | — | off (upgrade) | Compaction-maintained leaf-hash cache, 32 B/key (~½ base size); 3× less recompute CPU, ½ read bytes; no per-block writes (§4.3). |
-| Memory budget | `M` | ≈ 32 GiB | WAL + memtable + L0 runs (~`K × memtable`) + partition directory + caches + commitment heap (1–9 GiB by `H`). |
+| Memory budget | `M` | ≈ 32 GiB | Memtable + L0 runs (~`K × memtable`) + partition directory + caches + commitment heap (1–9 GiB by `H`). |

@@ -65,14 +65,22 @@
 ## 2. Phase 2 — Two-tier commitment
 
 **Canonical function.** Storage leaf = `Blake3(0x00 ‖ slot_key ‖ value)`;
-account leaf = `Blake3(0x01 ‖ account_hash ‖ account_value ‖ storage_root)`
-(domain-tagged; `storage_root = ZERO` for storage-less accounts); `combine` and
-pass-through unchanged at both levels. State root = binary trie over account-hash
-space whose leaves are account leaves.
+account leaf = `Blake3(0x01 ‖ account_hash ‖ storage_root)` (domain-tagged;
+as-built the account record's 32 B value *is* the storage root — D7's separate
+opaque `account_value` field was dropped, and a `storage_root = ZERO` account is
+simply absent from the accounts store); `combine` and pass-through unchanged at
+both levels. State root = binary trie over account-hash space whose leaves are
+account leaves.
 
-**Refactor.** Extract from `CommitmentDb` a reusable `SubtreeCommitter`
+**Refactor.** *(As-built: no `SubtreeCommitter` type was extracted — the account
+tree is the unchanged single-tier `CommitmentDb` (leaf tag 0x01), and per-whale
+storage uses a `BigAccount { depth, n, counts, heap }` struct plus the free
+functions `storageSubtreeRoot`/`promote`, sharing `heapRecombine`/
+`heapRebuildInternals` with the single-tier engine. Behaviourally equivalent to
+the plan below. Demotion back under `T_big` has hysteresis at `T_big/2`.)*
+The plan was: extract from `CommitmentDb` a reusable `SubtreeCommitter`
 (unit rows + gather-recompute + recombine over an arbitrary key range at an
-arbitrary heap depth). Instantiate it:
+arbitrary heap depth), instantiated:
 - once globally for the account tree (heap depth H over account-hash bits —
   today's code, unchanged behavior), and
 - per big account for its storage trie (depth `d_a` per D6).
@@ -98,8 +106,10 @@ gather; big: dirty units + recombine) — embarrassingly parallel later, serial 
 (2) write back account records; (3) memtable snapshot; (4) dirty account units →
 account heap → root.
 
-**Checkpoint format v2** (`flat.croot`, version 2): header + account-level depth-H
-row (unchanged) + big-account section: `count × {account_hash, n, d_a, 2^{d_a}-row}`.
+**Checkpoint format** *(as-built: two files, not a croot version bump)*: the
+account tree checkpoints to the unchanged `<name>.croot` (`CRO1`, version 1, via
+`acct_cdb.checkpoint`), and big-account state goes to a separate `<name>.cstor`
+(`CST1`, version 1): `count × {CstorAcct, counts[], unit row}`.
 On open: restore rows, rebuild internals at both levels. Accounts that crossed
 `T_big` since the checkpoint simply rebuild lazily (cache property).
 
